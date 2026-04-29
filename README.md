@@ -1,0 +1,1 @@
+# Kapital-Strategie.info
