@@ -1,0 +1,17 @@
+[Unit]
+Description=Interactive Brokers Gateway (headless via Xvfb)
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=DEIN_LINUX_BENUTZER
+ExecStart=/usr/local/bin/start_ibgateway.sh
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
