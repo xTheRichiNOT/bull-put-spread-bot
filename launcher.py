@@ -198,6 +198,247 @@ IB_SETUP_TEXT = """
 """.strip()
 
 
+class SetupWizard(ctk.CTkToplevel):
+    """Erststart-Wizard: führt den Kunden durch Platform / Software / Modus / Account."""
+
+    # Port-Matrix: (software, trading_mode) → port
+    _PORTS = {
+        ("TWS",     "Paper"): 7497,
+        ("TWS",     "Live"):  7496,
+        ("Gateway", "Paper"): 4002,
+        ("Gateway", "Live"):  4001,
+    }
+
+    def __init__(self, parent: ctk.CTk, cfg: dict, on_done):
+        super().__init__(parent)
+        self.title("Ersteinrichtung")
+        self.geometry("560x480")
+        self.resizable(False, False)
+        self.grab_set()           # Modal — Hauptfenster blockiert
+        self.lift()
+        self.focus_force()
+
+        self._cfg    = cfg
+        self._done   = on_done
+        self._step   = 0
+
+        # Wizard-State
+        self._platform  = ctk.StringVar(value="Desktop")
+        self._software  = ctk.StringVar(value="TWS")
+        self._mode      = ctk.StringVar(value="Paper")
+        self._account   = ctk.StringVar(value=cfg.get("ib_account", ""))
+        self._host      = ctk.StringVar(value=cfg.get("ib_host", "127.0.0.1"))
+
+        self._build()
+
+    def _build(self):
+        # Header
+        hdr = ctk.CTkFrame(self, height=54, corner_radius=0,
+                           fg_color=("#111827", "#111827"))
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="  Ersteinrichtung",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#38bdf8").pack(side="left", padx=8, pady=10)
+        self._step_lbl = ctk.CTkLabel(hdr, text="Schritt 1 / 4",
+                                      font=ctk.CTkFont(size=11),
+                                      text_color="#64748b")
+        self._step_lbl.pack(side="right", padx=16)
+
+        # Content area
+        self._content = ctk.CTkFrame(self, fg_color="transparent")
+        self._content.pack(fill="both", expand=True, padx=28, pady=10)
+
+        # Navigation
+        nav = ctk.CTkFrame(self, fg_color="transparent")
+        nav.pack(fill="x", padx=28, pady=(0, 20))
+        self._back_btn = ctk.CTkButton(nav, text="← Zurück", width=110, height=36,
+                                       fg_color=("#374151", "#374151"),
+                                       hover_color=("#4b5563", "#4b5563"),
+                                       command=self._back)
+        self._back_btn.pack(side="left")
+        self._next_btn = ctk.CTkButton(nav, text="Weiter →", width=130, height=36,
+                                       fg_color="#0369a1", hover_color="#075985",
+                                       font=ctk.CTkFont(weight="bold"),
+                                       command=self._next)
+        self._next_btn.pack(side="right")
+
+        self._show_step()
+
+    def _clear_content(self):
+        for w in self._content.winfo_children():
+            w.destroy()
+
+    def _show_step(self):
+        self._clear_content()
+        self._step_lbl.configure(text=f"Schritt {self._step + 1} / 4")
+        self._back_btn.configure(state="normal" if self._step > 0 else "disabled")
+        self._next_btn.configure(text="Fertig  ✓" if self._step == 3 else "Weiter →")
+
+        steps = [self._step_platform, self._step_software,
+                 self._step_mode,     self._step_account]
+        steps[self._step]()
+
+    # ── Step 1: Platform ──────────────────────────────────────────────────────
+    def _step_platform(self):
+        ctk.CTkLabel(self._content,
+                     text="Wo läuft der Bot?",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
+        ctk.CTkLabel(self._content,
+                     text="Wähle aus wo IB Gateway / TWS installiert ist.",
+                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 16))
+
+        for val, title, desc in [
+            ("Desktop",
+             "Gleicher Computer  (Mac / Windows)",
+             "Bot und TWS / IB Gateway laufen auf demselben Rechner.\nHost bleibt 127.0.0.1"),
+            ("Server",
+             "Externer Server  (Linux VPS / Strato)",
+             "IB Gateway läuft auf einem anderen Rechner im Netzwerk.\nDu gibst die IP-Adresse des Servers ein."),
+        ]:
+            f = ctk.CTkFrame(self._content,
+                             fg_color=("#1e293b", "#1e293b"),
+                             corner_radius=8)
+            f.pack(fill="x", pady=4)
+            rb = ctk.CTkRadioButton(f, text=title, variable=self._platform, value=val,
+                                    font=ctk.CTkFont(size=13, weight="bold"),
+                                    command=self._show_step)
+            rb.pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(f, text=desc, text_color="#64748b",
+                         font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
+
+        if self._platform.get() == "Server":
+            ctk.CTkLabel(self._content, text="IP-Adresse des Servers:",
+                         font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(12, 2))
+            ctk.CTkEntry(self._content, textvariable=self._host,
+                         width=200, placeholder_text="z.B. 192.168.1.10").pack(anchor="w")
+
+    # ── Step 2: Software ──────────────────────────────────────────────────────
+    def _step_software(self):
+        ctk.CTkLabel(self._content,
+                     text="Welche IB-Software verwendest du?",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
+        ctk.CTkLabel(self._content,
+                     text="Beide funktionieren mit dem Bot. IB Gateway empfohlen für Hintergrundbetrieb.",
+                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 16))
+
+        for val, title, desc in [
+            ("TWS",
+             "Trader Workstation  (TWS)",
+             "Die vollständige Handelsplattform mit grafischer Oberfläche.\n"
+             "Muss offen und eingeloggt bleiben."),
+            ("Gateway",
+             "IB Gateway  (empfohlen)",
+             "Leichtgewichtige Version ohne große Oberfläche.\n"
+             "Ideal für Hintergrundbetrieb — weniger RAM, kein großes Fenster."),
+        ]:
+            f = ctk.CTkFrame(self._content,
+                             fg_color=("#1e293b", "#1e293b"),
+                             corner_radius=8)
+            f.pack(fill="x", pady=4)
+            rb = ctk.CTkRadioButton(f, text=title, variable=self._software, value=val,
+                                    font=ctk.CTkFont(size=13, weight="bold"))
+            rb.pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(f, text=desc, text_color="#64748b",
+                         font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
+
+    # ── Step 3: Trading Mode ──────────────────────────────────────────────────
+    def _step_mode(self):
+        sw  = self._software.get()
+        ctk.CTkLabel(self._content,
+                     text="Paper Trading oder Live Trading?",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
+        ctk.CTkLabel(self._content,
+                     text="Paper Trading empfohlen zum Testen — kein echtes Geld.",
+                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 16))
+
+        for val, title, desc, color in [
+            ("Paper",
+             "Paper Trading  (Demokonto)",
+             "Kostenloses Testkonto mit $1.000.000 Spielgeld.\n"
+             f"Port: {self._PORTS[(sw, 'Paper')]}",
+             "#166534"),
+            ("Live",
+             "Live Trading  (echtes Geld)",
+             "Echte Orders mit echtem Kapital.\n"
+             f"Port: {self._PORTS[(sw, 'Live')]}  ⚠️  Nur wenn du weißt was du tust!",
+             "#7f1d1d"),
+        ]:
+            f = ctk.CTkFrame(self._content,
+                             fg_color=("#1e293b", "#1e293b"),
+                             corner_radius=8)
+            f.pack(fill="x", pady=4)
+            rb = ctk.CTkRadioButton(f, text=title, variable=self._mode, value=val,
+                                    font=ctk.CTkFont(size=13, weight="bold"),
+                                    fg_color=color)
+            rb.pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(f, text=desc, text_color="#64748b",
+                         font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
+
+    # ── Step 4: Account ───────────────────────────────────────────────────────
+    def _step_account(self):
+        sw, mode = self._software.get(), self._mode.get()
+        port = self._PORTS[(sw, mode)]
+        prefix = "DU" if mode == "Paper" else "U"
+
+        ctk.CTkLabel(self._content,
+                     text="Deine IB Account-Nummer",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
+
+        # Summary box
+        summary = (f"  Software:  {sw}   |   Modus: {mode} Trading   |   Port: {port}\n"
+                   f"  Host:  {self._host.get()}")
+        sf = ctk.CTkFrame(self._content, fg_color=("#0f172a", "#0f172a"), corner_radius=6)
+        sf.pack(fill="x", pady=(0, 16))
+        ctk.CTkLabel(sf, text=summary, font=ctk.CTkFont(family="Courier", size=11),
+                     text_color="#38bdf8", justify="left").pack(padx=12, pady=8)
+
+        ctk.CTkLabel(self._content,
+                     text=f"Account-Nummer  ({prefix}xxxxxxx):",
+                     font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(4, 2))
+        e = ctk.CTkEntry(self._content, textvariable=self._account,
+                         width=200, font=ctk.CTkFont(size=13),
+                         placeholder_text=f"{prefix}1234567")
+        e.pack(anchor="w")
+        e.focus()
+
+        ctk.CTkLabel(self._content,
+                     text=f"In TWS/{sw} findest du sie oben rechts neben deinem Namen.",
+                     text_color="#64748b", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(6, 0))
+
+        self._err_lbl = ctk.CTkLabel(self._content, text="",
+                                     text_color="#f87171", font=ctk.CTkFont(size=12))
+        self._err_lbl.pack(anchor="w", pady=(4, 0))
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+    def _back(self):
+        if self._step > 0:
+            self._step -= 1
+            self._show_step()
+
+    def _next(self):
+        if self._step == 3:
+            self._finish()
+        else:
+            self._step += 1
+            self._show_step()
+
+    def _finish(self):
+        acct = self._account.get().strip()
+        if not acct:
+            self._err_lbl.configure(text="⚠  Bitte Account-Nummer eingeben.")
+            return
+
+        sw, mode = self._software.get(), self._mode.get()
+        self._cfg["ib_account"] = acct
+        self._cfg["ib_host"]    = self._host.get().strip() or "127.0.0.1"
+        self._cfg["ib_port"]    = self._PORTS[(sw, mode)]
+        save_config(self._cfg)
+
+        self._done()
+        self.destroy()
+
+
 class BotLauncher(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -213,7 +454,26 @@ class BotLauncher(ctk.CTk):
         self._build_ui()
         self._poll_queue()
 
-        # Check for updates silently in background
+        # Erststart-Wizard wenn noch keine Account-Nummer gesetzt
+        if not self.cfg.get("ib_account", "").strip():
+            self.after(200, self._show_wizard)
+        else:
+            # Check for updates silently in background
+            threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _show_wizard(self):
+        SetupWizard(self, self.cfg, on_done=self._wizard_done)
+
+    def _wizard_done(self):
+        """Wird aufgerufen wenn Wizard abgeschlossen — Config neu laden + Update prüfen."""
+        self.cfg = load_config()
+        # Settings-Felder aktualisieren
+        for key, widget in getattr(self, "_fields", {}).items():
+            if isinstance(widget, ctk.BooleanVar):
+                widget.set(bool(self.cfg.get(key, True)))
+            elif not isinstance(widget, ctk.CTkOptionMenu):
+                widget.delete(0, "end")
+                widget.insert(0, str(self.cfg.get(key, "")))
         threading.Thread(target=self._check_for_updates, daemon=True).start()
 
     # ── UI ───────────────────────────────────────────────────────────────────
