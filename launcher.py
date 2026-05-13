@@ -22,7 +22,7 @@ VERSION_FILE = os.path.join(_BASE, "version.txt")
 # Ersetze DEIN_USERNAME und DEIN_REPO mit deinen GitHub-Daten.
 # Das Repo muss öffentlich sein ODER du verwendest einen Personal Access Token.
 VERSION         = open(VERSION_FILE).read().strip() if os.path.exists(VERSION_FILE) else "1.0.0"
-UPDATE_BASE_URL = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot/main"
+UPDATE_BASE_URL = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot-releases/main"
 
 # Dateien die beim Update heruntergeladen werden
 UPDATE_FILES = ["bot.py", "version.txt", "requirements.txt"]
