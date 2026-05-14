@@ -248,6 +248,8 @@ _iv_memory: dict = {}
 _bot_trades: dict = {}
 # IB-validierte Strikes und Expiries pro Symbol (einmalig beim Start geladen)
 _strike_map: dict = {}
+# Order-IDs die absichtlich storniert werden (TP/SL-Rotation → kein falsches 'cancelled')
+_expected_cancels: set = set()
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -350,6 +352,7 @@ def _cancel_order_by_id(ib, order_id: int, symbol: str, label: str):
     try:
         for t in ib.openTrades():
             if t.order.orderId == order_id:
+                _expected_cancels.add(order_id)  # absichtliche Stornierung markieren
                 ib.cancelOrder(t.order)
                 log(f"  🗑  [{symbol}] {label}-Order #{order_id} storniert")
                 return
@@ -362,7 +365,11 @@ def _on_order_status(trade):
     if sym not in _bot_trades:
         return
     status = trade.orderStatus.status
+    order_id = trade.order.orderId
     if status in ('Cancelled', 'ApiCancelled', 'Inactive'):
+        if order_id in _expected_cancels:
+            _expected_cancels.discard(order_id)
+            return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
         _bot_trades[sym]['status'] = 'cancelled'
         log(f"  ⚠️  [{sym}] Order gecancelt — Symbol für diese Session gesperrt")
         _save_state()
@@ -836,7 +843,15 @@ async def monitor_exits(ib=None):
             info['at_breakeven'] = True
             _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
             _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
-            await asyncio.sleep(0.5)   # kurz warten bis Cancel bei IB angekommen
+            # 3s warten + IB-Sync: IB braucht Zeit um Cancel zu bestätigen bevor neue Order
+            await asyncio.sleep(3)
+            if ib is not None:
+                await ib.reqAllOpenOrdersAsync()
+                await asyncio.sleep(0.5)
+            # Guard: Status könnte durch 21-DTE-Exit oder externen Cancel geändert worden sein
+            if info.get('status') != 'open':
+                log(f"  ⚠️  [{symbol}] Breakeven-SL übersprungen — Position wird bereits geschlossen")
+                continue
             be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
             be_bag = Bag(
                 symbol=symbol, exchange='SMART', currency='USD',

@@ -91,6 +91,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.37": [
+        "🐛  Error 201 Fix: Breakeven-SL wartet jetzt 3s + IB-Sync bevor neue Order — Cancel wird bei IB bestätigt bevor Folge-Order platziert wird",
+        "🐛  TP/SL-Stornierungen sperren Symbol nicht mehr fälschlicherweise ('cancelled') — nur unerwartete Cancels sperren",
+        "🐛  Race-Condition-Guard: Breakeven-SL wird übersprungen wenn Position bereits geschlossen wird (21-DTE-Exit)",
+    ],
     "1.0.36": [
         "🏗️  Neue Architektur: IB Strike-Map beim Start (reqSecDefOptParams) — nur IB-valide Strikes werden gehandelt",
         "🏗️  IB Combo/Bag Pricing im Scan — Bot fragt IB nach dem echten Netto-Credit des gesamten Spreads",
