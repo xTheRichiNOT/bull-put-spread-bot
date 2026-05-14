@@ -1,0 +1,11 @@
+[Unit]
+Description=Bull Put Spread Bot — Auto-Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=DEIN_LINUX_BENUTZER
+ExecStart=/opt/trading-bot/setup/auto_update.sh
+StandardOutput=journal
+StandardError=journal

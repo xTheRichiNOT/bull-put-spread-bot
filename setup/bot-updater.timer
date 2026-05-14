@@ -1,0 +1,13 @@
+[Unit]
+Description=Bull Put Spread Bot — stündlicher Update-Check
+Requires=bot-updater.service
+
+[Timer]
+# 2 Minuten nach Systemstart erstmals prüfen
+OnBootSec=2min
+# Danach jede Stunde
+OnUnitActiveSec=1h
+Unit=bot-updater.service
+
+[Install]
+WantedBy=timers.target
