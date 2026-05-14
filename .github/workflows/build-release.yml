@@ -148,3 +148,24 @@ jobs:
             artifacts/BullPutSpreadBot-v*.dmg \
             artifacts/BullPutSpreadBot.exe \
             artifacts/BullPutSpreadBot-v*-linux.tar.gz
+
+  # ── Python-Skripte ins Release-Repo pushen (Auto-Update für laufende Instanzen) ──
+  deploy-scripts:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python-Dateien in bull-put-spread-bot-releases pushen
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          git clone https://x-access-token:${RELEASES_TOKEN}@github.com/xTheRichiNOT/bull-put-spread-bot-releases.git _releases
+          cp bot.py launcher.py version.txt requirements.txt _releases/
+          cd _releases
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bot.py launcher.py version.txt requirements.txt
+          git diff --staged --quiet || git commit -m "chore: update scripts to v${VERSION}"
+          git push
