@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.21": [
+        "✅  Windows: saubere Meldung nach Update statt Fehlermeldung beim Neustart",
+    ],
     "1.0.20": [
         "🆕  Portfolio-Tab: alle drei Bereiche per Mauziehen vergrößerbar/verkleinerbar",
         "🆕  Chart-Bereich standardmäßig größer als die Tabelle darunter",
@@ -2040,12 +2043,28 @@ class BotLauncher(ctk.CTk):
         """Startet die App neu — lädt dabei ggf. die neue launcher.py."""
         if self._running:
             self._stop_bot()
-        try:
-            import subprocess
-            subprocess.Popen([sys.executable] + [a for a in sys.argv if a != '--bootstrap'])
-        except Exception:
-            pass
-        self.destroy()
+
+        if sys.platform == "win32":
+            # Windows: laufende EXE kann nicht per subprocess neu gestartet werden.
+            # Stattdessen: saubere Meldung, User startet manuell neu.
+            self._update_bar_set(
+                "  ✅  Update installiert — bitte App manuell neu starten", "#4ade80")
+            try:
+                import tkinter.messagebox as mb
+                mb.showinfo(
+                    "Update installiert",
+                    "Das Update wurde erfolgreich installiert.\n\n"
+                    "Bitte die App jetzt schließen und erneut starten.",
+                    parent=self)
+            except Exception:
+                pass
+            self.destroy()
+        else:
+            try:
+                subprocess.Popen([sys.executable] + [a for a in sys.argv if a != '--bootstrap'])
+            except Exception:
+                pass
+            self.destroy()
 
     def on_closing(self):
         if self._running:
