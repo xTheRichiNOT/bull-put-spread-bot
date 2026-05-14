@@ -2,3 +2,4 @@ ib_insync
 yfinance
 customtkinter
 certifi
+tzdata

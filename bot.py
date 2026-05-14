@@ -211,10 +211,19 @@ WARNING_KEYWORDS = [
 ]
 # ---------------------------
 
+def _now_et() -> datetime:
+    """Aktuelle Zeit in America/New_York — mit Fallback auf UTC-4 (EDT) falls tzdata fehlt."""
+    try:
+        return datetime.now(ZoneInfo('America/New_York'))
+    except Exception:
+        from datetime import timezone
+        edt = timezone(timedelta(hours=-4))
+        return datetime.now(edt)
+
 def is_market_open() -> bool:
-    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/16:30–23:00 MESZ)."""
-    now_et = datetime.now(ZoneInfo('America/New_York'))
-    if now_et.weekday() >= 5:          # Samstag=5, Sonntag=6
+    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ)."""
+    now_et = _now_et()
+    if now_et.weekday() >= 5:
         return False
     open_t  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
     close_t = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
@@ -222,7 +231,7 @@ def is_market_open() -> bool:
 
 def seconds_until_market_open() -> tuple:
     """Gibt (Sekunden, nächste Öffnungszeit ET) bis zur nächsten NYSE-Öffnung zurück."""
-    now_et = datetime.now(ZoneInfo('America/New_York'))
+    now_et = _now_et()
     days_ahead = 0
     while True:
         check = (now_et + timedelta(days=days_ahead)).replace(

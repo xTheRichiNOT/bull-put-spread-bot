@@ -91,6 +91,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.26": [
+        "✅  Windows: tzdata eingebaut — ZoneInfo('America/New_York') funktioniert ohne externe Abhängigkeit",
+        "✅  Fallback auf UTC-4 (EDT) falls tzdata trotzdem fehlt — Bot scannt jetzt zuverlässig zur Marktöffnung",
+    ],
     "1.0.25": [
         "✅  Windows: ICO in sicheren Temp-Pfad kopiert (kein Leerzeichen-Problem in Tcl/Tk)",
     ],
