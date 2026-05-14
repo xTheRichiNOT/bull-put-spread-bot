@@ -246,6 +246,8 @@ def seconds_until_market_open() -> tuple:
 _iv_memory: dict = {}
 # Speichert aktive Bot-Trades für Exit-Monitoring
 _bot_trades: dict = {}
+# IB-validierte Strikes und Expiries pro Symbol (einmalig beim Start geladen)
+_strike_map: dict = {}
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -402,6 +404,42 @@ def _bs_prob_otm(S, K, T, sigma, r=0.045):
         0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))))
     return (1 - p) if d2 > 0 else p
 
+async def build_strike_map(ib):
+    """Lädt IB-verfügbare Strikes und Expiries für alle Watchlist-Symbole.
+    Einmalig beim Bot-Start — verhindert 'Qualifizierung fehlgeschlagen' für nicht-existente Strikes."""
+    global _strike_map
+    log("📋 Lade IB Strike-Map für Watchlist ...")
+    _sem_map = asyncio.Semaphore(10)
+
+    async def _fetch(symbol):
+        async with _sem_map:
+            try:
+                stock = Stock(symbol, 'SMART', 'USD')
+                await ib.qualifyContractsAsync(stock)
+                if not stock.conId:
+                    return
+                chains = await ib.reqSecDefOptParamsAsync(symbol, '', 'STK', stock.conId)
+                if not chains:
+                    return
+                chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+                if chain and chain.strikes:
+                    _strike_map[symbol] = {
+                        'strikes':     sorted(chain.strikes),
+                        'expirations': sorted(chain.expirations),
+                    }
+            except Exception:
+                pass
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*[_fetch(s) for s in WATCHLIST]),
+            timeout=90
+        )
+    except asyncio.TimeoutError:
+        log(f"  ⚠️  Strike-Map Timeout — {len(_strike_map)}/{len(WATCHLIST)} Symbole geladen")
+    log(f"✅ Strike-Map: {len(_strike_map)}/{len(WATCHLIST)} Symbole geladen")
+
+
 async def get_market_data(symbol, ib=None):
     """Hole Kurs und ATM-IV. IB Gateway zuerst, Fallback auf yfinance."""
     import math as _math
@@ -540,46 +578,85 @@ async def fetch_signal(symbol, preis, iv, ib=None):
             praemie = _bs_put(preis, short_strike, T, iv)
             praemie_quelle = "Black-Scholes (geschätzt)"
 
-        # Long Strike
-        spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)  # skaliert mit Kurs
-        breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
-        candidates = sorted(puts[puts['strike'] < short_strike]['strike'].tolist())
-        if candidates:
-            long_target = short_strike - breite_ziel
-            long_strike = float(min(candidates, key=lambda s: abs(s - long_target)))
+        # ── Strike-Snapping: yfinance-Strikes auf IB-valide Werte anpassen ──────
+        # Verhindert "Qualifizierung fehlgeschlagen" für Strikes die IB nicht kennt
+        expiry_ib_str = expiry_str.replace('-', '')
+        if symbol in _strike_map and _strike_map[symbol]['strikes']:
+            ib_strikes = _strike_map[symbol]['strikes']
+            # Short Strike: nächster IB-Strike unter Kurs, nahe am Ziel
+            valid_short = [s for s in ib_strikes if s < preis]
+            if valid_short:
+                short_strike = min(valid_short, key=lambda s: abs(s - short_strike))
+            # Long Strike: nächster IB-Strike unter short_strike
+            valid_long = [s for s in ib_strikes if s < short_strike]
+            if valid_long:
+                # Breite neu berechnen mit gesnapptem short_strike
+                spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
+                breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
+                long_target = short_strike - breite_ziel
+                long_strike = min(valid_long, key=lambda s: abs(s - long_target))
+            else:
+                long_strike = short_strike - SPREAD_MIN
         else:
-            long_strike = short_strike - breite_ziel
+            # Kein Strike-Map → yfinance-Strikes verwenden
+            spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
+            breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
+            candidates  = sorted(puts[puts['strike'] < short_strike]['strike'].tolist())
+            if candidates:
+                long_target = short_strike - breite_ziel
+                long_strike = float(min(candidates, key=lambda s: abs(s - long_target)))
+            else:
+                long_strike = short_strike - breite_ziel
         breite = short_strike - long_strike
 
-        # Netto-Credit: Short Bid - Long Ask (realistischer als nur Short Bid)
-        if praemie_quelle == "yfinance (Bid)":
-            long_rows = puts[puts['strike'] == long_strike]
-            if not long_rows.empty:
-                long_ask_yf = float(long_rows.iloc[0]['ask'])
-                if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
-                    praemie = max(bid - long_ask_yf, 0.01)
-                    praemie_quelle = "yfinance (Net Bid-Ask)"
-
-        # ── IB-Preise für die gewählten Strikes (realistischer als yfinance) ──
-        if ib and ib.isConnected() and praemie_quelle in ("yfinance (Bid)", "yfinance (Net Bid-Ask)"):
+        # ── IB Combo/Bag Pricing (primär) ────────────────────────────────────
+        # Fragt IB nach dem echten handelbaren Netto-Credit für den gesamten Spread.
+        # Combo-Bid = was wir beim Verkauf erhalten — negativ bedeutet Debit-Spread.
+        if ib and ib.isConnected():
             try:
-                from ib_insync import Option as _Opt
-                expiry_ib_str = expiry_str.replace('-', '')
-                t_s = ib.reqMktData(_Opt(symbol, expiry_ib_str, short_strike, 'P', 'SMART'), '', False, False)
-                t_l = ib.reqMktData(_Opt(symbol, expiry_ib_str, long_strike,  'P', 'SMART'), '', False, False)
-                await asyncio.sleep(5)
-                ib_sb = t_s.bid if t_s.bid and t_s.bid > 0 else None
-                ib_la = t_l.ask if t_l.ask and t_l.ask > 0 else None
-                try: ib.cancelMktData(t_s)
-                except Exception: pass
-                try: ib.cancelMktData(t_l)
-                except Exception: pass
-                if ib_sb is not None and ib_la is not None:
-                    praemie = max(ib_sb - ib_la, 0.01)
-                    praemie_quelle = "IB (Bid-Ask)"
-                # Nur Short-Bid ohne Long-Ask nicht verwenden — würde Credit künstlich aufblähen
+                s_con = Option(symbol, expiry_ib_str, short_strike, 'P', 'SMART')
+                l_con = Option(symbol, expiry_ib_str, long_strike,  'P', 'SMART')
+                await ib.qualifyContractsAsync(s_con, l_con)
+                if s_con.conId > 0 and l_con.conId > 0:
+                    combo_bag = Bag(
+                        symbol=symbol, exchange='SMART', currency='USD',
+                        comboLegs=[
+                            ComboLeg(conId=s_con.conId, ratio=1, action='SELL', exchange='SMART'),
+                            ComboLeg(conId=l_con.conId, ratio=1, action='BUY',  exchange='SMART'),
+                        ]
+                    )
+                    t_combo = ib.reqMktData(combo_bag, '', False, False)
+                    await asyncio.sleep(5)
+                    combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
+                    try: ib.cancelMktData(t_combo)
+                    except Exception: pass
+                    if combo_bid is not None and combo_bid > 0:
+                        praemie = combo_bid
+                        praemie_quelle = "IB (Combo)"
+                    else:
+                        # Combo-Bid ≤ 0 → Debit-Spread oder kein Markt → BS-Schätzung markieren
+                        praemie_quelle = "Black-Scholes (geschätzt)"
+                else:
+                    # Strike existiert nicht bei IB → wird durch BS-Filter blockiert
+                    praemie_quelle = "Black-Scholes (geschätzt)"
             except Exception:
-                pass  # yfinance-Preis bleibt gültig
+                # IB-Fehler → yfinance Net Bid-Ask als Fallback
+                if praemie_quelle == "yfinance (Bid)":
+                    long_rows = puts[puts['strike'] == long_strike]
+                    if not long_rows.empty:
+                        long_ask_yf = float(long_rows.iloc[0]['ask'])
+                        if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
+                            praemie = max(bid - long_ask_yf, 0.01)
+                            praemie_quelle = "yfinance (Net Bid-Ask)"
+        else:
+            # Kein IB → yfinance Net Bid-Ask
+            if praemie_quelle == "yfinance (Bid)":
+                long_rows = puts[puts['strike'] == long_strike]
+                if not long_rows.empty:
+                    long_ask_yf = float(long_rows.iloc[0]['ask'])
+                    if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
+                        praemie = max(bid - long_ask_yf, 0.01)
+                        praemie_quelle = "yfinance (Net Bid-Ask)"
 
         credit    = praemie * 100
         max_risk  = (breite - praemie) * 100
@@ -1037,6 +1114,9 @@ async def run_bot(stop_event: threading.Event = None):
             if errorCode in (201, 202, 399, 10147):
                 log(f"  ⚠️  IBKR Error {errorCode} (reqId={reqId}): {errorString}")
         ib.errorEvent += _on_ib_error
+
+        # IB Strike-Map einmalig laden — valide Strikes/Expiries für alle Watchlist-Symbole
+        await build_strike_map(ib)
 
         # Gespeicherten State vom letzten Lauf laden (heute gecancelte Symbole sperren)
         _load_state()

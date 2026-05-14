@@ -91,6 +91,12 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.36": [
+        "🏗️  Neue Architektur: IB Strike-Map beim Start (reqSecDefOptParams) — nur IB-valide Strikes werden gehandelt",
+        "🏗️  IB Combo/Bag Pricing im Scan — Bot fragt IB nach dem echten Netto-Credit des gesamten Spreads",
+        "✅  Kein 'Qualifizierung fehlgeschlagen' mehr — Strikes werden vor dem Scan gegen IB validiert",
+        "✅  Scan-Preis = Trade-Preis — keine Trade-Abbrüche mehr durch Preis-Abweichung zwischen Scan und Trade",
+    ],
     "1.0.35": [
         "🐛  IB-Scan: Wartezeit auf IB-Optionspreise von 3s auf 5s erhöht — Long-Ask kam bei weiter OTM Strikes zu spät an",
     ],
