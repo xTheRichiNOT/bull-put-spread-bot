@@ -837,37 +837,55 @@ async def monitor_exits(ib=None):
         pnl_dollar = pnl_share * 100
         pnl_pct    = (pnl_share / entry * 100) if entry > 0 else 0
 
-        # Breakeven: SL UND TP stornieren, dann neuen Breakeven-SL platzieren
-        # (Error 201 vermeiden: IB erlaubt nicht 2 Closing-BUY-Orders gleichzeitig)
+        # Breakeven: bestehende SL-Order auf Breakeven-Preis modifizieren (Modify, kein Cancel)
+        # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put
+        # tritt nur auf wenn neues Bag mit umgekehrten Legs platziert wird)
         if pnl_share >= entry * BREAKEVEN_TRIGGER_PCT and not info.get('at_breakeven'):
             info['at_breakeven'] = True
-            _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
-            _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
-            # 3s warten + IB-Sync: IB braucht Zeit um Cancel zu bestätigen bevor neue Order
-            await asyncio.sleep(3)
-            if ib is not None:
+            be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
+            sl_order_id = info.get('sl_order_id', 0)
+            sl_modified = False
+
+            # Primär: bestehende SL-Order auf Breakeven-Preis modifizieren (kein Cancel nötig)
+            if sl_order_id and ib is not None:
                 await ib.reqAllOpenOrdersAsync()
                 await asyncio.sleep(0.5)
-            # Guard: Status könnte durch 21-DTE-Exit oder externen Cancel geändert worden sein
-            if info.get('status') != 'open':
-                log(f"  ⚠️  [{symbol}] Breakeven-SL übersprungen — Position wird bereits geschlossen")
-                continue
-            be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
-            be_bag = Bag(
-                symbol=symbol, exchange='SMART', currency='USD',
-                comboLegs=[
-                    ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
-                    ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
-                ]
-            )
-            be_order = LimitOrder('BUY', 1, be_close, tif='GTC')
-            be_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-            be_order.account = _cfg.get('ib_account', '')
-            be_trade = ib.placeOrder(be_bag, be_order)
-            info['sl_order_id'] = be_trade.order.orderId
+                for t in ib.openTrades():
+                    if t.order.orderId == sl_order_id:
+                        t.order.lmtPrice = be_close
+                        ib.placeOrder(t.contract, t.order)
+                        sl_modified = True
+                        log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC "
+                            f"(Modify #{sl_order_id}) | P&L: +${pnl_dollar:.0f}")
+                        break
+
+            if not sl_modified:
+                # SL bereits weg (OCA-Cancel durch TP-Fill o.ä.) → neue Order nötig
+                # Nur TP canceln (SL ist schon weg) + 3s warten für IB-Bestätigung
+                _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
+                await asyncio.sleep(3)
+                if ib is not None:
+                    await ib.reqAllOpenOrdersAsync()
+                    await asyncio.sleep(0.5)
+                if info.get('status') != 'open':
+                    log(f"  ⚠️  [{symbol}] Breakeven-SL übersprungen — Position wird bereits geschlossen")
+                    continue
+                be_bag = Bag(
+                    symbol=symbol, exchange='SMART', currency='USD',
+                    comboLegs=[
+                        ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
+                        ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
+                    ]
+                )
+                be_order = LimitOrder('BUY', 1, be_close, tif='GTC')
+                be_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+                be_order.account = _cfg.get('ib_account', '')
+                be_trade = ib.placeOrder(be_bag, be_order)
+                info['sl_order_id'] = be_trade.order.orderId
+                log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC gesetzt "
+                    f"(ID: {be_trade.order.orderId}) | P&L: +${pnl_dollar:.0f}")
+
             _save_state()
-            log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC gesetzt "
-                f"(ID: {be_trade.order.orderId}) | P&L: +${pnl_dollar:.0f}")
 
         # Unrealized P&L in trade-Info speichern (für Launcher-Anzeige)
         info['unrealized_pnl'] = round(pnl_dollar, 2)

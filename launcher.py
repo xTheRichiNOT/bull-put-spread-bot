@@ -91,6 +91,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.38": [
+        "🐛  Error 201 Fix (Root Cause): Breakeven-SL modifiziert jetzt die bestehende SL-Order direkt (Modify) statt Cancel + neue Order",
+        "🐛  Kein Cancel des TP mehr nötig — TP-Leg (BUY long_put) und BE-SL-Leg (SELL long_put) kollidieren nicht mehr",
+        "🐛  Fallback: wenn SL bereits weg (OCA durch TP-Fill), wird nur TP gecancelt und nach Bestätigung neue Order gesetzt",
+    ],
     "1.0.37": [
         "🐛  Error 201 Fix: Breakeven-SL wartet jetzt 3s + IB-Sync bevor neue Order — Cancel wird bei IB bestätigt bevor Folge-Order platziert wird",
         "🐛  TP/SL-Stornierungen sperren Symbol nicht mehr fälschlicherweise ('cancelled') — nur unerwartete Cancels sperren",
