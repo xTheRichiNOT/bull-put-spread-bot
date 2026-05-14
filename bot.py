@@ -1,13 +1,32 @@
 import math
 import asyncio
 import os
+import sys
+import json
+import queue
 import random
 import logging
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# Writable base dir: Application Support (frozen) or next to bot.py (dev)
+if getattr(sys, 'frozen', False):
+    if sys.platform == "darwin":
+        _BASE = os.path.join(os.path.expanduser("~"), "Library",
+                             "Application Support", "BullPutSpreadBot")
+    elif sys.platform == "win32":
+        _BASE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                             "BullPutSpreadBot")
+    else:
+        _BASE = os.path.join(os.path.expanduser("~"), ".local",
+                             "share", "BullPutSpreadBot")
+    os.makedirs(_BASE, exist_ok=True)
+else:
+    _BASE = os.path.dirname(os.path.abspath(__file__))
+
 # Load .env file automatically (no extra dependencies needed)
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+_env_path = os.path.join(_BASE, '.env')
 if os.path.exists(_env_path):
     with open(_env_path) as _f:
         for _line in _f:
@@ -18,7 +37,7 @@ if os.path.exists(_env_path):
 
 # ── Config laden (config.json) ───────────────────────────────────────────────
 import json as _json
-_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+_cfg_path = os.path.join(_BASE, 'config.json')
 _cfg_defaults = {
     "ib_host": "127.0.0.1", "ib_port": 7497, "ib_account": "",
     "min_vola": 0.28, "abstand_y": 0.10, "min_credit": 70,
@@ -38,7 +57,7 @@ else:
 # ────────────────────────────────────────────────────────────────────────────
 
 # ── Logging: Terminal + trades.log ──────────────────────────────────────────
-_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trades.log')
+_log_path = os.path.join(_BASE, 'trades.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(message)s',
@@ -50,8 +69,14 @@ logging.basicConfig(
 )
 # ib_insync produziert massenhaft position/updatePortfolio Logs — nur Fehler zeigen
 logging.getLogger('ib_insync').setLevel(logging.ERROR)
+_log_queue: queue.Queue = queue.Queue()
+
 def log(msg: str):
     logging.info(msg)
+    try:
+        _log_queue.put_nowait(msg + '\n')
+    except Exception:
+        pass
 # ────────────────────────────────────────────────────────────────────────────
 
 MIN_AVAILABLE_FUNDS = int(_cfg['min_available_funds'])
@@ -195,12 +220,85 @@ def is_market_open() -> bool:
     close_t = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
     return open_t <= now_et < close_t
 
+def seconds_until_market_open() -> tuple:
+    """Gibt (Sekunden, nächste Öffnungszeit ET) bis zur nächsten NYSE-Öffnung zurück."""
+    now_et = datetime.now(ZoneInfo('America/New_York'))
+    days_ahead = 0
+    while True:
+        check = (now_et + timedelta(days=days_ahead)).replace(
+            hour=9, minute=30, second=0, microsecond=0)
+        if check.weekday() < 5 and check > now_et:
+            break
+        days_ahead += 1
+    secs = max(60, int((check - now_et).total_seconds()))
+    return secs, check
+
 # Speichert IV vom letzten Scan pro Symbol — für Spike-Erkennung
 _iv_memory: dict = {}
 # Speichert aktive Bot-Trades für Exit-Monitoring
 _bot_trades: dict = {}
 
-_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.bot_state.json')
+_STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
+_HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
+_POSITIONS_FILE = os.path.join(_BASE, 'positions.json')
+
+def _write_positions_file():
+    """Schreibt offene Positionen für den Launcher (Live-Anzeige im Historie-Tab)."""
+    try:
+        positions = []
+        for sym, info in _bot_trades.items():
+            if info.get('status') in ('done', 'failed'):
+                continue
+            try:
+                exp_date = datetime.strptime(info.get('expiry_yf', ''), '%Y-%m-%d')
+                dte = max(0, (exp_date.date() - datetime.now().date()).days)
+            except Exception:
+                dte = 0
+            entry = info.get('entry_per_share', 0.0)
+            positions.append({
+                'symbol':          sym,
+                'expiry':          info.get('expiry_yf', ''),
+                'dte':             dte,
+                'short_strike':    info.get('short_strike', 0),
+                'long_strike':     info.get('long_strike', 0),
+                'entry_per_share': round(entry, 2),
+                'tp_target':       round(entry * 0.5, 2),
+                'status':          info.get('status', 'open'),
+                'opened_at':       info.get('opened_at', ''),
+                'unrealized_pnl':  info.get('unrealized_pnl'),  # None wenn noch nicht berechnet
+            })
+        with open(_POSITIONS_FILE, 'w') as f:
+            json.dump({
+                'updated': datetime.now().strftime('%H:%M:%S'),
+                'positions': positions,
+            }, f, indent=2)
+    except Exception:
+        pass
+
+def _append_history(symbol: str, info: dict, exit_per_share: float = 0.0):
+    """Hängt einen abgeschlossenen Trade an trade_history.json an."""
+    try:
+        history = []
+        if os.path.exists(_HISTORY_FILE):
+            with open(_HISTORY_FILE) as f:
+                history = json.load(f)
+        entry = info.get('entry_per_share', 0.0)
+        pnl   = round((entry - exit_per_share) * 100, 2)
+        history.append({
+            'symbol':          symbol,
+            'expiry':          info.get('expiry_yf', ''),
+            'short_strike':    info.get('short_strike', 0),
+            'long_strike':     info.get('long_strike', 0),
+            'entry_per_share': round(entry, 2),
+            'exit_per_share':  round(exit_per_share, 2),
+            'pnl':             pnl,
+            'status':          info.get('status', 'done'),
+            'closed_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
+        })
+        with open(_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        pass
 
 def _load_state():
     """Lädt aktive Spread-Positionen vom letzten Lauf — verhindert Duplikate nach Neustart.
@@ -218,7 +316,7 @@ def _load_state():
                 _bot_trades[sym] = info
                 loaded += 1
         if loaded:
-            print(f"   {loaded} aktive Spread-Position(en) aus State-File geladen")
+            log(f"   {loaded} aktive Spread-Position(en) aus State-File geladen")
     except Exception:
         pass
 
@@ -259,11 +357,12 @@ def _on_order_status(trade):
         _save_state()
     elif status == 'Filled':
         if _bot_trades[sym].get('status') == 'closing':
+            exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
+            _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
             log(f"  ✅ [{sym}] Exit-Order gefüllt — Position geschlossen")
         else:
             _bot_trades[sym]['status'] = 'open'
-            # Fill-Preis überschreibt Limit-Preis für korrekte P&L-Berechnung
             fill = trade.orderStatus.avgFillPrice
             if fill and fill > 0:
                 _bot_trades[sym]['entry_per_share'] = abs(fill)
@@ -299,16 +398,26 @@ async def get_market_data(symbol):
     def _fetch():
         import yfinance as yf
         ticker = yf.Ticker(symbol)
-        price = ticker.fast_info['last_price']
+        # fast_info kann bei manchen yfinance-Versionen mit _dividends-Bug crashen
+        try:
+            price = ticker.fast_info['last_price']
+        except Exception:
+            hist = ticker.history(period='1d')
+            price = float(hist['Close'].iloc[-1]) if not hist.empty else None
         if not price or price != price:
             return None, None
         expirations = ticker.options
         if not expirations:
             return price, None
         today = datetime.now()
-        valid = [e for e in expirations
-                 if MIN_DTE <= (datetime.strptime(e, '%Y-%m-%d') - today).days <= MAX_DTE]
-        expiry = valid[0] if valid else expirations[0]
+        dte_map = [(e, (datetime.strptime(e, '%Y-%m-%d') - today).days) for e in expirations]
+        valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
+        if not valid:
+            # Fallback: Expiry am nächsten an MIN_DTE, mindestens 14 DTE (verhindert 0-IV Weeklies)
+            candidates = [(e, d) for e, d in dte_map if d >= 14]
+            expiry = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0] if candidates else expirations[-1]
+        else:
+            expiry = valid[0]
         puts = ticker.option_chain(expiry).puts
         if puts.empty:
             return price, None
@@ -318,7 +427,7 @@ async def get_market_data(symbol):
     try:
         return await asyncio.to_thread(_fetch)
     except Exception as e:
-        print(f"   [{symbol}] ❌ yfinance Fehler: {e}")
+        log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
 
 async def check_news_trigger(symbol):
@@ -347,11 +456,17 @@ async def fetch_signal(symbol, preis, iv):
         import yfinance as yf
         ticker = yf.Ticker(symbol)
         today = datetime.now()
-        valid = [e for e in ticker.options
-                 if MIN_DTE <= (datetime.strptime(e, '%Y-%m-%d') - today).days <= MAX_DTE]
+        dte_map = [(e, (datetime.strptime(e, '%Y-%m-%d') - today).days)
+                   for e in ticker.options]
+        valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
         if not valid:
-            return None, None, None
-        expiry_str = valid[0]
+            # Fallback: Expiry am nächsten an MIN_DTE, mindestens 21 DTE
+            candidates = [(e, d) for e, d in dte_map if d >= 21]
+            if not candidates:
+                return None, None, None
+            expiry_str = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0]
+        else:
+            expiry_str = valid[0]
         puts = ticker.option_chain(expiry_str).puts
         dte = (datetime.strptime(expiry_str, '%Y-%m-%d') - today).days
         return expiry_str, puts, dte
@@ -435,7 +550,7 @@ async def fetch_signal(symbol, preis, iv):
             'score':         score,
         }
     except Exception as e:
-        print(f"   [{symbol}] ❌ fetch_signal Fehler: {e}")
+        log(f"   [{symbol}] ❌ fetch_signal Fehler: {e}")
         return None
 
 def count_bot_orders():
@@ -530,9 +645,8 @@ async def close_spread(ib, symbol, info, reason):
         trade = ib.placeOrder(bag, order)
         log(f"  {icon} [{symbol}] EXIT {label} | Order ID: {trade.order.orderId}")
     except Exception as e:
-        log(f"  ❌ [{symbol}] Exit-Fehler: {e}")
         import traceback
-        traceback.print_exc()
+        log(f"  ❌ [{symbol}] Exit-Fehler: {e}\n{traceback.format_exc()}")
 
 async def monitor_exits(ib=None):
     """DTE-Exit und Breakeven-Update. TP/SL werden von IBKR-Bracket-Orders verwaltet."""
@@ -571,10 +685,13 @@ async def monitor_exits(ib=None):
         pnl_dollar = pnl_share * 100
         pnl_pct    = (pnl_share / entry * 100) if entry > 0 else 0
 
-        # Breakeven: alten SL stornieren und durch Breakeven-Order ersetzen
+        # Breakeven: SL UND TP stornieren, dann neuen Breakeven-SL platzieren
+        # (Error 201 vermeiden: IB erlaubt nicht 2 Closing-BUY-Orders gleichzeitig)
         if pnl_share >= entry * BREAKEVEN_TRIGGER_PCT and not info.get('at_breakeven'):
             info['at_breakeven'] = True
             _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
+            _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
+            await asyncio.sleep(0.5)   # kurz warten bis Cancel bei IB angekommen
             be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
             be_bag = Bag(
                 symbol=symbol, exchange='SMART', currency='USD',
@@ -592,15 +709,18 @@ async def monitor_exits(ib=None):
             log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC gesetzt "
                 f"(ID: {be_trade.order.orderId}) | P&L: +${pnl_dollar:.0f}")
 
+        # Unrealized P&L in trade-Info speichern (für Launcher-Anzeige)
+        info['unrealized_pnl'] = round(pnl_dollar, 2)
+
         # P&L Logging
         be_pct  = BREAKEVEN_TRIGGER_PCT * 100
         tp_pct  = TAKE_PROFIT_PCT * 100
         sl_pct  = STOP_LOSS_MULT  * 100
         arrow   = '📈' if pnl_pct >= 0 else '📉'
         be_flag = '  🔒 Breakeven aktiv' if info.get('at_breakeven') else f'  (BE bei +{be_pct:.0f}%)'
-        print(f"  {arrow} [{symbol}] {pnl_pct:+.1f}% (${pnl_dollar:+.0f})"
-              f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
-              f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
+        log(f"  {arrow} [{symbol}] {pnl_pct:+.1f}% (${pnl_dollar:+.0f})"
+            f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
+            f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
 
 async def place_order(ib, sig):
     """Platziert eine Combo-Order auf IB für ein gegebenes Signal-Dict."""
@@ -759,6 +879,7 @@ async def place_order(ib, sig):
             'at_breakeven':    False,
             'tp_order_id':     0,
             'sl_order_id':     0,
+            'opened_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
         }
 
         # ── Bracket-Order: Entry + TP + SL, alle GTC ─────────────────────────
@@ -802,32 +923,31 @@ async def place_order(ib, sig):
         log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100:.0f})")
         log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100:.0f})")
     except Exception as e:
-        log(f"  ❌ [{sym}] Order-Fehler: {e}")
         import traceback
-        traceback.print_exc()
+        log(f"  ❌ [{sym}] Order-Fehler: {e}\n{traceback.format_exc()}")
 
 def print_ranking(signals, selected):
     """Zeigt eine Ranking-Tabelle aller Signale dieses Zyklus."""
     selected_symbols = {s['symbol'] for s in selected}
-    print(f"\n{'─'*108}")
-    print(f"  {'#':<3} {'Symbol':<6} {'IV':>6} {'Kurs':>8} {'Strike':>12} "
-          f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'P(MaxL)':>8} {'EV':>7} {'Score':>7}  Status")
-    print(f"{'─'*116}")
+    log(f"\n{'─'*108}")
+    log(f"  {'#':<3} {'Symbol':<6} {'IV':>6} {'Kurs':>8} {'Strike':>12} "
+        f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'P(MaxL)':>8} {'EV':>7} {'Score':>7}  Status")
+    log(f"{'─'*116}")
     for i, s in enumerate(signals, 1):
         status  = "→ TRADE" if s['symbol'] in selected_symbols else "  skip"
         triggers = ', '.join(s.get('triggers', []))
-        print(f"  {i:<3} {s['symbol']:<6} {s['iv']:>6.1%} {s['preis']:>8.2f} "
-              f"  {s['short_strike']:>5.0f}P/{s['long_strike']:>4.0f}P "
-              f"  ${s['credit']:>6.2f}"
-              f"  {s['risk_reward']:>5.2f}x  {s.get('prob_otm', 0):>6.1%}  {s.get('prob_max_loss', 0):>7.1%}"
-              f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f}  {status}")
+        log(f"  {i:<3} {s['symbol']:<6} {s['iv']:>6.1%} {s['preis']:>8.2f} "
+            f"  {s['short_strike']:>5.0f}P/{s['long_strike']:>4.0f}P "
+            f"  ${s['credit']:>6.2f}"
+            f"  {s['risk_reward']:>5.2f}x  {s.get('prob_otm', 0):>6.1%}  {s.get('prob_max_loss', 0):>7.1%}"
+            f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f}  {status}")
         if triggers:
-            print(f"       ↳ {triggers}")
-    print(f"{'─'*108}")
+            log(f"       ↳ {triggers}")
+    log(f"{'─'*108}")
 
-async def run_bot():
+async def run_bot(stop_event: threading.Event = None):
     ib = IB()
-    print("🤖 Master-Bot startet... Verbinde zur TWS (Port 7497)")
+    log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7497)})")
 
     try:
         client_id = random.randint(10, 999)
@@ -836,7 +956,7 @@ async def run_bot():
             int(_cfg.get('ib_port', 7497)),
             clientId=client_id,
         )
-        print("✅ Verbunden mit TWS (nur für Order-Placement)")
+        log("✅ Verbunden mit IB (nur für Order-Placement)")
 
         # Verzögerte Marktdaten aktivieren (Typ 3) — kein Echtzeit-Abo nötig
         ib.reqMarketDataType(3)
@@ -853,50 +973,97 @@ async def run_bot():
         # Gespeicherten State vom letzten Lauf laden (heute gecancelte Symbole sperren)
         _load_state()
 
-        # Bestehende offene Orders von IB laden — verhindert Duplikate nach Neustart
+        # Bestehende offene Options-Orders von IB laden — verhindert Duplikate nach Neustart
         open_orders = await ib.reqAllOpenOrdersAsync()
         pre_loaded  = 0
         for o in open_orders:
             sym = o.contract.symbol
-            if sym in WATCHLIST and sym not in _bot_trades:
+            if sym in WATCHLIST and sym not in _bot_trades and o.contract.secType == 'OPT':
                 _bot_trades[sym] = {'status': 'open', 'entry_per_share': o.order.lmtPrice,
                                     'at_breakeven': False}
                 pre_loaded += 1
-        # Bestehende Positionen für Watchlist-Symbole ebenfalls sperren
+
+        # Bestehende Options-Positionen: Spread-Details aus IB rekonstruieren
+        # Gruppiere PUT-Legs nach Symbol → short (qty<0) + long (qty>0) = Bull-Put-Spread
+        put_by_sym: dict = {}
         for p in ib.positions():
             sym = p.contract.symbol
-            if sym in WATCHLIST and sym not in _bot_trades:
-                _bot_trades[sym] = {'status': 'open', 'entry_per_share': 0,
-                                    'at_breakeven': False}
-                pre_loaded += 1
+            if sym not in WATCHLIST or p.contract.secType != 'OPT':
+                continue
+            if p.contract.right not in ('P', 'PUT'):
+                continue
+            put_by_sym.setdefault(sym, []).append(p)
+
+        for sym, legs in put_by_sym.items():
+            if sym in _bot_trades:
+                continue
+            short_legs = [p for p in legs if p.position < 0]
+            long_legs  = [p for p in legs if p.position > 0]
+            entry: dict = {'status': 'open', 'at_breakeven': False, 'entry_per_share': 0}
+
+            if short_legs:
+                sl = max(short_legs, key=lambda x: x.contract.strike)
+                entry['short_strike'] = sl.contract.strike
+                entry['short_conid']  = sl.contract.conId
+                raw = abs(sl.avgCost)
+                # IB gibt avgCost per-Kontrakt (×100) zurück → pro Share umrechnen
+                entry['entry_per_share'] = raw / 100 if raw > 10 else raw
+                exp = sl.contract.lastTradeDateOrContractMonth
+                try:
+                    entry['expiry_yf'] = datetime.strptime(exp[:8], '%Y%m%d').strftime('%Y-%m-%d')
+                except Exception:
+                    entry['expiry_yf'] = exp
+
+            if long_legs:
+                ll = min(long_legs, key=lambda x: x.contract.strike)
+                entry['long_strike'] = ll.contract.strike
+                entry['long_conid']  = ll.contract.conId
+                raw_paid = abs(ll.avgCost)
+                paid = raw_paid / 100 if raw_paid > 10 else raw_paid
+                entry['entry_per_share'] = max(0, entry.get('entry_per_share', 0) - paid)
+
+            _bot_trades[sym] = entry
+            pre_loaded += 1
+
         if pre_loaded:
-            print(f"   {pre_loaded} bestehende Order(s)/Position(en) aus IB geladen — werden nicht dupliziert")
-        print()
+            log(f"   {pre_loaded} bestehende Order(s)/Position(en) aus IB geladen — werden nicht dupliziert")
+        log("")
     except TimeoutError:
-        print("❌ Verbindung zu TWS fehlgeschlagen (Timeout auf Port 7497).")
-        print("   → TWS/IB Gateway läuft?")
-        print("   → API aktiviert? (Edit → Global Configuration → API → Enable Socket Clients)")
-        print("   → Port korrekt? Paper=7497, Live=7496, Gateway-Paper=4002, Gateway-Live=4001")
+        port = _cfg.get('ib_port', 7497)
+        log(f"❌ Verbindung fehlgeschlagen (Timeout auf Port {port}).")
+        log("   → TWS/IB Gateway läuft?")
+        log("   → API aktiviert? (Edit → Global Configuration → API → Enable Socket Clients)")
+        log("   → Port korrekt? Paper=7497, Live=7496, Gateway-Paper=4002, Gateway-Live=4001")
         ib.disconnect()
         return
 
     try:
-        while True:
+        while not (stop_event and stop_event.is_set()):
             market_open = is_market_open()
             now_et = datetime.now(ZoneInfo('America/New_York'))
-            print(f"\n{'═'*72}")
-            print(f"  ZYKLUS  {datetime.now().strftime('%H:%M:%S')}"
-                  f"  (NYSE: {'🟢 OFFEN' if market_open else '🔴 GESCHLOSSEN'}"
-                  f"  ET {now_et.strftime('%H:%M')})")
-            print(f"{'═'*72}")
+            log(f"\n{'═'*72}")
+            log(f"  ZYKLUS  {datetime.now().strftime('%H:%M:%S')}"
+                f"  (NYSE: {'🟢 OFFEN' if market_open else '🔴 GESCHLOSSEN'}"
+                f"  ET {now_et.strftime('%H:%M')})")
+            log(f"{'═'*72}")
 
             # ── Exit-Monitoring läuft immer — auch außerhalb der Handelszeiten ──
             await monitor_exits(ib)
+            _write_positions_file()   # Immer schreiben (auch bei geschlossenem Markt)
 
             if not market_open:
-                print(f"  ⏸️  Außerhalb NYSE-Handelszeiten (09:30–16:00 ET) — kein Scan, kein Trade")
-                print(f"  Pause {SCAN_INTERVALL}s ...")
-                await asyncio.sleep(SCAN_INTERVALL)
+                wait_sec, open_et = seconds_until_market_open()
+                h, rem = divmod(wait_sec, 3600)
+                m      = rem // 60
+                log(f"  ⏸️  Außerhalb NYSE-Handelszeiten (09:30–16:00 ET) — kein Scan, kein Trade")
+                log(f"  💤  Markt öffnet in {h}h {m}min  (ET {open_et.strftime('%a %H:%M')})  — Bot schläft")
+                slept = 0
+                while slept < wait_sec:
+                    if stop_event and stop_event.is_set():
+                        break
+                    chunk = min(30, wait_sec - slept)
+                    await asyncio.sleep(chunk)
+                    slept += chunk
                 continue
 
             # ── Phase 1: Alle Symbole parallel scannen ───────────────────────
@@ -906,10 +1073,10 @@ async def run_bot():
                 async with _sem:
                     preis, iv = await get_market_data(symbol)
                 if preis is None:
-                    print(f"   [{symbol}] ⏳ Keine Preisdaten")
+                    log(f"   [{symbol}] ⏳ Keine Preisdaten")
                     return None
                 if iv is None:
-                    print(f"   [{symbol}] ⏳ Kein IV — überspringe")
+                    log(f"   [{symbol}] ⏳ Kein IV — überspringe")
                     return None
 
                 prev_iv    = _iv_memory.get(symbol)
@@ -921,12 +1088,12 @@ async def run_bot():
                     news_hit, headline = await check_news_trigger(symbol)
 
                 if iv <= MIN_VOLA:
-                    print(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
+                    log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
                     return None
 
                 if not first_scan and not iv_spike and not news_hit:
                     delta = f"Δ={iv - prev_iv:+.1%}"
-                    print(f"   [{symbol}] –  IV={iv:.1%} stabil ({delta}, kein Spike ≥{MIN_IV_SPIKE:.0%}, keine News)")
+                    log(f"   [{symbol}] –  IV={iv:.1%} stabil ({delta}, kein Spike ≥{MIN_IV_SPIKE:.0%}, keine News)")
                     return None
 
                 trigger_reasons = []
@@ -937,7 +1104,7 @@ async def run_bot():
                 if news_hit:
                     trigger_reasons.append(f"News: \"{headline[:60]}\"")
 
-                print(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
+                log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
 
                 async with _sem:
                     sig = await fetch_signal(symbol, preis, iv)
@@ -951,7 +1118,7 @@ async def run_bot():
             all_signals = [s for s in results if s is not None]
             elapsed = (datetime.now() - t0).seconds
             scanned = len([r for r in results if r is not None or r is None])
-            print(f"\n   Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
+            log(f"\n   Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
 
             # ── Phase 2: Signale filtern und ranken ───────────────────────────
             qualified = [
@@ -989,9 +1156,16 @@ async def run_bot():
 
                 # Margin-Check: Available Funds vor jedem Trade-Zyklus prüfen
                 try:
-                    acct = {v.tag: v.value for v in ib.accountValues()
-                            if v.currency in ('USD', '')}
-                    available = float(acct.get('AvailableFunds', acct.get('AvailableFunds-S', 0)))
+                    # USD-Einträge haben Vorrang — currency='' kann 0-Einträge liefern die echte Werte überschreiben
+                    acct_usd = {v.tag: v.value for v in ib.accountValues() if v.currency == 'USD'}
+                    acct_any = {v.tag: v.value for v in ib.accountValues() if v.currency in ('USD', '')}
+                    raw = (acct_usd.get('AvailableFunds')
+                           or acct_usd.get('AvailableFunds-S')
+                           or acct_any.get('AvailableFunds')
+                           or acct_any.get('AvailableFunds-S')
+                           or acct_any.get('NetLiquidation')
+                           or '0')
+                    available = float(raw)
                     log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
                     if available < MIN_AVAILABLE_FUNDS:
                         log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
@@ -1040,13 +1214,13 @@ async def run_bot():
                         reasons.append(f"EV {s.get('ev', 0):+.2f}$ negativer Erwartungswert")
                     log(f"  ✗ [{s['symbol']}] blockiert: {', '.join(reasons)}")
             else:
-                print("\n  Keine Signale in diesem Zyklus.")
+                log("\n  Keine Signale in diesem Zyklus.")
 
             if best_rr:
-                print(f"  Bestes R/R: {best_rr:.2f}x | {len(tradeable)} Signale qualifiziert")
+                log(f"  Bestes R/R: {best_rr:.2f}x | {len(tradeable)} Signale qualifiziert")
 
             if not AUTO_TRADE:
-                print("  [AUTO_TRADE aus — nur Anzeige]")
+                log("  [AUTO_TRADE aus — nur Anzeige]")
             elif slots <= 0:
                 log(f"  ⏸️  Bot-Limit erreicht ({open_count}/{MAX_POSITIONS} Orders diese Session) — kein neuer Trade")
             elif not tradeable:
@@ -1054,18 +1228,24 @@ async def run_bot():
 
             # ── Phase 4: Orders platzieren ────────────────────────────────────
             for sig in selected:
-                print(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}")
+                log(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}")
                 await place_order(ib, sig)
 
-            print(f"\n  Pause {SCAN_INTERVALL}s ...")
-            await asyncio.sleep(SCAN_INTERVALL)
+            # Positionen für Launcher-Anzeige schreiben
+            _write_positions_file()
+
+            log(f"\n  Pause {SCAN_INTERVALL}s ...")
+            for _ in range(SCAN_INTERVALL):
+                if stop_event and stop_event.is_set():
+                    break
+                await asyncio.sleep(1)
 
     except Exception as e:
-        print(f"KRITISCHER FEHLER: {e}")
         import traceback
-        traceback.print_exc()
+        log(f"KRITISCHER FEHLER: {e}\n{traceback.format_exc()}")
     finally:
         ib.disconnect()
+        log("🔌 IB-Verbindung getrennt.")
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

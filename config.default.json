@@ -1,0 +1,18 @@
+{
+  "ib_host": "127.0.0.1",
+  "ib_port": 4002,
+  "ib_account": "",
+  "min_vola": 0.28,
+  "abstand_y": 0.1,
+  "min_credit": 70,
+  "min_risk_reward": 0.2,
+  "max_delta": 0.28,
+  "max_positions": 8,
+  "max_per_sector": 2,
+  "scan_intervall": 60,
+  "auto_trade": true,
+  "take_profit_pct": 0.5,
+  "stop_loss_mult": 2.0,
+  "dte_exit": 21,
+  "min_available_funds": 2000
+}

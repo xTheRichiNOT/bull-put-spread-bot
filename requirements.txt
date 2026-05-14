@@ -1,0 +1,4 @@
+ib_insync
+yfinance
+customtkinter
+certifi

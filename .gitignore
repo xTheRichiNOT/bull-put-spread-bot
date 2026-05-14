@@ -1,0 +1,35 @@
+# Sensible Daten — niemals ins Repo
+config.json
+.bot_state.json
+
+# Build-Artefakte
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.spec.bak
+
+# Laufzeit-Logs
+trades.log
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code intern
+.agents/
+.claude/
+skills-lock.json

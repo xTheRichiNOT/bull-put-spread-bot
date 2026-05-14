@@ -1,0 +1,143 @@
+name: Build & Release
+
+# Wird nur ausgelöst wenn ein Tag wie v1.0.20 gepusht wird
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # braucht write um GitHub Release zu erstellen
+
+jobs:
+
+  # ── Mac DMG ──────────────────────────────────────────────────────────────────
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python-Abhängigkeiten installieren
+        run: pip install pyinstaller customtkinter ib_insync yfinance certifi pillow
+
+      - name: Config-Template vorbereiten
+        run: cp config.default.json config.json
+
+      - name: .app bauen (PyInstaller)
+        run: pyinstaller bot.spec --noconfirm
+
+      - name: DMG erstellen (create-dmg)
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          brew install create-dmg
+          create-dmg \
+            --volname "BullPutSpreadBot v${VERSION}" \
+            --window-pos 200 120 \
+            --window-size 560 320 \
+            --icon-size 120 \
+            --icon "BullPutSpreadBot.app" 150 160 \
+            --hide-extension "BullPutSpreadBot.app" \
+            --app-drop-link 410 160 \
+            "dist/BullPutSpreadBot-v${VERSION}.dmg" \
+            "dist/BullPutSpreadBot.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: dist/BullPutSpreadBot-v*.dmg
+
+  # ── Windows EXE ──────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python-Abhängigkeiten installieren
+        run: pip install pyinstaller customtkinter ib_insync yfinance certifi pillow
+
+      - name: Config-Template vorbereiten
+        run: copy config.default.json config.json
+
+      - name: EXE bauen (PyInstaller)
+        run: pyinstaller bot.spec --noconfirm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/BullPutSpreadBot.exe
+
+  # ── Linux tar.gz ─────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: System-Abhängigkeiten installieren (tkinter + virtueller Display)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-tk xvfb
+
+      - name: Python-Abhängigkeiten installieren
+        run: pip install pyinstaller customtkinter ib_insync yfinance certifi pillow
+
+      - name: Config-Template vorbereiten
+        run: cp config.default.json config.json
+
+      - name: Binary bauen (PyInstaller, headless via Xvfb)
+        run: xvfb-run pyinstaller bot.spec --noconfirm
+
+      - name: Als tar.gz packen
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          tar -czf "dist/BullPutSpreadBot-v${VERSION}-linux.tar.gz" \
+              -C dist BullPutSpreadBot
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar
+          path: dist/BullPutSpreadBot-v*-linux.tar.gz
+
+  # ── GitHub Release erstellen ─────────────────────────────────────────────────
+  release:
+    needs: [build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Alle Build-Artefakte herunterladen
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: GitHub Release + Binaries hochladen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          gh release create "$VERSION" \
+            --title "BullPutSpreadBot $VERSION" \
+            --notes "## Installation
+
+**Mac:** DMG herunterladen → App in /Programme ziehen → Starten
+
+**Windows:** EXE herunterladen → Doppelklick → Direkt nutzen (kein Python nötig)
+
+**Linux:** tar.gz entpacken → \`./BullPutSpreadBot/BullPutSpreadBot\` ausführen
+
+---
+> Bereits installierte Apps erhalten dieses Update automatisch beim nächsten Start." \
+            artifacts/BullPutSpreadBot-v*.dmg \
+            artifacts/BullPutSpreadBot.exe \
+            artifacts/BullPutSpreadBot-v*-linux.tar.gz
