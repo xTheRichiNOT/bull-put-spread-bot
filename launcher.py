@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.25": [
+        "✅  Windows: ICO in sicheren Temp-Pfad kopiert (kein Leerzeichen-Problem in Tcl/Tk)",
+    ],
     "1.0.24": [
         "✅  Windows: Icon via Windows-API gesetzt (ctypes) — zuverlässig in Titelleiste und Taskleiste",
     ],
@@ -787,18 +790,25 @@ class BotLauncher(ctk.CTk):
     def _set_icon(self):
         try:
             if sys.platform == "win32":
-                ico_path = None
+                ico_src = None
                 for base in [_BASE, _BUNDLE_BASE] + ([sys._MEIPASS] if hasattr(sys, "_MEIPASS") else []):
                     p = os.path.join(base, "icons", "icon.ico")
                     if os.path.exists(p):
-                        ico_path = p
+                        ico_src = p
                         break
-                if ico_path:
+                if ico_src:
+                    # Kopiere ICO in sicheren Pfad ohne Leerzeichen (Tcl/Tk mag keine)
+                    import tempfile
+                    ico_path = os.path.join(tempfile.gettempdir(), "bpsb_icon.ico")
+                    try:
+                        shutil.copy2(ico_src, ico_path)
+                    except Exception:
+                        ico_path = ico_src
                     try:
                         self.iconbitmap(ico_path)
                     except Exception:
                         pass
-                    self.after(200, lambda p=ico_path: self._set_icon_win32(p))
+                    self.after(300, lambda p=ico_path: self._set_icon_win32(p))
                 return
             from PIL import Image, ImageTk
             path = os.path.join(_BASE, "icons", "icon.png")
@@ -823,7 +833,6 @@ class BotLauncher(ctk.CTk):
     def _set_icon_win32(self, ico_path: str):
         try:
             import ctypes
-            import ctypes.wintypes
             WM_SETICON = 0x0080
             IMAGE_ICON = 1
             LR_LOADFROMFILE = 0x00000010
