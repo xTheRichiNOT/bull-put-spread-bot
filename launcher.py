@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.24": [
+        "✅  Windows: Icon via Windows-API gesetzt (ctypes) — zuverlässig in Titelleiste und Taskleiste",
+    ],
     "1.0.23": [
         "✅  Windows: Fenster- und Taskleisten-Icon jetzt korrekt (ICO statt PNG)",
     ],
@@ -784,11 +787,19 @@ class BotLauncher(ctk.CTk):
     def _set_icon(self):
         try:
             if sys.platform == "win32":
+                ico_path = None
                 for base in [_BASE, _BUNDLE_BASE] + ([sys._MEIPASS] if hasattr(sys, "_MEIPASS") else []):
-                    ico = os.path.join(base, "icons", "icon.ico")
-                    if os.path.exists(ico):
-                        self.iconbitmap(ico)
-                        return
+                    p = os.path.join(base, "icons", "icon.ico")
+                    if os.path.exists(p):
+                        ico_path = p
+                        break
+                if ico_path:
+                    try:
+                        self.iconbitmap(ico_path)
+                    except Exception:
+                        pass
+                    self.after(200, lambda p=ico_path: self._set_icon_win32(p))
+                return
             from PIL import Image, ImageTk
             path = os.path.join(_BASE, "icons", "icon.png")
             if not os.path.exists(path):
@@ -806,6 +817,22 @@ class BotLauncher(ctk.CTk):
                     AppKit.NSApp.setApplicationIconImage_(ns_img)
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _set_icon_win32(self, ico_path: str):
+        try:
+            import ctypes
+            import ctypes.wintypes
+            WM_SETICON = 0x0080
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x00000010
+            hIcon = ctypes.windll.user32.LoadImageW(
+                None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | 0x00000040)
+            if hIcon:
+                hwnd = self.winfo_id()
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, hIcon)
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, hIcon)
         except Exception:
             pass
 
@@ -2119,6 +2146,14 @@ class BotLauncher(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com.bullputspreadbot.launcher")
+        except Exception:
+            pass
+
     # Aktiviere pending launcher-Update (launcher.py.new → launcher.py)
     _new = os.path.join(_BASE, "launcher.py.new")
     if os.path.exists(_new):
