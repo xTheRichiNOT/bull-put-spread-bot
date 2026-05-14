@@ -402,12 +402,47 @@ def _bs_prob_otm(S, K, T, sigma, r=0.045):
         0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))))
     return (1 - p) if d2 > 0 else p
 
-async def get_market_data(symbol):
-    """Hole Kurs und ATM-IV via yfinance."""
+async def get_market_data(symbol, ib=None):
+    """Hole Kurs und ATM-IV. IB Gateway zuerst, Fallback auf yfinance."""
+    import math as _math
+
+    # ── IB-Pfad ───────────────────────────────────────────────────────────────
+    if ib and ib.isConnected():
+        try:
+            from ib_insync import Stock as _Stock
+            t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
+            await asyncio.sleep(2)
+            try:
+                ib.cancelMktData(t)
+            except Exception:
+                pass
+            ib_price = None
+            for v in (t.last, t.close, t.bid):
+                if v and v > 0 and not _math.isnan(v):
+                    ib_price = float(v)
+                    break
+            ib_iv = None
+            if (t.impliedVolatility and not _math.isnan(t.impliedVolatility)
+                    and t.impliedVolatility > 0):
+                ib_iv = float(t.impliedVolatility)
+            if ib_price and ib_iv:
+                return ib_price, ib_iv
+            if ib_price:
+                # Kurs von IB — IV via yfinance nachladen
+                _, yf_iv = await _get_market_data_yf(symbol)
+                return ib_price, yf_iv
+        except Exception:
+            pass
+
+    # ── yfinance-Fallback ─────────────────────────────────────────────────────
+    return await _get_market_data_yf(symbol)
+
+
+async def _get_market_data_yf(symbol):
+    """Kurs + ATM-IV ausschließlich via yfinance (interner Fallback)."""
     def _fetch():
         import yfinance as yf
         ticker = yf.Ticker(symbol)
-        # fast_info kann bei manchen yfinance-Versionen mit _dividends-Bug crashen
         try:
             price = ticker.fast_info['last_price']
         except Exception:
@@ -422,7 +457,6 @@ async def get_market_data(symbol):
         dte_map = [(e, (datetime.strptime(e, '%Y-%m-%d') - today).days) for e in expirations]
         valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
         if not valid:
-            # Fallback: Expiry am nächsten an MIN_DTE, mindestens 14 DTE (verhindert 0-IV Weeklies)
             candidates = [(e, d) for e, d in dte_map if d >= 14]
             expiry = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0] if candidates else expirations[-1]
         else:
@@ -459,7 +493,7 @@ async def check_news_trigger(symbol):
     except (asyncio.TimeoutError, Exception):
         return False, None
 
-async def fetch_signal(symbol, preis, iv):
+async def fetch_signal(symbol, preis, iv, ib=None):
     """
     Berechnet den Bull-Put-Spread für ein Symbol.
     Gibt ein Signal-Dict zurück oder None wenn kein handelbares Setup gefunden.
@@ -525,6 +559,29 @@ async def fetch_signal(symbol, preis, iv):
                 if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
                     praemie = max(bid - long_ask_yf, 0.01)
                     praemie_quelle = "yfinance (Net Bid-Ask)"
+
+        # ── IB-Preise für die gewählten Strikes (realistischer als yfinance) ──
+        if ib and ib.isConnected() and praemie_quelle in ("yfinance (Bid)", "yfinance (Net Bid-Ask)"):
+            try:
+                from ib_insync import Option as _Opt
+                expiry_ib_str = expiry_str.replace('-', '')
+                t_s = ib.reqMktData(_Opt(symbol, expiry_ib_str, short_strike, 'P', 'SMART'), '', False, False)
+                t_l = ib.reqMktData(_Opt(symbol, expiry_ib_str, long_strike,  'P', 'SMART'), '', False, False)
+                await asyncio.sleep(3)
+                ib_sb = t_s.bid if t_s.bid and t_s.bid > 0 else None
+                ib_la = t_l.ask if t_l.ask and t_l.ask > 0 else None
+                try: ib.cancelMktData(t_s)
+                except Exception: pass
+                try: ib.cancelMktData(t_l)
+                except Exception: pass
+                if ib_sb is not None and ib_la is not None:
+                    praemie = max(ib_sb - ib_la, 0.01)
+                    praemie_quelle = "IB (Bid-Ask)"
+                elif ib_sb is not None:
+                    praemie = ib_sb
+                    praemie_quelle = "IB (Bid)"
+            except Exception:
+                pass  # yfinance-Preis bleibt gültig
 
         credit    = praemie * 100
         max_risk  = (breite - praemie) * 100
@@ -1084,7 +1141,7 @@ async def run_bot(stop_event: threading.Event = None):
 
             async def scan_symbol(symbol):
                 async with _sem:
-                    preis, iv = await get_market_data(symbol)
+                    preis, iv = await get_market_data(symbol, ib)
                 if preis is None:
                     log(f"   [{symbol}] ⏳ Keine Preisdaten")
                     return None
@@ -1120,7 +1177,7 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
 
                 async with _sem:
-                    sig = await fetch_signal(symbol, preis, iv)
+                    sig = await fetch_signal(symbol, preis, iv, ib)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig

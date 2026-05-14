@@ -91,6 +91,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.31": [
+        "✅  Scan nutzt jetzt IB Gateway zuerst für Kurs, IV und Options-Preise — yfinance nur noch als Fallback",
+        "✅  Signals die den Scan passieren haben jetzt realistische IB-Preise → weniger Trade-Abbrüche durch Preis-Abweichung",
+    ],
     "1.0.30": [
         "🐛  already_traded-Fix: 'cancelled'/'failed' blockieren keinen Retry mehr — Signal wird erneut gehandelt wenn kein Fill stattfand",
     ],
