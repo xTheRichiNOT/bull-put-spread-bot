@@ -84,13 +84,17 @@ VERSION_FILE = _ver_as if os.path.exists(_ver_as) else _ver_bnd
 # Ersetze DEIN_USERNAME und DEIN_REPO mit deinen GitHub-Daten.
 # Das Repo muss öffentlich sein ODER du verwendest einen Personal Access Token.
 VERSION         = open(VERSION_FILE).read().strip() if os.path.exists(VERSION_FILE) else "1.0.0"
-UPDATE_BASE_URL = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot/main"
+UPDATE_BASE_URL = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot-releases/main"
 
 # Alle Dateien die beim Auto-Update heruntergeladen werden (inkl. launcher.py)
 UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.32": [
+        "🐛  Update-URL korrigiert (privates Repo → öffentliches Releases-Repo)",
+        "✅  Auto-Update funktioniert wieder zuverlässig",
+    ],
     "1.0.31": [
         "✅  Scan nutzt jetzt IB Gateway zuerst für Kurs, IV und Options-Preise — yfinance nur noch als Fallback",
         "✅  Signals die den Scan passieren haben jetzt realistische IB-Preise → weniger Trade-Abbrüche durch Preis-Abweichung",
