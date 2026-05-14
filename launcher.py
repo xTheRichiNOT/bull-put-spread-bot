@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.22": [
+        "✅  Windows: Sidebar-Icon und Fenster-Icon werden jetzt korrekt geladen",
+    ],
     "1.0.21": [
         "✅  Windows: saubere Meldung nach Update statt Fehlermeldung beim Neustart",
     ],
@@ -779,6 +782,10 @@ class BotLauncher(ctk.CTk):
         try:
             from PIL import Image, ImageTk
             path = os.path.join(_BASE, "icons", "icon.png")
+            if not os.path.exists(path):
+                path = os.path.join(_BUNDLE_BASE, "icons", "icon.png")
+            if not os.path.exists(path) and hasattr(sys, "_MEIPASS"):
+                path = os.path.join(sys._MEIPASS, "icons", "icon.png")
             img  = Image.open(path).resize((256, 256), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self.wm_iconphoto(True, photo)
@@ -875,6 +882,9 @@ class BotLauncher(ctk.CTk):
             _icon_path = os.path.join(_BASE, "icons", "icon.png")
             if not os.path.exists(_icon_path):
                 _icon_path = os.path.join(_BUNDLE_BASE, "icons", "icon.png")
+            # Windows one-file EXE: bundled files liegen in sys._MEIPASS
+            if not os.path.exists(_icon_path) and hasattr(sys, "_MEIPASS"):
+                _icon_path = os.path.join(sys._MEIPASS, "icons", "icon.png")
             if os.path.exists(_icon_path):
                 _img = ctk.CTkImage(
                     light_image=Image.open(_icon_path),
