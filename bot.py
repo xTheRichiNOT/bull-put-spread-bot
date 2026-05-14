@@ -598,22 +598,22 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             t_s = ib.reqMktData(s_contract, '', False, False)
             t_l = ib.reqMktData(l_contract,  '', False, False)
             await asyncio.sleep(4)
-            def _market_ask(t):
-                # Nur echte Marktpreise — kein modelGreeks (gibt inflationierten Theoriewert)
-                if t.ask and t.ask > 0:  return t.ask
-                if t.bid  and t.bid  > 0: return t.bid + 0.01
-                return 0.0
-            def _market_bid(t):
-                if t.bid and t.bid > 0:  return t.bid
-                return 0.0
-            s_ask = _market_ask(t_s)
-            l_bid = _market_bid(t_l)
+            s_bid = t_s.bid if (t_s.bid and t_s.bid > 0) else None
+            s_ask = t_s.ask if (t_s.ask and t_s.ask > 0) else None
+            l_bid = t_l.bid if (t_l.bid and t_l.bid > 0) else None
             try: ib.cancelMktData(t_s)
             except Exception: pass
             try: ib.cancelMktData(t_l)
             except Exception: pass
-            spread_width = short_strike - long_strike
-            return min(max(0.0, s_ask - l_bid), spread_width)
+            # IB-Daten nur verwenden wenn Short-Leg einen echten Bid hat.
+            # Kein Bid = illiquide/wertlos — Ask ist dann oft ein veralteter
+            # Stale-Order der den echten Marktwert massiv überschätzt.
+            if s_bid is not None:
+                ask = s_ask if s_ask else s_bid + 0.01
+                bid = l_bid if l_bid else 0.0
+                spread_width = short_strike - long_strike
+                return min(max(0.0, ask - bid), spread_width)
+            # Kein Bid auf Short-Leg → IB-Daten unzuverlässig → yfinance
         except Exception:
             pass
     # Fallback: yfinance

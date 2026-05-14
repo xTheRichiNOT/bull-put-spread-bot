@@ -91,6 +91,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.29": [
+        "🐛  P&L-Fix: IB-Daten werden nur genutzt wenn Short-Leg einen echten Bid hat — sonst yfinance",
+        "🐛  Verhindert Stale-Ask ($2.13 für wertlose OTM-Option) der P&L als -$121 statt +$91 anzeigte",
+    ],
     "1.0.28": [
         "🐛  P&L-Anzeige korrigiert — kein modelGreeks-Theoriewert mehr für wertlose OTM-Optionen",
         "🐛  Spread-Wert ist jetzt auf Spread-Breite gedeckelt (verhindert P&L-Fehler nahe Verfall)",
