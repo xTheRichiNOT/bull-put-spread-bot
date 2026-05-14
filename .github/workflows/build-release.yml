@@ -63,7 +63,7 @@ jobs:
           python-version: '3.12'
 
       - name: Python-Abhängigkeiten installieren
-        run: pip install pyinstaller customtkinter ib_insync yfinance certifi pillow
+        run: pip install pyinstaller customtkinter ib_insync yfinance certifi pillow tzdata
 
       - name: Config-Template vorbereiten
         run: copy config.default.json config.json

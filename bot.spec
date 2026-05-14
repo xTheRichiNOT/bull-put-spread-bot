@@ -34,6 +34,7 @@ a = Analysis(
         ("version.txt",      "."),
         ("requirements.txt", "."),
         ("icons/icon.png",   "icons"),
+        ("icons/icon.ico",   "icons"),
     ] + ctk_datas,
     hiddenimports=[
         "bot",
@@ -48,6 +49,7 @@ a = Analysis(
         "yfinance",
         "customtkinter",
         "zoneinfo",
+        "tzdata",
         "PIL",
         "PIL.Image",
         "PIL.ImageTk",
