@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.35": [
+        "🐛  IB-Scan: Wartezeit auf IB-Optionspreise von 3s auf 5s erhöht — Long-Ask kam bei weiter OTM Strikes zu spät an",
+    ],
     "1.0.34": [
         "🐛  IB-Scan-Fix: Credit wird nur aus IB berechnet wenn BEIDE Legs (Short Bid + Long Ask) Preise haben — verhindert künstlich aufgeblähten Credit wenn Long-Ask fehlt",
     ],

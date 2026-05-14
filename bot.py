@@ -567,7 +567,7 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                 expiry_ib_str = expiry_str.replace('-', '')
                 t_s = ib.reqMktData(_Opt(symbol, expiry_ib_str, short_strike, 'P', 'SMART'), '', False, False)
                 t_l = ib.reqMktData(_Opt(symbol, expiry_ib_str, long_strike,  'P', 'SMART'), '', False, False)
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 ib_sb = t_s.bid if t_s.bid and t_s.bid > 0 else None
                 ib_la = t_l.ask if t_l.ask and t_l.ask > 0 else None
                 try: ib.cancelMktData(t_s)
