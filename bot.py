@@ -434,7 +434,10 @@ async def get_market_data(symbol):
         iv = puts.loc[atm_idx, 'impliedVolatility']
         return price, float(iv) if iv == iv else None
     try:
-        return await asyncio.to_thread(_fetch)
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25)
+    except asyncio.TimeoutError:
+        log(f"   [{symbol}] ⏱️  yfinance Timeout (>25s) — überspringe")
+        return None, None
     except Exception as e:
         log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
@@ -452,8 +455,8 @@ async def check_news_trigger(symbol):
                     return True, title
         return False, None
     try:
-        return await asyncio.to_thread(_fetch)
-    except Exception:
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15)
+    except (asyncio.TimeoutError, Exception):
         return False, None
 
 async def fetch_signal(symbol, preis, iv):
@@ -481,7 +484,7 @@ async def fetch_signal(symbol, preis, iv):
         return expiry_str, puts, dte
 
     try:
-        expiry_yf, puts, dte = await asyncio.to_thread(_fetch_chain)
+        expiry_yf, puts, dte = await asyncio.wait_for(asyncio.to_thread(_fetch_chain), timeout=30)
         if puts is None or puts.empty:
             return None
 
@@ -558,6 +561,9 @@ async def fetch_signal(symbol, preis, iv):
             'ev_ratio':      ev_ratio,
             'score':         score,
         }
+    except asyncio.TimeoutError:
+        log(f"   [{symbol}] ⏱️  fetch_signal Timeout — überspringe")
+        return None
     except Exception as e:
         log(f"   [{symbol}] ❌ fetch_signal Fehler: {e}")
         return None
@@ -622,8 +628,8 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             return None
         return max(0.0, float(short_ask[0]) - float(long_bid[0]))
     try:
-        return await asyncio.to_thread(_fetch)
-    except Exception:
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20)
+    except (asyncio.TimeoutError, Exception):
         return None
 
 async def close_spread(ib, symbol, info, reason):
@@ -1123,10 +1129,17 @@ async def run_bot(stop_event: threading.Event = None):
                 return None
 
             t0 = datetime.now()
-            results   = await asyncio.gather(*[scan_symbol(s) for s in WATCHLIST])
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*[scan_symbol(s) for s in WATCHLIST],
+                                   return_exceptions=True),
+                    timeout=120)
+            except asyncio.TimeoutError:
+                log("  ⏱️  Scan-Timeout nach 120s — nächster Zyklus")
+                results = []
+            results     = [r for r in results if not isinstance(r, BaseException)]
             all_signals = [s for s in results if s is not None]
             elapsed = (datetime.now() - t0).seconds
-            scanned = len([r for r in results if r is not None or r is None])
             log(f"\n   Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
 
             # ── Phase 2: Signale filtern und ranken ───────────────────────────
