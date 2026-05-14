@@ -577,9 +577,7 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                 if ib_sb is not None and ib_la is not None:
                     praemie = max(ib_sb - ib_la, 0.01)
                     praemie_quelle = "IB (Bid-Ask)"
-                elif ib_sb is not None:
-                    praemie = ib_sb
-                    praemie_quelle = "IB (Bid)"
+                # Nur Short-Bid ohne Long-Ask nicht verwenden — würde Credit künstlich aufblähen
             except Exception:
                 pass  # yfinance-Preis bleibt gültig
 

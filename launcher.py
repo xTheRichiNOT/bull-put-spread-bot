@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.34": [
+        "🐛  IB-Scan-Fix: Credit wird nur aus IB berechnet wenn BEIDE Legs (Short Bid + Long Ask) Preise haben — verhindert künstlich aufgeblähten Credit wenn Long-Ask fehlt",
+    ],
     "1.0.33": [
         "✅  Update-URL zeigt jetzt direkt auf Haupt-Repo (öffentlich) — kein separates Releases-Repo mehr nötig",
     ],
