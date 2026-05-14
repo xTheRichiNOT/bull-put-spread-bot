@@ -91,6 +91,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.23": [
+        "✅  Windows: Fenster- und Taskleisten-Icon jetzt korrekt (ICO statt PNG)",
+    ],
     "1.0.22": [
         "✅  Windows: Sidebar-Icon und Fenster-Icon werden jetzt korrekt geladen",
     ],
@@ -780,6 +783,12 @@ class BotLauncher(ctk.CTk):
 
     def _set_icon(self):
         try:
+            if sys.platform == "win32":
+                for base in [_BASE, _BUNDLE_BASE] + ([sys._MEIPASS] if hasattr(sys, "_MEIPASS") else []):
+                    ico = os.path.join(base, "icons", "icon.ico")
+                    if os.path.exists(ico):
+                        self.iconbitmap(ico)
+                        return
             from PIL import Image, ImageTk
             path = os.path.join(_BASE, "icons", "icon.png")
             if not os.path.exists(path):
@@ -789,7 +798,7 @@ class BotLauncher(ctk.CTk):
             img  = Image.open(path).resize((256, 256), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self.wm_iconphoto(True, photo)
-            self._icon_ref = photo          # prevent GC
+            self._icon_ref = photo
             if sys.platform == "darwin":
                 try:
                     import AppKit  # type: ignore[import-untyped]
