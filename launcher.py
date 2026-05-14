@@ -91,6 +91,12 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.39": [
+        "🐛  Error 201 endgültig behoben: Wenn SL-Order weg ist, wird KEINE neue Closing-Bag-Order platziert",
+        "🐛  Closing-Bag (BUY short/SELL long) würde mit TP-Leg (BUY long_put) auf selben Contract kollidieren",
+        "✅  Fallback: TP+SL werden gecancelt, Position läuft sicher bis Verfall oder 21-DTE-Exit",
+        "✅  Primärer Pfad (Modify) bleibt unverändert — kein Konflikt weil gleiche Order-ID",
+    ],
     "1.0.38": [
         "🐛  Error 201 Fix (Root Cause): Breakeven-SL modifiziert jetzt die bestehende SL-Order direkt (Modify) statt Cancel + neue Order",
         "🐛  Kein Cancel des TP mehr nötig — TP-Leg (BUY long_put) und BE-SL-Leg (SELL long_put) kollidieren nicht mehr",

@@ -860,30 +860,13 @@ async def monitor_exits(ib=None):
                         break
 
             if not sl_modified:
-                # SL bereits weg (OCA-Cancel durch TP-Fill o.ä.) → neue Order nötig
-                # Nur TP canceln (SL ist schon weg) + 3s warten für IB-Bestätigung
+                # SL bereits weg → neue Closing-Bag-Order würde Error 201 riskieren
+                # (TP-Leg BUY long_put ↔ neues SELL long_put = gegenläufig auf selben Contract)
+                # Sicher: TP und SL stornieren, Position läuft bis Verfall oder 21-DTE-Exit
                 _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
-                await asyncio.sleep(3)
-                if ib is not None:
-                    await ib.reqAllOpenOrdersAsync()
-                    await asyncio.sleep(0.5)
-                if info.get('status') != 'open':
-                    log(f"  ⚠️  [{symbol}] Breakeven-SL übersprungen — Position wird bereits geschlossen")
-                    continue
-                be_bag = Bag(
-                    symbol=symbol, exchange='SMART', currency='USD',
-                    comboLegs=[
-                        ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
-                        ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
-                    ]
-                )
-                be_order = LimitOrder('BUY', 1, be_close, tif='GTC')
-                be_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-                be_order.account = _cfg.get('ib_account', '')
-                be_trade = ib.placeOrder(be_bag, be_order)
-                info['sl_order_id'] = be_trade.order.orderId
-                log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC gesetzt "
-                    f"(ID: {be_trade.order.orderId}) | P&L: +${pnl_dollar:.0f}")
+                _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
+                log(f"  🔒 [{symbol}] Breakeven: TP/SL storniert — "
+                    f"keine neue Order (läuft bis Verfall/DTE-Exit) | P&L: +${pnl_dollar:.0f}")
 
             _save_state()
 
