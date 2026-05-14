@@ -91,6 +91,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.28": [
+        "🐛  P&L-Anzeige korrigiert — kein modelGreeks-Theoriewert mehr für wertlose OTM-Optionen",
+        "🐛  Spread-Wert ist jetzt auf Spread-Breite gedeckelt (verhindert P&L-Fehler nahe Verfall)",
+    ],
     "1.0.27": [
         "🐛  Bot friert nicht mehr ein — alle yfinance-Aufrufe haben jetzt Timeouts (25s/30s)",
         "🐛  Gesamt-Scan-Timeout nach 120s — Bot setzt Zyklen auch bei langsamer Yahoo-API fort",

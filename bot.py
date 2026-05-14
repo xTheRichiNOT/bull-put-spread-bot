@@ -598,24 +598,22 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             t_s = ib.reqMktData(s_contract, '', False, False)
             t_l = ib.reqMktData(l_contract,  '', False, False)
             await asyncio.sleep(4)
-            def _best_ask(t):
-                if t.ask and t.ask > 0:      return t.ask
-                if t.modelGreeks and t.modelGreeks.optPrice and t.modelGreeks.optPrice > 0:
-                    return t.modelGreeks.optPrice
-                return None
-            def _best_bid(t):
-                if t.bid and t.bid > 0:      return t.bid
-                if t.modelGreeks and t.modelGreeks.optPrice and t.modelGreeks.optPrice > 0:
-                    return t.modelGreeks.optPrice
-                return None
-            s_ask = _best_ask(t_s)
-            l_bid = _best_bid(t_l)
+            def _market_ask(t):
+                # Nur echte Marktpreise — kein modelGreeks (gibt inflationierten Theoriewert)
+                if t.ask and t.ask > 0:  return t.ask
+                if t.bid  and t.bid  > 0: return t.bid + 0.01
+                return 0.0
+            def _market_bid(t):
+                if t.bid and t.bid > 0:  return t.bid
+                return 0.0
+            s_ask = _market_ask(t_s)
+            l_bid = _market_bid(t_l)
             try: ib.cancelMktData(t_s)
             except Exception: pass
             try: ib.cancelMktData(t_l)
             except Exception: pass
-            if s_ask and l_bid:
-                return max(0.0, s_ask - l_bid)
+            spread_width = short_strike - long_strike
+            return min(max(0.0, s_ask - l_bid), spread_width)
         except Exception:
             pass
     # Fallback: yfinance
