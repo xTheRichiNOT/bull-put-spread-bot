@@ -581,9 +581,9 @@ async def has_open_position(ib, symbol):
         return False
 
 def already_traded(symbol):
-    """Prüft ob dieser Bot in dieser Session bereits eine Order für das Symbol platziert hat.
-    Blockiert auch 'placing' (läuft gerade) und 'cancelled'/'failed' (nicht nochmal versuchen)."""
-    return symbol in _bot_trades and _bot_trades[symbol].get('status') in ('open', 'closing', 'placing', 'cancelled', 'failed', 'done')
+    """Blockiert nur wenn eine echte Position existiert oder gerade platziert wird.
+    'cancelled'/'failed' = kein Fill → Retry erlaubt (has_open_position prüft IB nochmal)."""
+    return symbol in _bot_trades and _bot_trades[symbol].get('status') in ('open', 'closing', 'placing', 'done')
 
 async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None):
     """Aktueller Marktwert des Spreads (= Debit um ihn zurückzukaufen).
