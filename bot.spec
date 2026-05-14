@@ -6,7 +6,7 @@
 
 import sys
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -22,18 +22,19 @@ elif sys.platform == "win32":
 else:
     _icon = ICON_LIN
 
-ctk_data = collect_data_files("customtkinter", include_py_files=False)
+# collect_all holt Daten + Binaries + hiddenimports (fix für CTk Theme-JSON auf Windows)
+ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
 
 a = Analysis(
     ["launcher.py"],
     pathex=[],
-    binaries=[],
+    binaries=[] + ctk_binaries,
     datas=[
         ("config.json",      "."),
         ("version.txt",      "."),
         ("requirements.txt", "."),
         ("icons/icon.png",   "icons"),
-    ] + ctk_data,
+    ] + ctk_datas,
     hiddenimports=[
         "bot",
         "certifi",
@@ -53,7 +54,7 @@ a = Analysis(
         "darkdetect",
         "packaging",
         "packaging.version",
-    ],
+    ] + ctk_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
