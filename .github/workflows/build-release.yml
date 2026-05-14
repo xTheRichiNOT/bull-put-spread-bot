@@ -128,18 +128,23 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           VERSION="${{ github.ref_name }}"
+          cat > notes.md << 'EOF'
+          ## Installation
+
+          **Mac:** DMG herunterladen, App in /Programme ziehen, starten
+
+          **Windows:** EXE herunterladen, Doppelklick, direkt nutzen (kein Python noetig)
+
+          **Linux GUI:** tar.gz entpacken, BullPutSpreadBot ausfuehren
+
+          **Linux Server (headless):** ZIP entpacken, setup/install_linux.sh ausfuehren
+
+          ---
+          Bereits installierte Apps erhalten dieses Update automatisch beim naechsten Start.
+          EOF
           gh release create "$VERSION" \
             --title "BullPutSpreadBot $VERSION" \
-            --notes "## Installation
-
-**Mac:** DMG herunterladen → App in /Programme ziehen → Starten
-
-**Windows:** EXE herunterladen → Doppelklick → Direkt nutzen (kein Python nötig)
-
-**Linux:** tar.gz entpacken → \`./BullPutSpreadBot/BullPutSpreadBot\` ausführen
-
----
-> Bereits installierte Apps erhalten dieses Update automatisch beim nächsten Start." \
+            --notes-file notes.md \
             artifacts/BullPutSpreadBot-v*.dmg \
             artifacts/BullPutSpreadBot.exe \
             artifacts/BullPutSpreadBot-v*-linux.tar.gz
