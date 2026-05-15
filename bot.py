@@ -661,179 +661,6 @@ def _check_credit(credit: float, breite: float, prob_otm: float):
     return True, required, min_pwin
 
 
-# ── Decision Engine ───────────────────────────────────────────────────────────
-from dataclasses import dataclass
-
-@dataclass
-class TradeContext:
-    ev_norm:                float   # EV normalisiert 0–1
-    p_win:                  float   # P(OTM) = P(Gewinn)
-    iv_rank:                float   # IV normalisiert 0–1
-    news_momentum:          float   # 1.0 wenn News-Trigger
-    structure_quality:      float   # DTE-Qualität × R/R-Qualität
-    p_max_loss:             float   # P(MaxVerlust) = Risiko
-    spread_cost:            float   # Risikofraktion: MaxRisk/(Credit+MaxRisk)
-    liquidity_risk:         float   # 0=echtes Bid, 0.6=BS-Schätzung
-    dte_risk:               float   # Distanz DTE vom optimalen Fenster
-    iv_expansion_confirmed: float   # 1.0 wenn IV > 35%
-    tight_spread_bonus:     float   # 1.0 wenn R/R ≥ 0.25
-    liquidity_bonus:        float   # 1.0 wenn kein BS-Fallback
-    no_event_conflict:      float   # 1.0 wenn DTE >= 21 (kein Gamma-Risiko)
-    earnings_penalty:       float = 0.0  # direkt vom Score abgezogen: 0.05–0.25
-    iv_penalty:             float = 0.0  # direkt vom Score abgezogen: 0.10 wenn IV 18–25%
-    exec_score:             float = 0.0  # Execution Quality: Slippage × Fill-Prob (0–1)
-    liquidity_score_raw:    float = 0.5  # P90-relativer Liquidity Score (0–1) für liq-Komponente
-
-
-class DecisionEngine:
-    """Prop-Desk Ranking Engine mit konfigurierbaren Regime-Gewichten.
-    Einzige Hard-Gates: Infrastrukturprobleme (kein Vertrag, kein Preis)
-    und Mindest-Credit-Größe. Alles andere ist Score-Komponente."""
-
-    def __init__(self,
-                 trade_threshold: float = ENTRY_THRESHOLD,
-                 watch_threshold: float = WATCH_THRESHOLD,
-                 w_edge: float = 0.45,
-                 w_exec: float = 0.25,
-                 w_risk: float = 0.25,
-                 w_liq:  float = 0.05):
-        self.trade_threshold = trade_threshold
-        self.watch_threshold = watch_threshold
-        self.w_edge = w_edge
-        self.w_exec = w_exec
-        self.w_risk = w_risk
-        self.w_liq  = w_liq
-
-    def _edge(self, s: TradeContext) -> float:
-        return (0.30 * s.ev_norm
-              + 0.25 * s.p_win
-              + 0.15 * s.iv_rank
-              + 0.15 * s.news_momentum
-              + 0.15 * s.structure_quality)
-
-    def _risk(self, s: TradeContext) -> float:
-        return (0.30 * s.p_max_loss
-              + 0.25 * s.spread_cost
-              + 0.25 * s.liquidity_risk
-              + 0.20 * s.dte_risk)
-
-    def _quality(self, s: TradeContext) -> float:
-        """Diagnostik-only (kein Score-Einfluss). Zeigt Bonus-Faktoren."""
-        return (0.07 * s.iv_expansion_confirmed
-              + 0.07 * s.tight_spread_bonus
-              + 0.07 * s.liquidity_bonus
-              + 0.07 * s.no_event_conflict)
-
-    def compute_score(self, s: TradeContext) -> float:
-        return (self.w_edge * self._edge(s)
-              + self.w_exec * s.exec_score
-              + self.w_risk * (1.0 - self._risk(s))
-              + self.w_liq  * s.liquidity_score_raw
-              - s.earnings_penalty
-              - s.iv_penalty)
-
-    def decide(self, ctx: TradeContext):
-        score = self.compute_score(ctx)
-        if score >= self.trade_threshold:
-            action = 'TRADE'
-        elif score >= self.watch_threshold:
-            action = 'WATCH'
-        else:
-            action = 'SKIP'
-        return action, score
-
-    def explain(self, ctx: TradeContext) -> dict:
-        score = self.compute_score(ctx)
-        return {
-            'edge':        round(self._edge(ctx),         4),
-            'exec':        round(ctx.exec_score,          4),
-            'risk':        round(self._risk(ctx),         4),
-            'liq':         round(ctx.liquidity_score_raw, 4),
-            'quality':     round(self._quality(ctx),      4),
-            'earn_pen':    round(ctx.earnings_penalty,    4),
-            'iv_pen':      round(ctx.iv_penalty,          4),
-            'final_score': round(score,                   4),
-        }
-
-
-# ── Regime-spezifische Engine-Instanzen ──────────────────────────────────────
-# HIGH_IV: IV ≥ 35 %, kein Earnings-Risiko — Edge dominiert (fette Prämie)
-_engine_high_iv  = DecisionEngine(w_edge=0.55, w_exec=0.20, w_risk=0.20, w_liq=0.05)
-# MODERATE_IV: IV 25–35 % — ausgewogen
-_engine_moderate = DecisionEngine(w_edge=0.45, w_exec=0.25, w_risk=0.25, w_liq=0.05)
-# LOW_IV: IV 18–25 % — nur wenn Fill und Liquidität gesichert
-_engine_low_iv   = DecisionEngine(w_edge=0.35, w_exec=0.30, w_risk=0.25, w_liq=0.10)
-
-# Fallback für Kompatibilität (wird in fetch_signal durch classify_strategy ersetzt)
-_decision_engine = _engine_moderate
-
-
-# ── Strategy Classifier ───────────────────────────────────────────────────────
-
-@dataclass
-class StrategyCandidate:
-    """Strukturierte Ausgabe des Strategy Classifiers — für Logs und Shadow Analytics."""
-    symbol:          str
-    strategy:        str    # BULL_PUT_PREMIUM / STANDARD / CAUTIOUS
-    direction:       str    # directional / neutral
-    iv_regime_str:   str    # low / mid / high
-    confidence:      float  # 0.0–1.0: Wie gut passt das Setup ins Regime?
-    earnings_risk:   float  # earn_penalty (0–0.25)
-    liquidity_score: float  # P90-relativer Liq-Score
-
-
-def detect_direction(iv_spike: bool, news_hit: bool) -> str:
-    """directional wenn IV-Spike oder News-Trigger aktiv, sonst neutral.
-    Directional = klarer Impuls vorhanden → Strike-Auswahl strenger, Edge dominiert."""
-    return 'directional' if (iv_spike or news_hit) else 'neutral'
-
-
-def classify_strategy(iv: float, earn_penalty: float,
-                      direction: str = 'neutral',
-                      symbol: str = '',
-                      liquidity_score: float = 0.5) -> tuple:
-    """Klassifiziert Setup-Regime, berechnet Konfidenz und wählt passende Engine.
-
-    Returns: (StrategyCandidate, engine: DecisionEngine)
-
-    Regimes + Konfidenz:
-      BULL_PUT_PREMIUM  — IV ≥ 35 %, earn ≤ 0.05  → conf 0.85 (dir) / 0.75 (neu)
-      BULL_PUT_STANDARD — IV ≥ 25 %               → conf 0.72 (dir) / 0.65 (neu)
-      BULL_PUT_CAUTIOUS — IV 18–25 %              → conf 0.60 (dir) / 0.50 (neu)
-    """
-    is_dir = direction == 'directional'
-    if iv >= 0.35:
-        iv_r = 'high'
-    elif iv >= 0.25:
-        iv_r = 'mid'
-    else:
-        iv_r = 'low'
-
-    if iv >= 0.35 and earn_penalty <= 0.05:
-        regime = 'BULL_PUT_PREMIUM'
-        engine = _engine_high_iv
-        conf   = 0.85 if is_dir else 0.75
-    elif iv >= 0.25:
-        regime = 'BULL_PUT_STANDARD'
-        engine = _engine_moderate
-        conf   = 0.72 if is_dir else 0.65
-    else:
-        regime = 'BULL_PUT_CAUTIOUS'
-        engine = _engine_low_iv
-        conf   = 0.60 if is_dir else 0.50
-
-    candidate = StrategyCandidate(
-        symbol          = symbol,
-        strategy        = regime,
-        direction       = direction,
-        iv_regime_str   = iv_r,
-        confidence      = conf,
-        earnings_risk   = earn_penalty,
-        liquidity_score = liquidity_score,
-    )
-    return candidate, engine
-
-
 def _round_to_standard_strike(strike: float, price: float) -> float:
     """Rundet einen Strike auf das nächste typische Options-Inkrement.
     Fallback wenn der Strike-Map-Eintrag für ein Symbol fehlt."""
@@ -1185,11 +1012,8 @@ def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
     return min(1.0, oi_score * 0.6 + vol_score * 0.4)
 
 
-async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False):
-    """
-    Berechnet den Bull-Put-Spread für ein Symbol.
-    Gibt ein Signal-Dict zurück oder None wenn kein handelbares Setup gefunden.
-    """
+async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False):
+    """Berechnet Bull-Put-Spread. Gibt Signal-Dict zurück oder None."""
     def _fetch_chain():
         import yfinance as yf
         ticker = yf.Ticker(symbol)
@@ -1379,92 +1203,62 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False, iv_sp
         ev_raw    = (prob_otm * credit)     - (prob_max_loss * max_risk)   # ohne Slippage (Info)
         ev_ratio  = ev / eff_credit if eff_credit > 0 else 0.0
 
-        # ── Decision Engine: TradeContext aufbauen ────────────────────────
-        dte_center = (MIN_DTE + MAX_DTE) / 2          # 52.5 Tage
-        dte_ok     = max(0.0, 1.0 - abs(dte - dte_center) / (dte_center))
-        # IV-Penalty: Signal bleibt durch, aber Score wird reduziert
-        _iv_penalty = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
+        # ── Deterministischer 4-Komponenten Score ────────────────────────
+        _iv_penalty  = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
+        _credit_pct  = credit / (breite * 100) if breite > 0 else 0.0
+        _rr_norm     = min(rr / MIN_RISK_REWARD, 1.0)
+        _credit_norm = min(_credit_pct / MIN_CREDIT_PERCENT, 1.0)
+        _news_bonus  = 0.05 if news_hit else 0.0
 
-        # Liquidity Risk: für _risk()-Komponente (BS override auf ≥0.6)
-        _liq_risk = max(0.6, 1.0 - _liquidity_score) if 'Black-Scholes' in praemie_quelle else (1.0 - _liquidity_score)
-
-        # Execution Score: Slippage-Qualität (Fill-Wahrscheinlichkeit zum Limit) × Volume-Fill-Prob
-        # _slip: 0.65 (BS) → 0.82 (yfinance Bid) → 0.92 (IB Combo) = Datenqual.
-        # vol_fill: min(volume / 1000, 1.0) = wie wahrscheinlich fill bei diesem Volumen
-        _vol_fill   = min(_vol / 1000.0, 1.0)
-        _exec_score = 0.5 * _slip + 0.5 * _vol_fill
-
-        ctx = TradeContext(
-            ev_norm                = min(max(ev / 500.0, 0.0), 1.0),
-            p_win                  = prob_otm,
-            iv_rank                = min(iv / 0.80, 1.0),
-            news_momentum          = 1.0 if news_hit else 0.0,
-            structure_quality      = dte_ok * min(rr / 0.30, 1.0),
-            p_max_loss             = prob_max_loss,
-            spread_cost            = 1.0 - rr / (1.0 + rr),
-            liquidity_risk         = _liq_risk,
-            dte_risk               = 0.0 if MIN_DTE <= dte <= MAX_DTE else min(abs(dte - dte_center) / dte_center, 1.0),
-            iv_expansion_confirmed = 1.0 if iv > 0.35 else 0.0,
-            tight_spread_bonus     = 1.0 if rr >= 0.25 else 0.0,
-            liquidity_bonus        = 0.0 if 'Black-Scholes' in praemie_quelle else min(1.0, _liquidity_score),
-            no_event_conflict      = 1.0 if dte >= 21 else 0.0,
-            earnings_penalty       = earn_penalty,
-            iv_penalty             = _iv_penalty,
-            exec_score             = _exec_score,
-            liquidity_score_raw    = _liquidity_score,
-        )
-        direction = detect_direction(iv_spike, news_hit)
-        _candidate, _regime_engine = classify_strategy(
-            iv, earn_penalty, direction=direction, symbol=symbol,
-            liquidity_score=_liquidity_score)
-        breakdown = _regime_engine.explain(ctx)
-        decision, score = _regime_engine.decide(ctx)
+        score = min(1.0, max(0.0,
+            0.35 * prob_otm
+            + 0.30 * _rr_norm
+            + 0.25 * _credit_norm
+            + 0.10 * _liquidity_score
+            + _news_bonus
+            - earn_penalty
+            - _iv_penalty
+        ))
+        decision = 'TRADE' if score >= ENTRY_THRESHOLD else 'WATCH' if score >= WATCH_THRESHOLD else 'SKIP'
 
         # Hard-Gate: Mindest-Credit-Größe (Infrastruktur, kein Score-Thema)
         credit_ok_hard = credit >= max(breite * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
 
         return {
-            'symbol':          symbol,
-            'preis':           preis,
-            'iv':              iv,
-            'dte':             dte,
-            'expiry_ib':       expiry_yf.replace('-', ''),
-            'short_strike':    short_strike,
-            'long_strike':     long_strike,
-            'breite':          breite,
-            'praemie':         praemie,
-            'praemie_quelle':  praemie_quelle,
-            'credit':          credit,
-            'max_risk':        max_risk,
-            'risk_reward':     rr,
-            'prob_otm':        prob_otm,
-            'prob_max_loss':   prob_max_loss,
-            'ev':              ev,
-            'ev_raw':          ev_raw,          # EV vor Slippage (Info)
-            'ev_ratio':        ev_ratio,
-            'slippage_factor': _slip,
+            'symbol':           symbol,
+            'preis':            preis,
+            'iv':               iv,
+            'dte':              dte,
+            'expiry_ib':        expiry_yf.replace('-', ''),
+            'short_strike':     short_strike,
+            'long_strike':      long_strike,
+            'breite':           breite,
+            'praemie':          praemie,
+            'praemie_quelle':   praemie_quelle,
+            'credit':           credit,
+            'max_risk':         max_risk,
+            'risk_reward':      rr,
+            'prob_otm':         prob_otm,
+            'prob_max_loss':    prob_max_loss,
+            'ev':               ev,
+            'ev_raw':           ev_raw,
+            'ev_ratio':         ev_ratio,
+            'slippage_factor':  _slip,
             'score':            score,
-            'decision':         decision,        # 'TRADE' / 'WATCH' / 'SKIP'
-            'strategy':         _candidate.strategy,
-            'direction':        _candidate.direction,
-            'iv_regime_str':    _candidate.iv_regime_str,
-            'confidence':       _candidate.confidence,
-            'edge':             breakdown['edge'],
-            'exec':             breakdown['exec'],
-            'risk':             breakdown['risk'],
-            'liq':              breakdown['liq'],
-            'quality':          breakdown['quality'],
+            'decision':         decision,
+            'edge':             round(0.35 * prob_otm + 0.30 * _rr_norm, 4),
+            'risk':             round(earn_penalty + _iv_penalty, 4),
+            'quality':          round(0.25 * _credit_norm + 0.10 * _liquidity_score + _news_bonus, 4),
             'liquidity_score':  round(_liquidity_score, 3),
-            'exec_score':       round(_exec_score, 3),
             'earnings_penalty': earn_penalty,
             'iv_penalty':       _iv_penalty,
             'credit_ok_hard':   credit_ok_hard,
         }
     except asyncio.TimeoutError:
-        log(f"   [{symbol}] ⏱️  fetch_signal Timeout — überspringe")
+        log(f"   [{symbol}] ⏱️  build_bull_put_spread Timeout — überspringe")
         return None
     except Exception as e:
-        log(f"   [{symbol}] ❌ fetch_signal Fehler: {e}")
+        log(f"   [{symbol}] ❌ build_bull_put_spread Fehler: {e}")
         return None
 
 def count_bot_orders():
@@ -2145,33 +1939,22 @@ async def place_order(ib, sig):
 def print_ranking(signals, selected):
     """Zeigt eine Ranking-Tabelle aller Signale dieses Zyklus."""
     selected_symbols = {s['symbol'] for s in selected}
-    _REGIME_SHORT = {
-        'BULL_PUT_PREMIUM':  'PREM',
-        'BULL_PUT_STANDARD': 'STD ',
-        'BULL_PUT_CAUTIOUS': 'CAUT',
-    }
-    _DIR_SHORT = {'directional': 'DIR', 'neutral': 'NEU'}
-    log(f"\n{'─'*120}")
+    log(f"\n{'─'*100}")
     log(f"  {'#':<3} {'Symbol':<6} {'IV':>6} {'Kurs':>8} {'Strike':>12} "
-        f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'EV':>7} {'Score':>7} "
-        f"{'Regime':<5} {'Dir':<4} {'Conf':>5}  Status")
-    log(f"{'─'*120}")
+        f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'EV':>7} {'Score':>7}  Status")
+    log(f"{'─'*100}")
     for i, s in enumerate(signals, 1):
         status   = "→ TRADE" if s['symbol'] in selected_symbols else "  skip"
         triggers = ', '.join(s.get('triggers', []))
-        regime   = _REGIME_SHORT.get(s.get('strategy', ''), '    ')
-        dirstr   = _DIR_SHORT.get(s.get('direction', ''), '   ')
-        conf     = s.get('confidence', 0.0)
         log(f"  {i:<3} {s['symbol']:<6} {s['iv']:>6.1%} {s['preis']:>8.2f} "
             f"  {s['short_strike']:>5.0f}P/{s['long_strike']:>4.0f}P "
             f"  ${s['credit']:>6.2f}"
             f"  {s['risk_reward']:>5.2f}x  {s.get('prob_otm', 0):>6.1%}"
-            f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f} "
-            f" {regime} {dirstr} {conf:>5.2f}  {status}")
+            f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f}  {status}")
         if triggers:
-            log(f"       ↳ {triggers} | edge={s.get('edge',0):.3f} exec={s.get('exec',0):.3f}"
-                f" risk={s.get('risk',0):.3f} liq={s.get('liq',0):.3f}")
-    log(f"{'─'*120}")
+            log(f"       ↳ {triggers} | edge={s.get('edge',0):.3f} risk={s.get('risk',0):.3f}"
+                f" liq={s.get('liquidity_score',0):.3f} earn_pen={s.get('earnings_penalty',0):.3f}")
+    log(f"{'─'*100}")
 
 async def configure_environment(ib) -> bool:
     """Erkennt Demo/Live-Modus anhand der Kontonummer und konfiguriert IB entsprechend.
@@ -2558,9 +2341,8 @@ async def run_bot(stop_event: threading.Event = None):
                     log(f"   [{symbol}] ⏳ Kein IV — überspringe")
                     return None
 
-                prev_iv    = _iv_memory.get(symbol)
-                first_scan = prev_iv is None
-                iv_spike   = not first_scan and (iv - prev_iv) >= MIN_IV_SPIKE
+                prev_iv  = _iv_memory.get(symbol)
+                iv_spike = prev_iv is not None and (iv - prev_iv) >= MIN_IV_SPIKE
                 _iv_memory[symbol] = iv
 
                 async with _sem_news:
@@ -2570,23 +2352,14 @@ async def run_bot(stop_event: threading.Event = None):
                     log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
                     return None
 
-                if not first_scan and not iv_spike and not news_hit:
-                    delta = f"Δ={iv - prev_iv:+.1%}"
-                    log(f"   [{symbol}] –  IV={iv:.1%} stabil ({delta}, kein Spike ≥{MIN_IV_SPIKE:.0%}, keine News)")
-                    return None
-
                 trigger_reasons = []
-                if first_scan:
-                    trigger_reasons.append("Erster Scan")
                 if iv_spike:
                     trigger_reasons.append(f"IV-Spike +{iv - prev_iv:.1%}")
                 if news_hit:
                     trigger_reasons.append(f"News: \"{headline[:60]}\"")
 
-                log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
-
                 async with _sem_sig:
-                    sig = await fetch_signal(symbol, preis, iv, ib, news_hit=news_hit, iv_spike=iv_spike)
+                    sig = await build_bull_put_spread(symbol, preis, iv, ib, news_hit=news_hit, iv_spike=iv_spike)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig
@@ -2596,7 +2369,7 @@ async def run_bot(stop_event: threading.Event = None):
                 results = await asyncio.wait_for(
                     asyncio.gather(*[scan_symbol(s) for s in WATCHLIST],
                                    return_exceptions=True),
-                    timeout=120)
+                    timeout=300)
             except asyncio.TimeoutError:
                 log("  ⏱️  Scan-Timeout nach 120s — nächster Zyklus")
                 results = []
