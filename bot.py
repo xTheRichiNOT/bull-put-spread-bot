@@ -768,22 +768,70 @@ _engine_low_iv   = DecisionEngine(w_edge=0.35, w_exec=0.30, w_risk=0.25, w_liq=0
 _decision_engine = _engine_moderate
 
 
-def classify_strategy(iv: float, earn_penalty: float) -> tuple:
-    """Wählt Setup-Regime + passende DecisionEngine-Instanz.
+# ── Strategy Classifier ───────────────────────────────────────────────────────
 
-    Returns: (regime_name: str, engine: DecisionEngine)
+@dataclass
+class StrategyCandidate:
+    """Strukturierte Ausgabe des Strategy Classifiers — für Logs und Shadow Analytics."""
+    symbol:          str
+    strategy:        str    # BULL_PUT_PREMIUM / STANDARD / CAUTIOUS
+    direction:       str    # directional / neutral
+    iv_regime_str:   str    # low / mid / high
+    confidence:      float  # 0.0–1.0: Wie gut passt das Setup ins Regime?
+    earnings_risk:   float  # earn_penalty (0–0.25)
+    liquidity_score: float  # P90-relativer Liq-Score
 
-    Regimes:
-      BULL_PUT_PREMIUM  — IV ≥ 35 %, Earnings-Penalty ≤ 0.05  → Edge schwer
-      BULL_PUT_STANDARD — IV ≥ 25 % (oder moderates Earnings-Risiko) → ausgewogen
-      BULL_PUT_CAUTIOUS — IV 18–25 %                             → Exec + Liq schwer
+
+def detect_direction(iv_spike: bool, news_hit: bool) -> str:
+    """directional wenn IV-Spike oder News-Trigger aktiv, sonst neutral.
+    Directional = klarer Impuls vorhanden → Strike-Auswahl strenger, Edge dominiert."""
+    return 'directional' if (iv_spike or news_hit) else 'neutral'
+
+
+def classify_strategy(iv: float, earn_penalty: float,
+                      direction: str = 'neutral',
+                      symbol: str = '',
+                      liquidity_score: float = 0.5) -> tuple:
+    """Klassifiziert Setup-Regime, berechnet Konfidenz und wählt passende Engine.
+
+    Returns: (StrategyCandidate, engine: DecisionEngine)
+
+    Regimes + Konfidenz:
+      BULL_PUT_PREMIUM  — IV ≥ 35 %, earn ≤ 0.05  → conf 0.85 (dir) / 0.75 (neu)
+      BULL_PUT_STANDARD — IV ≥ 25 %               → conf 0.72 (dir) / 0.65 (neu)
+      BULL_PUT_CAUTIOUS — IV 18–25 %              → conf 0.60 (dir) / 0.50 (neu)
     """
-    if iv >= 0.35 and earn_penalty <= 0.05:
-        return 'BULL_PUT_PREMIUM', _engine_high_iv
+    is_dir = direction == 'directional'
+    if iv >= 0.35:
+        iv_r = 'high'
     elif iv >= 0.25:
-        return 'BULL_PUT_STANDARD', _engine_moderate
+        iv_r = 'mid'
     else:
-        return 'BULL_PUT_CAUTIOUS', _engine_low_iv
+        iv_r = 'low'
+
+    if iv >= 0.35 and earn_penalty <= 0.05:
+        regime = 'BULL_PUT_PREMIUM'
+        engine = _engine_high_iv
+        conf   = 0.85 if is_dir else 0.75
+    elif iv >= 0.25:
+        regime = 'BULL_PUT_STANDARD'
+        engine = _engine_moderate
+        conf   = 0.72 if is_dir else 0.65
+    else:
+        regime = 'BULL_PUT_CAUTIOUS'
+        engine = _engine_low_iv
+        conf   = 0.60 if is_dir else 0.50
+
+    candidate = StrategyCandidate(
+        symbol          = symbol,
+        strategy        = regime,
+        direction       = direction,
+        iv_regime_str   = iv_r,
+        confidence      = conf,
+        earnings_risk   = earn_penalty,
+        liquidity_score = liquidity_score,
+    )
+    return candidate, engine
 
 
 def _round_to_standard_strike(strike: float, price: float) -> float:
@@ -1137,7 +1185,7 @@ def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
     return min(1.0, oi_score * 0.6 + vol_score * 0.4)
 
 
-async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
+async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False):
     """
     Berechnet den Bull-Put-Spread für ein Symbol.
     Gibt ein Signal-Dict zurück oder None wenn kein handelbares Setup gefunden.
@@ -1365,7 +1413,10 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             exec_score             = _exec_score,
             liquidity_score_raw    = _liquidity_score,
         )
-        iv_regime, _regime_engine = classify_strategy(iv, earn_penalty)
+        direction = detect_direction(iv_spike, news_hit)
+        _candidate, _regime_engine = classify_strategy(
+            iv, earn_penalty, direction=direction, symbol=symbol,
+            liquidity_score=_liquidity_score)
         breakdown = _regime_engine.explain(ctx)
         decision, score = _regime_engine.decide(ctx)
 
@@ -1394,7 +1445,10 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             'slippage_factor': _slip,
             'score':            score,
             'decision':         decision,        # 'TRADE' / 'WATCH' / 'SKIP'
-            'strategy':         iv_regime,       # BULL_PUT_PREMIUM / STANDARD / CAUTIOUS
+            'strategy':         _candidate.strategy,
+            'direction':        _candidate.direction,
+            'iv_regime_str':    _candidate.iv_regime_str,
+            'confidence':       _candidate.confidence,
             'edge':             breakdown['edge'],
             'exec':             breakdown['exec'],
             'risk':             breakdown['risk'],
@@ -2091,21 +2145,33 @@ async def place_order(ib, sig):
 def print_ranking(signals, selected):
     """Zeigt eine Ranking-Tabelle aller Signale dieses Zyklus."""
     selected_symbols = {s['symbol'] for s in selected}
-    log(f"\n{'─'*108}")
+    _REGIME_SHORT = {
+        'BULL_PUT_PREMIUM':  'PREM',
+        'BULL_PUT_STANDARD': 'STD ',
+        'BULL_PUT_CAUTIOUS': 'CAUT',
+    }
+    _DIR_SHORT = {'directional': 'DIR', 'neutral': 'NEU'}
+    log(f"\n{'─'*120}")
     log(f"  {'#':<3} {'Symbol':<6} {'IV':>6} {'Kurs':>8} {'Strike':>12} "
-        f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'P(MaxL)':>8} {'EV':>7} {'Score':>7}  Status")
-    log(f"{'─'*116}")
+        f"{'Credit':>8} {'R/R':>6} {'P(Win)':>7} {'EV':>7} {'Score':>7} "
+        f"{'Regime':<5} {'Dir':<4} {'Conf':>5}  Status")
+    log(f"{'─'*120}")
     for i, s in enumerate(signals, 1):
-        status  = "→ TRADE" if s['symbol'] in selected_symbols else "  skip"
+        status   = "→ TRADE" if s['symbol'] in selected_symbols else "  skip"
         triggers = ', '.join(s.get('triggers', []))
+        regime   = _REGIME_SHORT.get(s.get('strategy', ''), '    ')
+        dirstr   = _DIR_SHORT.get(s.get('direction', ''), '   ')
+        conf     = s.get('confidence', 0.0)
         log(f"  {i:<3} {s['symbol']:<6} {s['iv']:>6.1%} {s['preis']:>8.2f} "
             f"  {s['short_strike']:>5.0f}P/{s['long_strike']:>4.0f}P "
             f"  ${s['credit']:>6.2f}"
-            f"  {s['risk_reward']:>5.2f}x  {s.get('prob_otm', 0):>6.1%}  {s.get('prob_max_loss', 0):>7.1%}"
-            f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f}  {status}")
+            f"  {s['risk_reward']:>5.2f}x  {s.get('prob_otm', 0):>6.1%}"
+            f"  {s.get('ev', 0):>+6.2f}$  {s['score']:>6.3f} "
+            f" {regime} {dirstr} {conf:>5.2f}  {status}")
         if triggers:
-            log(f"       ↳ {triggers}")
-    log(f"{'─'*108}")
+            log(f"       ↳ {triggers} | edge={s.get('edge',0):.3f} exec={s.get('exec',0):.3f}"
+                f" risk={s.get('risk',0):.3f} liq={s.get('liq',0):.3f}")
+    log(f"{'─'*120}")
 
 async def configure_environment(ib) -> bool:
     """Erkennt Demo/Live-Modus anhand der Kontonummer und konfiguriert IB entsprechend.
@@ -2520,7 +2586,7 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
 
                 async with _sem_sig:
-                    sig = await fetch_signal(symbol, preis, iv, ib, news_hit=news_hit)
+                    sig = await fetch_signal(symbol, preis, iv, ib, news_hit=news_hit, iv_spike=iv_spike)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig
