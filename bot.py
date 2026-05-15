@@ -142,6 +142,16 @@ MAX_PER_SECTOR   = int(_cfg['max_per_sector'])
 AUTO_TRADE       = bool(_cfg['auto_trade'])
 IB_SCAN_BATCH    = 10   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
 
+# Confidence-Score je nach Preis-Datenquelle
+PRICE_CONFIDENCE: dict[str, float] = {
+    'REAL_BID_ASK': 1.0,   # Live NBBO — breitester Markt
+    'MIDPRICE':     0.9,   # Mid-Point aus echten Bid+Ask (Demo)
+    'LAST_PRICE':   0.7,   # Greeks / letzter Handelspreis
+    'BS_ESTIMATE':  0.4,   # Black-Scholes / yfinance-Schätzung
+}
+MIN_CONFIDENCE_LIVE  = 0.9   # Live: mindestens echtes Bid/Ask erforderlich
+MIN_CONFIDENCE_PAPER = 0.3   # Demo: BS erlaubt, aber IV>25% und Kurs valid
+
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
     # Tech
@@ -1185,6 +1195,8 @@ async def place_order(ib, sig):
             except Exception:
                 pass
 
+            price_src = 'BS_ESTIMATE'   # Default — wird bei besseren Daten überschrieben
+
             if short_bid is None or long_ask is None:
                 def _greek_price(ticker, side):
                     g = ticker.bidGreeks if side == 'bid' else ticker.askGreeks
@@ -1194,6 +1206,7 @@ async def place_order(ib, sig):
                 if sb_greek and la_greek:
                     short_bid = sb_greek
                     long_ask  = la_greek
+                    price_src = 'LAST_PRICE'
                     log(f"  ⚠️  [{sym}] Kein Bid/Ask — bidGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
                 else:
                     def _model_price(ticker):
@@ -1204,6 +1217,7 @@ async def place_order(ib, sig):
                     if sb_model and la_model:
                         short_bid = sb_model
                         long_ask  = la_model
+                        price_src = 'LAST_PRICE'
                         log(f"  ⚠️  [{sym}] Kein Bid/Ask — modelGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
                     else:
                         short_last = t_short.last if t_short.last and t_short.last > 0 else None
@@ -1211,11 +1225,13 @@ async def place_order(ib, sig):
                         if short_last and long_last:
                             short_bid = short_last
                             long_ask  = long_last
+                            price_src = 'LAST_PRICE'
                             log(f"  ⚠️  [{sym}] Kein Bid/Ask, kein Greek — Last-Preis: Short ${short_last:.2f}  Long ${long_last:.2f}")
                         else:
                             if IS_DEMO_MODE and sig.get('praemie', 0) > 0:
                                 short_bid = sig['praemie']
                                 long_ask  = 0.0
+                                price_src = 'BS_ESTIMATE'
                                 log(f"  ⚠️  [{sym}] PAPER MODE: Keine IB-Marktdaten — "
                                     f"Scan-Schätzung ${sig['praemie']:.2f}/Share ({sig.get('praemie_quelle','?')})")
                             else:
@@ -1224,6 +1240,7 @@ async def place_order(ib, sig):
                                 return
 
             has_real_bid = bool(t_short.bid and t_short.bid > 0)
+            has_real_ask = bool(t_long.ask  and t_long.ask  > 0)
 
             if IS_DEMO_MODE:
                 def _mid(t, fallback):
@@ -1236,9 +1253,14 @@ async def place_order(ib, sig):
                 long_val  = _mid(t_long,  long_ask)
                 ibkr_net  = round(short_val - long_val, 2)
                 if ibkr_net <= 0 and sig.get('praemie', 0) > 0:
-                    ibkr_net = sig['praemie']
+                    ibkr_net  = sig['praemie']
+                    price_src = 'BS_ESTIMATE'
                     log(f"  ⚠️  [{sym}] PAPER MODE: Mid-Point ≤0 — "
                         f"Scan-Schätzung ${ibkr_net:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                elif price_src == 'BS_ESTIMATE' and (has_real_bid or has_real_ask):
+                    price_src = 'MIDPRICE'   # Zumindest ein echter Kurs vorhanden
+                elif has_real_bid and has_real_ask:
+                    price_src = 'MIDPRICE'
                 limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
                 quelle = "Mid-Point (Demo)"
             else:
@@ -1249,6 +1271,30 @@ async def place_order(ib, sig):
                 discount    = 0.75 if (has_real_bid or has_model) else 0.65
                 limit_price = round(max(ibkr_net * discount, 0.01), 2)
                 quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
+                if has_real_bid:
+                    price_src = 'REAL_BID_ASK'
+                elif price_src == 'BS_ESTIMATE':
+                    price_src = 'LAST_PRICE'   # modelGreeks / Last zählen als LAST_PRICE im Live-Modus
+
+            # ── Confidence-Gate ─────────────────────────────────────────────
+            confidence = PRICE_CONFIDENCE[price_src]
+            min_conf   = MIN_CONFIDENCE_PAPER if IS_DEMO_MODE else MIN_CONFIDENCE_LIVE
+            if confidence < min_conf:
+                sig_iv    = sig.get('iv', 0)
+                sig_preis = sig.get('preis', 0)
+                # BS im Demo-Modus: erlaubt wenn IV>25% und Underlying-Preis valide
+                if IS_DEMO_MODE and price_src == 'BS_ESTIMATE' and sig_iv > 0.25 and sig_preis > 0:
+                    log(f"  ⚠️  [{sym}] [{price_src}] Conf={confidence:.2f} — erlaubt (Demo): "
+                        f"IV={sig_iv:.1%}>25%, Kurs=${sig_preis:.2f} valid")
+                else:
+                    reasons = []
+                    if IS_DEMO_MODE and price_src == 'BS_ESTIMATE':
+                        if sig_iv <= 0.25:  reasons.append(f"IV={sig_iv:.1%} ≤ 25%")
+                        if not sig_preis:   reasons.append("Kurs ungültig")
+                    log(f"  ✗ [{sym}] Confidence {confidence:.2f} [{price_src}] < {min_conf:.2f} min"
+                        + (f" — {', '.join(reasons)}" if reasons else "") + " — Trade abgebrochen")
+                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                    return
 
             has_model  = bool(t_short.modelGreeks and t_short.modelGreeks.optPrice
                               and t_short.modelGreeks.optPrice > 0)
@@ -1258,7 +1304,8 @@ async def place_order(ib, sig):
             if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
                 short_delta = abs(t_short.modelGreeks.delta)
             delta_str = f"Δ={short_delta:.3f}" if short_delta is not None else "Δ=n/a"
-            log(f"  📡 [{sym}] {quelle}: Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
+            log(f"  📡 [{sym}] {quelle} [Conf={confidence:.2f}/{price_src}]: "
+                f"Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
                 f"Netto: ${ibkr_net:.2f} → Limit: ${limit_price:.2f}  {delta_str}")
 
             if short_delta is not None and short_delta > MAX_DELTA:
