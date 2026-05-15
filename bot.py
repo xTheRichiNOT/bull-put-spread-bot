@@ -180,6 +180,39 @@ CONTRACTS_BY_CONFIDENCE = {
     'BS_ESTIMATE':  1,
 }
 
+# Liquiditätsfilter: Short-Leg muss ausreichend liquide sein
+MIN_OPEN_INTEREST  = int(_cfg.get('min_open_interest', 500))
+MIN_OPTION_VOLUME  = int(_cfg.get('min_option_volume',  100))
+MAX_BID_ASK_SPREAD = float(_cfg.get('max_bid_ask_spread', 0.12))  # 12 % des Mids
+
+# Slippage-Modell: erwarteter Fill als Anteil des theoretischen Credits
+SLIPPAGE_FACTOR: dict[str, float] = {
+    'IB (Combo)':             0.92,
+    'yfinance (Bid)':         0.82,
+    'Black-Scholes (geschätzt)': 0.65,
+    'default':                0.80,
+}
+
+# VIX-Regime (Bull Put Spreads = Short Premium → VIX-abhängige Größensteuerung)
+VIX_CALM_THRESHOLD    = float(_cfg.get('vix_calm',    16))   # < 16: zu wenig Prämie
+VIX_ELEVATED_THRESHOLD= float(_cfg.get('vix_elevated', 30))  # 16–30: optimal
+VIX_CRISIS_THRESHOLD  = float(_cfg.get('vix_crisis',   40))  # > 40: kein neuer Trade
+
+# Event-Lock: kein neuer Trade N Stunden vor/nach Makro-Ereignis
+EVENT_LOCK_HOURS = int(_cfg.get('event_lock_hours', 24))
+
+# Makro-Kalender: FOMC-Sitzungstage + CPI-Veröffentlichungen + NFP
+_MACRO_EVENTS: list[str] = [
+    # CPI 2026
+    '2026-06-10', '2026-07-14', '2026-08-12', '2026-09-10',
+    '2026-10-14', '2026-11-12', '2026-12-10',
+    # FOMC 2026 (Sitzungsende-Tag)
+    '2026-06-10', '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09',
+    # NFP 2026 (erster Freitag des Monats)
+    '2026-06-05', '2026-07-02', '2026-08-07', '2026-09-04',
+    '2026-10-02', '2026-11-06', '2026-12-04',
+]
+
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
     # Tech
@@ -307,6 +340,10 @@ ACCOUNT_ID:   str  = ''
 # Kill-Switch: True wenn Tages-/Wochenverlust-Limit überschritten
 _kill_switch_active: bool  = False
 _kill_switch_reason: str   = ''
+
+# Aktueller VIX-Stand (wird jede Scan-Runde aktualisiert)
+_vix_level:  float = 0.0
+_vix_regime: str   = 'unknown'
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -829,6 +866,52 @@ async def check_earnings_conflict(symbol: str, expiry_str: str) -> tuple:
         return False, ''
 
 
+async def get_vix() -> float:
+    """Lädt den aktuellen VIX-Stand via yfinance (^VIX)."""
+    def _fetch():
+        import yfinance as yf
+        try:
+            fi = yf.Ticker('^VIX').fast_info
+            v = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
+            return float(v) if v else 0.0
+        except Exception:
+            return 0.0
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=10) or 0.0
+    except Exception:
+        return 0.0
+
+
+def vix_regime(vix: float) -> tuple:
+    """Gibt (regime_str, size_factor) zurück.
+    size_factor == 0.0 bedeutet: kein neuer Trade (Krisenmodus)."""
+    if vix <= 0:
+        return 'unknown', 1.0
+    if vix < VIX_CALM_THRESHOLD:
+        return 'calm', 0.5       # wenig Prämie, Hälfte der Kontrakte
+    if vix < VIX_ELEVATED_THRESHOLD:
+        return 'normal', 1.0
+    if vix < VIX_CRISIS_THRESHOLD:
+        return 'elevated', 0.75  # gut für Premium, aber etwas konservativer
+    return 'crisis', 0.0          # Gap-Risiko zu hoch → kein neuer Trade
+
+
+def check_event_lock() -> tuple:
+    """Prüft ob ein Makro-Event (CPI/FOMC/NFP) innerhalb EVENT_LOCK_HOURS liegt.
+    Gibt (locked, reason_str) zurück."""
+    now = datetime.now()
+    for ds in _MACRO_EVENTS:
+        try:
+            ev_dt = datetime.strptime(ds, '%Y-%m-%d').replace(hour=8, minute=30)
+            hours = (ev_dt - now).total_seconds() / 3600
+            if -2 <= hours <= EVENT_LOCK_HOURS:
+                label = 'CPI/NFP/FOMC'
+                return True, f"{label} am {ds} (noch {max(0, hours):.0f}h)"
+        except Exception:
+            continue
+    return False, ''
+
+
 async def check_kill_switch(ib) -> bool:
     """Liest Tages-P&L aus IBKR; setzt _kill_switch_active wenn Limit überschritten.
     Gibt True zurück wenn Trading gestoppt werden soll."""
@@ -906,6 +989,24 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             otm_puts = puts
         short_row = otm_puts.loc[(otm_puts['strike'] - target).abs().idxmin()]
         short_strike = float(short_row['strike'])
+
+        # ── Liquiditätsfilter (Short-Leg) ─────────────────────────────────────
+        _oi  = float(short_row.get('openInterest', 0) or 0)
+        _vol = float(short_row.get('volume', 0) or 0)
+        _sb  = float(short_row.get('bid', 0) or 0)
+        _sa  = float(short_row.get('ask', 0) or 0)
+        if _oi < MIN_OPEN_INTEREST:
+            log(f"   [{symbol}] ✗ OI={_oi:.0f} < {MIN_OPEN_INTEREST} — zu illiquide")
+            return None
+        if _vol < MIN_OPTION_VOLUME:
+            log(f"   [{symbol}] ✗ Volume={_vol:.0f} < {MIN_OPTION_VOLUME} — zu wenig Umsatz")
+            return None
+        if _sb > 0 and _sa > 0:
+            _mid_yf = (_sb + _sa) / 2
+            _ba_pct = (_sa - _sb) / _mid_yf
+            if _ba_pct > MAX_BID_ASK_SPREAD:
+                log(f"   [{symbol}] ✗ Bid/Ask-Spread {_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%} — zu illiquide")
+                return None
 
         # Prämie: Short-Bid für Spread-Breiten-Berechnung
         bid = float(short_row['bid'])
@@ -1015,8 +1116,12 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         prob_otm      = _bs_prob_otm(preis, short_strike, T, iv)
         prob_max_loss = 1.0 - _bs_prob_otm(preis, long_strike, T, iv)
 
-        ev       = (prob_otm * credit) - (prob_max_loss * max_risk)
-        ev_ratio = ev / credit if credit > 0 else 0.0
+        # Slippage-adjustierter EV: theoretischen Credit um erwarteten Fill-Abschlag korrigieren
+        _slip     = SLIPPAGE_FACTOR.get(praemie_quelle, SLIPPAGE_FACTOR['default'])
+        eff_credit = credit * _slip
+        ev        = (prob_otm * eff_credit) - (prob_max_loss * max_risk)
+        ev_raw    = (prob_otm * credit)     - (prob_max_loss * max_risk)   # ohne Slippage (Info)
+        ev_ratio  = ev / eff_credit if eff_credit > 0 else 0.0
 
         # ── Decision Engine: TradeContext aufbauen ────────────────────────
         dte_center = (MIN_DTE + MAX_DTE) / 2          # 52.5 Tage
@@ -1059,7 +1164,9 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             'prob_otm':        prob_otm,
             'prob_max_loss':   prob_max_loss,
             'ev':              ev,
+            'ev_raw':          ev_raw,          # EV vor Slippage (Info)
             'ev_ratio':        ev_ratio,
+            'slippage_factor': _slip,
             'score':           score,           # final_score der Decision Engine
             'decision':        decision,        # 'TRADE' / 'WATCH' / 'SKIP'
             'edge':            breakdown['edge'],
@@ -1644,16 +1751,18 @@ async def place_order(ib, sig):
                     _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                     return
 
-            # Position Sizing: Anzahl Kontrakte aus Confidence (max durch Risk-Limit begrenzt)
+            # Position Sizing: Confidence × VIX-Regime, gedeckelt durch Risk-Limit
             n_contracts_conf = CONTRACTS_BY_CONFIDENCE.get(price_src, 1)
+            _, vix_factor    = vix_regime(_vix_level)
+            n_contracts_vix  = max(1, int(n_contracts_conf * vix_factor))
             if net_liq > 0 and MAX_RISK_PER_TRADE_PCT > 0 and spread_risk_usd > 0:
                 max_by_risk = max(1, int(net_liq * MAX_RISK_PER_TRADE_PCT / spread_risk_usd))
-                n_contracts = min(n_contracts_conf, max_by_risk)
+                n_contracts = min(n_contracts_vix, max_by_risk)
             else:
                 n_contracts = 1
-            if n_contracts > 1:
-                log(f"  📏 [{sym}] Position Sizing: {n_contracts} Kontrakte "
-                    f"[{price_src}, NetLiq=${net_liq:,.0f}, RiskLimit={MAX_RISK_PER_TRADE_PCT:.0%}]")
+            log(f"  📏 [{sym}] Position Sizing: {n_contracts} Kontrakt(e)"
+                f" [Conf:{n_contracts_conf} × VIX:{vix_factor:.1f} → {n_contracts_vix},"
+                f" RiskCap:{max_by_risk if net_liq > 0 else '?'}]")
 
             _bot_trades[sym] = {
                 'entry_per_share': limit_price,
@@ -1937,6 +2046,19 @@ async def run_bot(stop_event: threading.Event = None):
                     slept += chunk
                 continue
 
+            # ── VIX-Regime + Event-Lock ──────────────────────────────────────
+            global _vix_level, _vix_regime
+            _vix_level = await get_vix()
+            _regime_str, _size_factor = vix_regime(_vix_level)
+            _vix_regime = _regime_str
+            vix_icon = {'calm': '😴', 'normal': '✅', 'elevated': '⚡', 'crisis': '🚨'}.get(_regime_str, '❓')
+            log(f"  {vix_icon} VIX {_vix_level:.1f} [{_regime_str.upper()}]"
+                + (f" — Size-Faktor {_size_factor:.1f}x" if _size_factor != 1.0 else ""))
+
+            _ev_locked, _ev_reason = check_event_lock()
+            if _ev_locked:
+                log(f"  🔒 EVENT-LOCK: {_ev_reason} — kein neuer Trade")
+
             # ── Kill-Switch-Check ─────────────────────────────────────────────
             if await check_kill_switch(ib):
                 log(f"  🛑 KILL-SWITCH aktiv ({_kill_switch_reason}) — Scan übersprungen, nur Exit-Monitoring läuft")
@@ -2158,8 +2280,20 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"  ⏸️  Kein Signal mit Score ≥ {ENTRY_THRESHOLD} (TRADE) und erfülltem Credit-Gate")
 
             # ── Phase 4: Orders platzieren ────────────────────────────────────
+            # VIX-Krisenmodus: keine neuen Trades
+            _cur_regime, _cur_factor = vix_regime(_vix_level)
+            if _cur_factor <= 0 and selected:
+                log(f"  🚨 VIX {_vix_level:.1f} [CRISIS] — {len(selected)} Trade(s) blockiert")
+                selected = []
+            # Event-Lock: keine neuen Trades vor Makro-Ereignis
+            if _ev_locked and selected:
+                log(f"  🔒 EVENT-LOCK ({_ev_reason}) — {len(selected)} Trade(s) blockiert")
+                selected = []
+
             for sig in selected:
-                log(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}")
+                log(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}"
+                    f" | EV adj. ${sig['ev']:+.0f} (raw ${sig.get('ev_raw', sig['ev']):+.0f})"
+                    f" | Slip {sig.get('slippage_factor', 1.0):.0%}")
                 await place_order(ib, sig)
 
             # Positionen für Launcher-Anzeige schreiben

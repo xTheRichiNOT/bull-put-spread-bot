@@ -19,5 +19,12 @@
   "max_weekly_loss": 0,
   "max_risk_per_trade_pct": 0.02,
   "max_total_risk_pct": 0.15,
-  "earnings_buffer_days": 14
+  "earnings_buffer_days": 14,
+  "min_open_interest": 500,
+  "min_option_volume": 100,
+  "max_bid_ask_spread": 0.12,
+  "vix_calm": 16,
+  "vix_elevated": 30,
+  "vix_crisis": 40,
+  "event_lock_hours": 24
 }
