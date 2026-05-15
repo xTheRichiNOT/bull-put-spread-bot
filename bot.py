@@ -364,7 +364,7 @@ def _save_state():
         import json
         data = {sym: info
                 for sym, info in _bot_trades.items()
-                if info.get('status') in ('open', 'closing') and info.get('short_conid')}
+                if info.get('status') in ('open', 'closing', 'exit_retry') and info.get('short_conid')}
         with open(_STATE_FILE, 'w') as f:
             json.dump(data, f)
     except Exception:
@@ -395,8 +395,17 @@ def _on_order_status(trade):
         if order_id in _expected_cancels:
             _expected_cancels.discard(order_id)
             return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
-        _bot_trades[sym]['status'] = 'cancelled'
-        log(f"  🚫 [{sym}] Order #{order_id} abgelehnt/gecancelt — Symbol für diese Session gesperrt")
+        current_st = _bot_trades[sym].get('status', '')
+        if current_st in ('open', 'closing', 'recovery_pending'):
+            # Position war offen — Exit gescheitert → in 60s nochmal versuchen
+            retry_ts = (datetime.now() + timedelta(seconds=60)).timestamp()
+            _bot_trades[sym]['status']   = 'exit_retry'
+            _bot_trades[sym]['retry_at'] = retry_ts
+            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY geplant in 60s")
+        else:
+            # Kein offener Trade (Entry-Order gecancelt) — nur überspringen
+            _bot_trades[sym]['status'] = 'cancelled'
+            log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — kein offener Spread, Symbol übersprungen")
         _save_state()
     elif status == 'Filled':
         if _bot_trades[sym].get('status') == 'closing':
@@ -860,7 +869,7 @@ async def fetch_signal(symbol, preis, iv, ib=None):
 def count_bot_orders():
     """Zählt aktive Spread-Orders des Bots — ignoriert reine Aktien-Positionen."""
     return sum(1 for info in _bot_trades.values()
-               if info.get('status') in ('open', 'closing')
+               if info.get('status') in ('open', 'closing', 'exit_retry')
                and info.get('short_conid'))
 
 async def has_open_position(ib, symbol):
@@ -872,7 +881,8 @@ async def has_open_position(ib, symbol):
 def already_traded(symbol):
     """Blockiert nur wenn eine echte Position existiert oder gerade platziert wird.
     'cancelled'/'failed' = kein Fill → Retry erlaubt (has_open_position prüft IB nochmal)."""
-    return symbol in _bot_trades and _bot_trades[symbol].get('status') in ('open', 'closing', 'placing', 'done')
+    return symbol in _bot_trades and _bot_trades[symbol].get('status') in (
+        'open', 'closing', 'placing', 'done', 'exit_retry', 'recovery_pending')
 
 async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None):
     """Aktueller Marktwert des Spreads (= Debit um ihn zurückzukaufen).
@@ -1049,6 +1059,21 @@ async def monitor_exits(ib=None):
     if not _bot_trades:
         return
     for symbol, info in list(_bot_trades.items()):
+        # EXIT_RETRY: Exit-Order wurde abgelehnt — nach 60s Cooldown erneut versuchen
+        if info.get('status') == 'exit_retry':
+            if not ib:
+                continue
+            retry_at = info.get('retry_at', 0)
+            remaining = int(retry_at - datetime.now().timestamp())
+            if remaining > 0:
+                log(f"  ⏳ [{symbol}] EXIT_RETRY: Warte noch {remaining}s bis Retry")
+                continue
+            log(f"  🔁 [{symbol}] EXIT_RETRY: Cooldown abgelaufen — erneuter Schließ-Versuch")
+            info['status'] = 'closing'   # kurz auf 'closing' für close_spread
+            async with _sym_lock(symbol):
+                await close_spread(ib, symbol, info, 'RETRY_EXIT')
+            continue
+
         if info.get('status') != 'open':
             continue
         if not info.get('expiry_yf'):
@@ -1765,7 +1790,7 @@ async def run_bot(stop_event: threading.Event = None):
                 # Sektor-Exposure nur aus echten Spread-Positionen zählen
                 sector_counts: dict = {}
                 for s, info in _bot_trades.items():
-                    if info.get('status') in ('open', 'closing') and info.get('short_conid'):
+                    if info.get('status') in ('open', 'closing', 'exit_retry') and info.get('short_conid'):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
