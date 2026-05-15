@@ -97,8 +97,8 @@ WATCHLIST        = [
     'CRM', 'ORCL', 'NOW', 'ADBE', 'PLTR', 'WDAY', 'SNOW', 'PANW', 'CRWD', 'FTNT', 'DDOG', 'APP',
     # Consumer Tech / EV (8)
     'TSLA', 'NFLX', 'UBER', 'SHOP', 'LYFT', 'PINS', 'DASH', 'RBLX',
-    # Fintech & Krypto (7)
-    'COIN', 'PYPL', 'V', 'MA', 'SQ', 'AFRM', 'SOFI',
+    # Fintech & Krypto (6)
+    'COIN', 'PYPL', 'V', 'MA', 'AFRM', 'SOFI',
     # Banken & Finanzen (11)
     'JPM', 'GS', 'MS', 'BAC', 'WFC', 'C', 'AXP', 'SCHW', 'BLK', 'BX', 'USB',
     # Pharma / Healthcare (13)
@@ -140,7 +140,7 @@ SCAN_INTERVALL   = int(_cfg['scan_intervall'])
 MAX_POSITIONS    = int(_cfg['max_positions'])
 MAX_PER_SECTOR   = int(_cfg['max_per_sector'])
 AUTO_TRADE       = bool(_cfg['auto_trade'])
-IB_SCAN_BATCH    = 20   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
+IB_SCAN_BATCH    = 15   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
 
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
@@ -163,7 +163,7 @@ SECTOR_MAP = {
     'DASH': 'ConsumerTech', 'RBLX': 'ConsumerTech',
     # Fintech
     'COIN': 'Fintech', 'PYPL': 'Fintech', 'V': 'Fintech',  'MA': 'Fintech',
-    'SQ': 'Fintech',   'AFRM': 'Fintech', 'SOFI': 'Fintech',
+    'AFRM': 'Fintech', 'SOFI': 'Fintech',
     # Banken
     'JPM': 'Banken', 'GS': 'Banken',   'MS': 'Banken',  'BAC': 'Banken',
     'WFC': 'Banken', 'C': 'Banken',    'AXP': 'Banken', 'SCHW': 'Banken',
@@ -443,6 +443,20 @@ def _check_credit(credit: float, breite: float, prob_otm: float):
     return True, required, min_pwin
 
 
+def _round_to_standard_strike(strike: float, price: float) -> float:
+    """Rundet einen Strike auf das nächste typische Options-Inkrement.
+    Fallback wenn der Strike-Map-Eintrag für ein Symbol fehlt."""
+    if price >= 500:
+        inc = 10.0
+    elif price >= 200:
+        inc = 5.0
+    elif price >= 50:
+        inc = 2.5
+    else:
+        inc = 1.0
+    return round(strike / inc) * inc
+
+
 async def build_strike_map(ib):
     """Lädt IB-verfügbare Strikes und Expiries für alle Watchlist-Symbole.
     Einmalig beim Bot-Start — verhindert 'Qualifizierung fehlgeschlagen' für nicht-existente Strikes."""
@@ -558,7 +572,7 @@ async def _get_market_data_yf(symbol):
         return None, None
 
 async def _batch_ib_price_scan(batch: list, ib) -> dict:
-    """Abonniert bis zu IB_SCAN_BATCH Symbole gleichzeitig, wartet 2s, cancelt alle.
+    """Abonniert bis zu IB_SCAN_BATCH Symbole gleichzeitig, wartet 3s, cancelt alle.
     Gibt {symbol: (price, iv)} zurück — nur Symbole mit mindestens einem Preis."""
     import math as _math
     from ib_insync import Stock as _Stock
@@ -568,7 +582,7 @@ async def _batch_ib_price_scan(batch: list, ib) -> dict:
             tickers[sym] = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '106', False, False)
         except Exception:
             pass
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
     results = {}
     for sym, t in tickers.items():
         try:
@@ -673,13 +687,15 @@ async def fetch_signal(symbol, preis, iv, ib=None):
             else:
                 long_strike = short_strike - SPREAD_MIN
         else:
-            # Kein Strike-Map → yfinance-Strikes verwenden
+            # Kein Strike-Map → Standard-Inkrement-Rounding (verhindert Error 200)
+            short_strike = _round_to_standard_strike(short_strike, preis)
             spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
             breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
             candidates  = sorted(puts[puts['strike'] < short_strike]['strike'].tolist())
             if candidates:
                 long_target = short_strike - breite_ziel
                 long_strike = float(min(candidates, key=lambda s: abs(s - long_target)))
+                long_strike = _round_to_standard_strike(long_strike, preis)
             else:
                 long_strike = short_strike - breite_ziel
         breite = short_strike - long_strike
