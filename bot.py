@@ -130,9 +130,13 @@ MIN_CREDIT_ABS     = 45    # Absolutes Minimum unabhängig von der Breite ($)
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
-MAX_PROBABILITY  = 0.85
-MAX_LOSS_PROB    = 0.20
-MIN_EV_RATIO     = 0.005
+MAX_PROBABILITY  = 0.85    # nur noch für Display-Hinweis (kein Hard-Block)
+MAX_LOSS_PROB    = 0.20    # nur noch für Score-Penalty (kein Hard-Block)
+MIN_EV_RATIO     = 0.005   # nur noch für Score-Penalty
+
+# Decision Engine — ein einziger gewichteter Score entscheidet
+ENTRY_THRESHOLD  = 0.72    # Score >= 0.72: Trade
+WATCH_THRESHOLD  = 0.60    # Score 0.60–0.72: Watch (sichtbar, kein Trade)
 RATIO_TOLERANCE  = 0.20
 MIN_DTE          = 45
 MAX_DTE          = 60
@@ -509,6 +513,81 @@ def _check_credit(credit: float, breite: float, prob_otm: float):
     return True, required, min_pwin
 
 
+# ── Decision Engine ───────────────────────────────────────────────────────────
+from dataclasses import dataclass
+
+@dataclass
+class TradeContext:
+    ev_norm:                float   # EV normalisiert 0–1
+    p_win:                  float   # P(OTM) = P(Gewinn)
+    iv_rank:                float   # IV normalisiert 0–1
+    news_momentum:          float   # 1.0 wenn News-Trigger
+    structure_quality:      float   # DTE-Qualität × R/R-Qualität
+    p_max_loss:             float   # P(MaxVerlust) = Risiko
+    spread_cost:            float   # Risikofraktion: MaxRisk/(Credit+MaxRisk)
+    liquidity_risk:         float   # 0=echtes Bid, 0.6=BS-Schätzung
+    dte_risk:               float   # Distanz DTE vom optimalen Fenster
+    iv_expansion_confirmed: float   # 1.0 wenn IV > 35%
+    tight_spread_bonus:     float   # 1.0 wenn R/R ≥ 0.25
+    liquidity_bonus:        float   # 1.0 wenn kein BS-Fallback
+    no_event_conflict:      float   # 1.0 wenn DTE >= 21 (kein Gamma-Risiko)
+
+
+class DecisionEngine:
+    """Ersetzt alle Hard-Filter durch einen einzigen gewichteten Score.
+    Einzige Hard-Gates: Infrastrukturprobleme (kein Vertrag, kein Preis) und
+    Mindest-Credit-Größe. Alles andere ist Score-Komponente."""
+
+    def __init__(self, trade_threshold: float = ENTRY_THRESHOLD,
+                       watch_threshold: float = WATCH_THRESHOLD):
+        self.trade_threshold = trade_threshold
+        self.watch_threshold = watch_threshold
+
+    def _edge(self, s: TradeContext) -> float:
+        return (0.30 * s.ev_norm
+              + 0.25 * s.p_win
+              + 0.15 * s.iv_rank
+              + 0.15 * s.news_momentum
+              + 0.15 * s.structure_quality)
+
+    def _risk(self, s: TradeContext) -> float:
+        return (0.30 * s.p_max_loss
+              + 0.25 * s.spread_cost
+              + 0.25 * s.liquidity_risk
+              + 0.20 * s.dte_risk)
+
+    def _quality(self, s: TradeContext) -> float:
+        return (0.10 * s.iv_expansion_confirmed
+              + 0.10 * s.tight_spread_bonus
+              + 0.10 * s.liquidity_bonus
+              + 0.10 * s.no_event_conflict)
+
+    def compute_score(self, s: TradeContext) -> float:
+        return self._edge(s) + self._quality(s) - self._risk(s)
+
+    def decide(self, ctx: TradeContext):
+        score = self.compute_score(ctx)
+        if score >= self.trade_threshold:
+            action = 'TRADE'
+        elif score >= self.watch_threshold:
+            action = 'WATCH'
+        else:
+            action = 'SKIP'
+        return action, score
+
+    def explain(self, ctx: TradeContext) -> dict:
+        score = self.compute_score(ctx)
+        return {
+            'edge':        round(self._edge(ctx),    4),
+            'risk':        round(self._risk(ctx),    4),
+            'quality':     round(self._quality(ctx), 4),
+            'final_score': round(score,              4),
+        }
+
+
+_decision_engine = DecisionEngine()
+
+
 def _round_to_standard_strike(strike: float, price: float) -> float:
     """Rundet einen Strike auf das nächste typische Options-Inkrement.
     Fallback wenn der Strike-Map-Eintrag für ein Symbol fehlt."""
@@ -686,7 +765,7 @@ async def check_news_trigger(symbol):
     except (asyncio.TimeoutError, Exception):
         return False, None
 
-async def fetch_signal(symbol, preis, iv, ib=None):
+async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
     """
     Berechnet den Bull-Put-Spread für ein Symbol.
     Gibt ein Signal-Dict zurück oder None wenn kein handelbares Setup gefunden.
@@ -831,33 +910,57 @@ async def fetch_signal(symbol, preis, iv, ib=None):
         prob_otm      = _bs_prob_otm(preis, short_strike, T, iv)
         prob_max_loss = 1.0 - _bs_prob_otm(preis, long_strike, T, iv)
 
-        # Erwartungswert: (P_Gewinn × Credit) − (P_MaxVerlust × MaxRisk)
-        # Vereinfachung nach dem Modell des Nutzers — ignoriert Teilzonen (Breakeven-Bereich)
         ev       = (prob_otm * credit) - (prob_max_loss * max_risk)
         ev_ratio = ev / credit if credit > 0 else 0.0
 
-        # Score = EV-Ratio × IV-Stärke: kombiniert statistischen Vorteil und Prämienqualität
-        score    = ev_ratio * (iv / MIN_VOLA)
+        # ── Decision Engine: TradeContext aufbauen ────────────────────────
+        dte_center = (MIN_DTE + MAX_DTE) / 2          # 52.5 Tage
+        dte_ok     = max(0.0, 1.0 - abs(dte - dte_center) / (dte_center))
+        ctx = TradeContext(
+            ev_norm                = min(max(ev / 500.0, 0.0), 1.0),
+            p_win                  = prob_otm,
+            iv_rank                = min(iv / 0.80, 1.0),
+            news_momentum          = 1.0 if news_hit else 0.0,
+            structure_quality      = dte_ok * min(rr / 0.30, 1.0),
+            p_max_loss             = prob_max_loss,
+            spread_cost            = 1.0 - rr / (1.0 + rr),
+            liquidity_risk         = 0.6 if 'Black-Scholes' in praemie_quelle else 0.0,
+            dte_risk               = 0.0 if MIN_DTE <= dte <= MAX_DTE else min(abs(dte - dte_center) / dte_center, 1.0),
+            iv_expansion_confirmed = 1.0 if iv > 0.35 else 0.0,
+            tight_spread_bonus     = 1.0 if rr >= 0.25 else 0.0,
+            liquidity_bonus        = 0.0 if 'Black-Scholes' in praemie_quelle else 1.0,
+            no_event_conflict      = 1.0 if dte >= 21 else 0.0,
+        )
+        breakdown = _decision_engine.explain(ctx)
+        decision, score = _decision_engine.decide(ctx)
+
+        # Hard-Gate: Mindest-Credit-Größe (Infrastruktur, kein Score-Thema)
+        credit_ok_hard = credit >= max(breite * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
 
         return {
-            'symbol':        symbol,
-            'preis':         preis,
-            'iv':            iv,
-            'dte':           dte,
-            'expiry_ib':     expiry_yf.replace('-', ''),
-            'short_strike':  short_strike,
-            'long_strike':   long_strike,
-            'breite':        breite,
-            'praemie':       praemie,
-            'praemie_quelle': praemie_quelle,
-            'credit':        credit,
-            'max_risk':      max_risk,
-            'risk_reward':   rr,
-            'prob_otm':      prob_otm,
-            'prob_max_loss': prob_max_loss,
-            'ev':            ev,
-            'ev_ratio':      ev_ratio,
-            'score':         score,
+            'symbol':          symbol,
+            'preis':           preis,
+            'iv':              iv,
+            'dte':             dte,
+            'expiry_ib':       expiry_yf.replace('-', ''),
+            'short_strike':    short_strike,
+            'long_strike':     long_strike,
+            'breite':          breite,
+            'praemie':         praemie,
+            'praemie_quelle':  praemie_quelle,
+            'credit':          credit,
+            'max_risk':        max_risk,
+            'risk_reward':     rr,
+            'prob_otm':        prob_otm,
+            'prob_max_loss':   prob_max_loss,
+            'ev':              ev,
+            'ev_ratio':        ev_ratio,
+            'score':           score,           # final_score der Decision Engine
+            'decision':        decision,        # 'TRADE' / 'WATCH' / 'SKIP'
+            'edge':            breakdown['edge'],
+            'risk':            breakdown['risk'],
+            'quality':         breakdown['quality'],
+            'credit_ok_hard':  credit_ok_hard,
         }
     except asyncio.TimeoutError:
         log(f"   [{symbol}] ⏱️  fetch_signal Timeout — überspringe")
@@ -1741,7 +1844,7 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
 
                 async with _sem_sig:
-                    sig = await fetch_signal(symbol, preis, iv, ib)
+                    sig = await fetch_signal(symbol, preis, iv, ib, news_hit=news_hit)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig
@@ -1766,11 +1869,8 @@ async def run_bot(stop_event: threading.Event = None):
             qualified = [
                 s for s in all_signals
                 if (IS_DEMO_MODE or s['praemie_quelle'] != "Black-Scholes (geschätzt)")
-                and _check_credit(s['credit'], s['breite'], s.get('prob_otm', 0))[0]
-                and s['risk_reward']            >= MIN_RISK_REWARD
-                and s['prob_otm']               <= MAX_PROBABILITY
-                and s.get('prob_max_loss', 1.0) <= MAX_LOSS_PROB
-                and s.get('ev_ratio', 0)        >= MIN_EV_RATIO
+                and s.get('credit_ok_hard', True)
+                and s.get('decision') == 'TRADE'
             ]
             qualified.sort(key=lambda s: s['score'], reverse=True)
 
@@ -1840,23 +1940,21 @@ async def run_bot(stop_event: threading.Event = None):
                     reasons = []
                     if s['praemie_quelle'] == "Black-Scholes (geschätzt)" and not IS_DEMO_MODE:
                         reasons.append("kein echtes Bid (BS-Schätzung) — Live-Modus erfordert echtes Bid")
-                    _c, _p, _b = s['credit'], s.get('prob_otm', 0), s['breite']
-                    _credit_ok, _req, _req_pwin = _check_credit(_c, _b, _p)
-                    if not _credit_ok:
-                        _risk = _b * 100
-                        if _c >= _req:
-                            reasons.append(f"Credit ${_c:.0f} OK aber P(Win) {_p:.1%} < {_req_pwin:.0%}")
-                        else:
-                            reasons.append(f"Credit ${_c:.0f} < erforderlich ${_req:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${_risk:.0f} Risiko)")
-                    if s['risk_reward'] < MIN_RISK_REWARD:
-                        reasons.append(f"R/R {s['risk_reward']:.2f}x < {MIN_RISK_REWARD:.2f}x")
-                    if s.get('prob_otm', 0) > MAX_PROBABILITY:
-                        reasons.append(f"P(Win) {s.get('prob_otm',0):.1%} > {MAX_PROBABILITY:.0%} (Prämie zu klein)")
-                    if s.get('prob_max_loss', 1.0) > MAX_LOSS_PROB:
-                        reasons.append(f"P(MaxVerlust) {s.get('prob_max_loss',1):.1%} > {MAX_LOSS_PROB:.0%}")
-                    if s.get('ev_ratio', 0) < MIN_EV_RATIO:
-                        reasons.append(f"EV {s.get('ev', 0):+.2f}$ negativer Erwartungswert")
-                    log(f"  ✗ [{s['symbol']}] blockiert: {', '.join(reasons)}")
+                    if not s.get('credit_ok_hard', True):
+                        _c, _b = s['credit'], s['breite']
+                        _req = max(_b * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
+                        reasons.append(f"Credit ${_c:.0f} < erforderlich ${_req:.0f} (Hard-Gate)")
+                    decision = s.get('decision', 'SKIP')
+                    score    = s.get('score', 0.0)
+                    edge     = s.get('edge', 0.0)
+                    risk     = s.get('risk', 0.0)
+                    quality  = s.get('quality', 0.0)
+                    if decision != 'TRADE':
+                        reasons.append(
+                            f"Score {score:.3f} < {ENTRY_THRESHOLD} [{decision}]"
+                            f" | Edge={edge:.3f} Risk={risk:.3f} Quality={quality:.3f}"
+                        )
+                    log(f"  ✗ [{s['symbol']}] blockiert: {', '.join(reasons) or 'unbekannt'}")
             else:
                 log("\n  Keine Signale in diesem Zyklus.")
 
@@ -1868,7 +1966,7 @@ async def run_bot(stop_event: threading.Event = None):
             elif slots <= 0:
                 log(f"  ⏸️  Bot-Limit erreicht ({open_count}/{MAX_POSITIONS} Orders diese Session) — kein neuer Trade")
             elif not tradeable:
-                log(f"  ⏸️  Kein Signal über Mindest-R/R {MIN_RISK_REWARD:.2f}x oder dynamischen Credit (≥{MIN_CREDIT_PERCENT:.0%} der Spread-Breite, mind. ${MIN_CREDIT_ABS})")
+                log(f"  ⏸️  Kein Signal mit Score ≥ {ENTRY_THRESHOLD} (TRADE) und erfülltem Credit-Gate")
 
             # ── Phase 4: Orders platzieren ────────────────────────────────────
             for sig in selected:
