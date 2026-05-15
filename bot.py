@@ -681,6 +681,8 @@ class TradeContext:
     no_event_conflict:      float   # 1.0 wenn DTE >= 21 (kein Gamma-Risiko)
     earnings_penalty:       float = 0.0  # direkt vom Score abgezogen: 0.05–0.25
     iv_penalty:             float = 0.0  # direkt vom Score abgezogen: 0.10 wenn IV 18–25%
+    exec_score:             float = 0.0  # Execution Quality: Slippage × Fill-Prob (0–1)
+    liquidity_score_raw:    float = 0.5  # P90-relativer Liquidity Score (0–1) für liq-Komponente
 
 
 class DecisionEngine:
@@ -707,13 +709,20 @@ class DecisionEngine:
               + 0.20 * s.dte_risk)
 
     def _quality(self, s: TradeContext) -> float:
+        """Diagnostik-only (nicht mehr im Score). Zeigt Bonus-Faktoren."""
         return (0.07 * s.iv_expansion_confirmed
               + 0.07 * s.tight_spread_bonus
               + 0.07 * s.liquidity_bonus
               + 0.07 * s.no_event_conflict)
 
     def compute_score(self, s: TradeContext) -> float:
-        return self._edge(s) + self._quality(s) - self._risk(s) - s.earnings_penalty - s.iv_penalty
+        """Prop-Desk Formel: 0.45×Edge + 0.25×Exec + 0.25×(1−Risk) + 0.05×Liq − Penalties."""
+        return (0.45 * self._edge(s)
+              + 0.25 * s.exec_score
+              + 0.25 * (1.0 - self._risk(s))
+              + 0.05 * s.liquidity_score_raw
+              - s.earnings_penalty
+              - s.iv_penalty)
 
     def decide(self, ctx: TradeContext):
         score = self.compute_score(ctx)
@@ -728,10 +737,14 @@ class DecisionEngine:
     def explain(self, ctx: TradeContext) -> dict:
         score = self.compute_score(ctx)
         return {
-            'edge':        round(self._edge(ctx),    4),
-            'risk':        round(self._risk(ctx),    4),
-            'quality':     round(self._quality(ctx), 4),
-            'final_score': round(score,              4),
+            'edge':        round(self._edge(ctx),         4),
+            'exec':        round(ctx.exec_score,          4),
+            'risk':        round(self._risk(ctx),         4),
+            'liq':         round(ctx.liquidity_score_raw, 4),
+            'quality':     round(self._quality(ctx),      4),  # diagnostik
+            'earn_pen':    round(ctx.earnings_penalty,    4),
+            'iv_pen':      round(ctx.iv_penalty,          4),
+            'final_score': round(score,                   4),
         }
 
 
@@ -1289,8 +1302,14 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         # IV-Penalty: Signal bleibt durch, aber Score wird reduziert
         _iv_penalty = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
 
-        # Liquidity Risk: log10-Score → Risk-Komponente (BS override auf ≥0.6)
+        # Liquidity Risk: für _risk()-Komponente (BS override auf ≥0.6)
         _liq_risk = max(0.6, 1.0 - _liquidity_score) if 'Black-Scholes' in praemie_quelle else (1.0 - _liquidity_score)
+
+        # Execution Score: Slippage-Qualität (Fill-Wahrscheinlichkeit zum Limit) × Volume-Fill-Prob
+        # _slip: 0.65 (BS) → 0.82 (yfinance Bid) → 0.92 (IB Combo) = Datenqual.
+        # vol_fill: min(volume / 1000, 1.0) = wie wahrscheinlich fill bei diesem Volumen
+        _vol_fill   = min(_vol / 1000.0, 1.0)
+        _exec_score = 0.5 * _slip + 0.5 * _vol_fill
 
         ctx = TradeContext(
             ev_norm                = min(max(ev / 500.0, 0.0), 1.0),
@@ -1308,6 +1327,8 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             no_event_conflict      = 1.0 if dte >= 21 else 0.0,
             earnings_penalty       = earn_penalty,
             iv_penalty             = _iv_penalty,
+            exec_score             = _exec_score,
+            liquidity_score_raw    = _liquidity_score,
         )
         breakdown = _decision_engine.explain(ctx)
         decision, score = _decision_engine.decide(ctx)
@@ -1335,12 +1356,15 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             'ev_raw':          ev_raw,          # EV vor Slippage (Info)
             'ev_ratio':        ev_ratio,
             'slippage_factor': _slip,
-            'score':            score,           # final_score der Decision Engine
+            'score':            score,
             'decision':         decision,        # 'TRADE' / 'WATCH' / 'SKIP'
             'edge':             breakdown['edge'],
+            'exec':             breakdown['exec'],
             'risk':             breakdown['risk'],
-            'quality':          breakdown['quality'],
+            'liq':              breakdown['liq'],
+            'quality':          breakdown['quality'],   # diagnostik
             'liquidity_score':  round(_liquidity_score, 3),
+            'exec_score':       round(_exec_score, 3),
             'earnings_penalty': earn_penalty,
             'iv_penalty':       _iv_penalty,
             'credit_ok_hard':   credit_ok_hard,
