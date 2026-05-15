@@ -675,25 +675,22 @@ async def fetch_signal(symbol, preis, iv, ib=None):
         expiry_ib_str = expiry_yf.replace('-', '')
         if symbol in _strike_map and _strike_map[symbol]['strikes']:
             ib_strikes = _strike_map[symbol]['strikes']
-            # Short Strike: nächster IB-Strike unter Kurs, nahe am Ziel
-            # Double-snap: erst nächster Map-Strike, dann auf Standard-Inkrement runden,
-            # dann nochmals nächster Map-Strike — verhindert Error 200 bei Quartals-Expiries
-            # (reqSecDefOptParamsAsync enthält Strikes aus ALLEN Expiries, nicht nur der gewählten)
+            # Short Strike: nächsten Map-Strike finden, dann auf Standard-Inkrement runden.
+            # Kein Re-Snap zurück in die Map — reqSecDefOptParamsAsync liefert Strikes aus ALLEN
+            # Expiries. Für Quartals-Expiries (z.B. 20260626) existieren nur Standard-Inkremente
+            # ($5/$10). Das Rounding ist sicherer als der Re-Snap in die Map.
             valid_short = [s for s in ib_strikes if s < preis]
             if valid_short:
-                snapped_short  = min(valid_short, key=lambda s: abs(s - short_strike))
-                rounded_short  = _round_to_standard_strike(snapped_short, preis)
-                short_strike   = min(valid_short, key=lambda s: abs(s - rounded_short))
-            # Long Strike: nächster IB-Strike unter short_strike
+                snapped = min(valid_short, key=lambda s: abs(s - short_strike))
+                short_strike = _round_to_standard_strike(snapped, preis)
+            # Long Strike: nächster Map-Strike unter short_strike, dann runden
             valid_long = [s for s in ib_strikes if s < short_strike]
             if valid_long:
-                # Breite neu berechnen mit gesnapptem short_strike
                 spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
                 breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
                 long_target = short_strike - breite_ziel
-                snapped_long  = min(valid_long, key=lambda s: abs(s - long_target))
-                rounded_long  = _round_to_standard_strike(snapped_long, preis)
-                long_strike   = min(valid_long, key=lambda s: abs(s - rounded_long))
+                snapped_l   = min(valid_long, key=lambda s: abs(s - long_target))
+                long_strike = _round_to_standard_strike(snapped_l, preis)
             else:
                 long_strike = short_strike - SPREAD_MIN
         else:
@@ -882,44 +879,55 @@ async def close_spread(ib, symbol, info, reason):
             await asyncio.sleep(0.5)
 
             active_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel'}
-            cancelled_count = 0
+
+            # Schritt 1: Gespeicherte TP/SL-IDs zuerst — diese haben garantiert eine gültige orderId
+            for label, oid in [('TP', info.get('tp_order_id', 0)),
+                                ('SL', info.get('sl_order_id', 0))]:
+                if not oid:
+                    continue
+                for t in ib.openTrades():
+                    if t.order.orderId == oid:
+                        _expected_cancels.add(oid)
+                        ib.cancelOrder(t.order)
+                        log(f"  🗑  [{symbol}] {label}-Order #{oid} storniert (vor Exit)")
+                        break
+
+            # Schritt 2: Alle weiteren aktiven Orders mit gültiger orderId (z.B. Entry-Order)
+            seen_ids = {info.get('tp_order_id', 0), info.get('sl_order_id', 0)}
             for t in ib.trades():
                 if t.contract.symbol != symbol:
                     continue
                 if t.orderStatus.status not in active_statuses:
                     continue
                 oid = t.order.orderId or 0
-                if oid > 0:
-                    _expected_cancels.add(oid)
-                    ib.cancelOrder(t.order)
-                    log(f"  🗑  [{symbol}] Order #{oid} storniert (vor Exit)")
-                elif t.order.permId:
-                    # orderId=0 bei Bracket-Legs möglich — permId als Fallback
-                    _expected_cancels.add(t.order.permId)
-                    ib.cancelOrder(t.order)
-                    log(f"  🗑  [{symbol}] Order permId={t.order.permId} storniert (vor Exit)")
-                else:
-                    log(f"  ⚠️  [{symbol}] Order ohne gültige ID — Stornierung übersprungen")
+                if oid == 0:
+                    # orderId=0: Order aus alter Session — cancelOrder nicht möglich (Error 10147)
+                    log(f"  ⚠️  [{symbol}] Order permId={t.order.permId or '?'} hat orderId=0 "
+                        f"— bitte manuell in IBKR/TWS prüfen und ggf. stornieren")
                     continue
-                cancelled_count += 1
+                if oid in seen_ids:
+                    continue  # bereits oben behandelt
+                seen_ids.add(oid)
+                _expected_cancels.add(oid)
+                ib.cancelOrder(t.order)
+                log(f"  🗑  [{symbol}] Order #{oid} storniert (vor Exit)")
 
-            if cancelled_count > 0:
-                # ib.sleep pumpt den Event-Loop — IB bestätigt Cancelled-Status synchron
-                await ib.reqAllOpenOrdersAsync()
-                ib.sleep(1)
+            # Warten bis IB Stornierungen bestätigt (asyncio.sleep — nicht ib.sleep, da im async-Kontext)
+            await asyncio.sleep(1.0)
 
-                # Sicherheits-Check: Falls noch aktive Orders vorhanden → Exit abbrechen
-                remaining = [
-                    t for t in ib.trades()
-                    if t.contract.symbol == symbol
-                    and t.orderStatus.status in active_statuses
-                ]
-                if remaining:
-                    ids = [t.order.orderId or t.order.permId for t in remaining]
-                    log(f"  ❌ [{symbol}] Exit abgebrochen — {len(remaining)} Order(s) noch aktiv "
-                        f"nach Stornierung: {ids}. Bitte manuell prüfen!")
-                    info['status'] = 'open'  # Status zurücksetzen
-                    return
+            # Sicherheits-Check: nur cancellierbare Orders (orderId > 0) prüfen
+            remaining = [
+                t for t in ib.trades()
+                if t.contract.symbol == symbol
+                and t.orderStatus.status in active_statuses
+                and (t.order.orderId or 0) > 0
+            ]
+            if remaining:
+                ids = [t.order.orderId for t in remaining]
+                log(f"  ❌ [{symbol}] Exit abgebrochen — {len(remaining)} Order(s) noch aktiv "
+                    f"nach Stornierung: {ids}. Bitte manuell prüfen!")
+                info['status'] = 'open'
+                return
 
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
@@ -1335,6 +1343,8 @@ async def run_bot(stop_event: threading.Event = None):
             2108, 2158, 2157,       # Hist./SecDef-Farm OK
             504,                    # Not connected (transient)
             101,                    # Max Tickers — Demo-typisch, wird via Fallback behandelt
+            200,                    # Kein Contract gefunden — wird im Code abgefangen (conId=0)
+            10147,                  # Cancel für orderId=0 — wird im Code übersprungen
         }
         _IB_SUPPRESS_PHRASES = (
             'cancelMktData: No reqId found',   # Cancel auf bereits bereinigter Subscription
