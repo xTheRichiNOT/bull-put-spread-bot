@@ -128,7 +128,9 @@ WATCHLIST        = [
     # Travel & Leisure (3)
     'ABNB', 'BKNG', 'MAR',
 ]  # gesamt: 120
-MIN_VOLA         = float(_cfg['min_vola'])
+MIN_VOLA         = float(_cfg.get('min_vola', 0.18))   # Hard-Floor IV (war 0.28)
+MIN_VOLA_SOFT    = 0.25    # Score-Penalty Zone: IV 18–25 % → -0.10
+IV_SOFT_PENALTY  = 0.10
 MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
@@ -142,9 +144,10 @@ MAX_PROBABILITY  = 0.85    # nur noch für Display-Hinweis (kein Hard-Block)
 MAX_LOSS_PROB    = 0.20    # nur noch für Score-Penalty (kein Hard-Block)
 MIN_EV_RATIO     = 0.005   # nur noch für Score-Penalty
 
-# Decision Engine — ein einziger gewichteter Score entscheidet
-ENTRY_THRESHOLD  = 0.70    # Score >= 0.70: Trade
-WATCH_THRESHOLD  = 0.62    # Score 0.62–0.70: Watch (sichtbar, kein Trade)
+# Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
+ENTRY_THRESHOLD  = 0.60    # Score ≥ 0.60: Trade-Kandidat (war 0.70)
+WATCH_THRESHOLD  = 0.50    # Score 0.50–0.60: Watch (war 0.62)
+MAX_TRADES_PER_DAY = int(_cfg.get('max_trades_per_day', 10))  # Daily Budget
 RATIO_TOLERANCE  = 0.20
 MIN_DTE          = 45
 MAX_DTE          = 60
@@ -183,7 +186,11 @@ CONTRACTS_BY_CONFIDENCE = {
     'BS_ESTIMATE':  1,
 }
 
-# Liquiditätsfilter: Short-Leg muss ausreichend liquide sein
+# Liquiditätsscoring (kein Hard-Gate mehr — nur Referenzwert für log10-Score)
+# Hard-Floor: OI < 20 UND Volume < 10 gleichzeitig → kein verwertbarer Datenpunkt
+LIQUIDITY_SCAN_FLOOR_OI  = int(_cfg.get('liquidity_floor_oi',  20))
+LIQUIDITY_SCAN_FLOOR_VOL = int(_cfg.get('liquidity_floor_vol', 10))
+# Referenzwerte für log10-Normierung (OI/Vol bei diesen Werten → Score ≈ 1.0 je Leg)
 MIN_OPEN_INTEREST  = int(_cfg.get('min_open_interest', 500))
 MIN_OPTION_VOLUME  = int(_cfg.get('min_option_volume',  100))
 MAX_BID_ASK_SPREAD = float(_cfg.get('max_bid_ask_spread', 0.12))  # 12 % des Mids
@@ -356,6 +363,9 @@ ACCOUNT_ID:   str  = ''
 # Kill-Switch: True wenn Tages-/Wochenverlust-Limit überschritten
 _kill_switch_active: bool  = False
 _kill_switch_reason: str   = ''
+
+# Daily Trade Budget: Anzahl Trades pro Kalendertag
+_trades_today: dict = {}   # {'2026-05-15': 3, ...}
 
 # Aktueller VIX-Stand (wird jede Scan-Runde aktualisiert)
 _vix_level:  float = 0.0
@@ -669,6 +679,8 @@ class TradeContext:
     tight_spread_bonus:     float   # 1.0 wenn R/R ≥ 0.25
     liquidity_bonus:        float   # 1.0 wenn kein BS-Fallback
     no_event_conflict:      float   # 1.0 wenn DTE >= 21 (kein Gamma-Risiko)
+    earnings_penalty:       float = 0.0  # direkt vom Score abgezogen: 0.05–0.25
+    iv_penalty:             float = 0.0  # direkt vom Score abgezogen: 0.10 wenn IV 18–25%
 
 
 class DecisionEngine:
@@ -701,7 +713,7 @@ class DecisionEngine:
               + 0.07 * s.no_event_conflict)
 
     def compute_score(self, s: TradeContext) -> float:
-        return self._edge(s) + self._quality(s) - self._risk(s)
+        return self._edge(s) + self._quality(s) - self._risk(s) - s.earnings_penalty - s.iv_penalty
 
     def decide(self, ctx: TradeContext):
         score = self.compute_score(ctx)
@@ -904,8 +916,10 @@ async def check_news_trigger(symbol):
         return False, None
 
 async def check_earnings_conflict(symbol: str, expiry_str: str) -> tuple:
-    """Prüft ob Earnings vor Expiry oder innerhalb EARNINGS_BUFFER_DAYS liegen.
-    Gibt (True, reason) wenn blockiert, sonst (False, '')."""
+    """Prüft Earnings-Risiko. Gibt (hard_block, penalty, reason) zurück.
+    hard_block=True: Earnings in ≤3 Tagen UND vor Expiry (akutes Risiko).
+    penalty: Score-Abzug 0.25/0.20/0.15/0.05/0.0 je nach Nähe und Position zur Expiry.
+    """
     def _fetch():
         import yfinance as yf
         from datetime import date as date_t
@@ -913,30 +927,48 @@ async def check_earnings_conflict(symbol: str, expiry_str: str) -> tuple:
         expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
         cal = yf.Ticker(symbol).calendar
         if cal is None:
-            return False, ''
+            return False, 0.0, ''
         if isinstance(cal, dict):
             raw_dates = cal.get('Earnings Date', [])
         else:
             try:
                 raw_dates = cal.loc['Earnings Date'].tolist()
             except Exception:
-                return False, ''
+                return False, 0.0, ''
+        best = (False, 0.0, '')   # (hard, penalty, reason) für nächstes Earnings-Datum
         for d in (raw_dates or []):
             try:
                 ed = d.date() if hasattr(d, 'date') else datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
                 if ed < today:
                     continue
+                days = (ed - today).days
                 if ed <= expiry_date:
-                    return True, f"Earnings {ed} vor Expiry {expiry_str}"
-                if (ed - today).days <= EARNINGS_BUFFER_DAYS:
-                    return True, f"Earnings {ed} in {(ed - today).days}d (Buffer={EARNINGS_BUFFER_DAYS}d)"
+                    # Earnings passieren WÄHREND wir die Position halten
+                    if days <= 3:
+                        return True, 0.25, f"Earnings {ed} in {days}d (vor Expiry — Hard Block)"
+                    elif days <= 7:
+                        best = (False, 0.20, f"Earnings {ed} in {days}d vor Expiry")
+                    elif days <= 14:
+                        if best[1] < 0.15:
+                            best = (False, 0.15, f"Earnings {ed} in {days}d vor Expiry")
+                    else:
+                        if best[1] < 0.10:
+                            best = (False, 0.10, f"Earnings {ed} in {days}d vor Expiry")
+                else:
+                    # Earnings passieren NACH Expiry — wir halten nicht durch
+                    if days <= 7:
+                        if best[1] < 0.05:
+                            best = (False, 0.05, f"Earnings {ed} in {days}d (nach Expiry)")
+                    elif days <= EARNINGS_BUFFER_DAYS:
+                        if best[1] < 0.02:
+                            best = (False, 0.02, f"Earnings {ed} in {days}d (nach Expiry)")
             except Exception:
                 continue
-        return False, ''
+        return best
     try:
         return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15)
     except Exception:
-        return False, ''
+        return False, 0.0, ''
 
 
 async def get_vix() -> float:
@@ -1020,6 +1052,43 @@ async def check_kill_switch(ib) -> bool:
     return False
 
 
+# ── Liquidity Scoring: Rolling Stats per Symbol ──────────────────────────────
+# Vergleich erfolgt relativ zu den historischen Werten des Symbols selbst (P90),
+# nicht gegen absolute Schwellenwerte. Selbst-kalibrierend über die Laufzeit.
+_liq_stats: dict = {}   # symbol → {'oi': [float, ...], 'vol': [float, ...]}
+
+def _update_liq_stats(symbol: str, oi: float, vol: float) -> None:
+    s = _liq_stats.setdefault(symbol, {'oi': [], 'vol': []})
+    if oi >= 0:
+        s['oi'].append(oi)
+        if len(s['oi']) > 50:
+            s['oi'].pop(0)
+    if vol >= 0:
+        s['vol'].append(vol)
+        if len(s['vol']) > 50:
+            s['vol'].pop(0)
+
+def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
+    """log1p-basierter Liquidity Score 0–1. Relativ zu symbol-eigener P90-Historie
+    (≥5 Datenpunkte), sonst Fallback auf absolute Referenzwerte."""
+    oi  = max(0.0, oi)
+    vol = max(0.0, vol)
+    s = _liq_stats.get(symbol, {})
+    oi_vals  = s.get('oi',  [])
+    vol_vals = s.get('vol', [])
+    if len(oi_vals) >= 5 and len(vol_vals) >= 5:
+        # Percentile-basiert: aktueller Wert relativ zu P90 des Symbols
+        oi_p90  = sorted(oi_vals) [int(len(oi_vals)  * 0.9)]
+        vol_p90 = sorted(vol_vals)[int(len(vol_vals) * 0.9)]
+        oi_score  = math.log1p(oi)  / math.log1p(max(oi_p90,  1))
+        vol_score = math.log1p(vol) / math.log1p(max(vol_p90, 1))
+    else:
+        # Fallback: Normierung gegen konfigurierte Referenzwerte
+        oi_score  = math.log1p(oi)  / math.log1p(max(MIN_OPEN_INTEREST,  1))
+        vol_score = math.log1p(vol) / math.log1p(max(MIN_OPTION_VOLUME,  1))
+    return min(1.0, oi_score * 0.6 + vol_score * 0.4)
+
+
 async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
     """
     Berechnet den Bull-Put-Spread für ein Symbol.
@@ -1049,12 +1118,14 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         if puts is None or puts.empty:
             return None
 
-        # Earnings-Filter: kein Trade wenn Earnings vor Expiry oder innerhalb Buffer
-        conflict, conflict_reason = await check_earnings_conflict(symbol, expiry_yf)
-        if conflict:
-            log(f"   [{symbol}] 🚫 Earnings-Konflikt: {conflict_reason} — überspringe")
+        # Earnings: Penalty statt Hard-Block — nur bei Earnings ≤3d vor Expiry blockieren
+        hard_block, earn_penalty, conflict_reason = await check_earnings_conflict(symbol, expiry_yf)
+        if hard_block:
+            log(f"   [{symbol}] 🚫 Earnings-HardBlock: {conflict_reason} — überspringe")
             _shadow_partial(symbol, preis, iv, 'earnings', conflict_reason, expiry=expiry_yf)
             return None
+        if earn_penalty > 0:
+            log(f"   [{symbol}] ⚠️  Earnings-Penalty: {conflict_reason} → Score -{earn_penalty:.2f}")
 
         # Short Strike: nächster echter Strike ~OTM unter Kurs
         target = preis * (1 - ABSTAND_Y)
@@ -1064,27 +1135,29 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         short_row = otm_puts.loc[(otm_puts['strike'] - target).abs().idxmin()]
         short_strike = float(short_row['strike'])
 
-        # ── Liquiditätsfilter (Short-Leg) ─────────────────────────────────────
+        # ── Liquiditäts-Scoring (kein Hard-Gate mehr außer absolutem Datenpunkt-Floor) ──
         _oi  = float(short_row.get('openInterest', 0) or 0)
         _vol = float(short_row.get('volume', 0) or 0)
         _sb  = float(short_row.get('bid', 0) or 0)
         _sa  = float(short_row.get('ask', 0) or 0)
-        # Im Demo-Modus: yfinance liefert oft niedrigere OI-Werte (delayed/stale) → Schwelle reduzieren
-        _oi_threshold = MIN_OPEN_INTEREST if not IS_DEMO_MODE else max(MIN_OPEN_INTEREST // 5, 50)
-        if _oi < _oi_threshold:
-            # Warnung bei bekannt hochliquiden Symbolen — deutet auf falschen Strike/Expiry hin
-            if symbol in _HIGH_LIQUIDITY_SYMS and _oi > 0:
-                log(f"   [{symbol}] ⚠️  OI={_oi:.0f} suspekt niedrig für Haupt-Symbol"
-                    f" (erwartet >1000) — evtl. falscher Strike/Expiry (yfinance delayed?)")
-            log(f"   [{symbol}] ✗ OI={_oi:.0f} < {_oi_threshold} — zu illiquide")
-            _shadow_partial(symbol, preis, iv, 'liquidity', f"OI={_oi:.0f} < {_oi_threshold}",
+
+        # Absoluter Floor: OI = 0 UND Volume = 0 → kein Datenpunkt (beide Null)
+        if _oi < LIQUIDITY_SCAN_FLOOR_OI and _vol < LIQUIDITY_SCAN_FLOOR_VOL:
+            log(f"   [{symbol}] ✗ OI={_oi:.0f} & Vol={_vol:.0f} — kein verwertbarer Datenpunkt")
+            _shadow_partial(symbol, preis, iv, 'liquidity',
+                            f"OI={_oi:.0f}&Vol={_vol:.0f} unter absolutem Floor",
                             short_strike=float(short_row['strike']))
             return None
-        if _vol < MIN_OPTION_VOLUME:
-            log(f"   [{symbol}] ✗ Volume={_vol:.0f} < {MIN_OPTION_VOLUME} — zu wenig Umsatz")
-            _shadow_partial(symbol, preis, iv, 'liquidity', f"Volume={_vol:.0f} < {MIN_OPTION_VOLUME}",
-                            short_strike=float(short_row['strike']))
-            return None
+
+        # Rolling-Stats aktualisieren und relativen Liquidity Score berechnen
+        _update_liq_stats(symbol, _oi, _vol)
+        _liquidity_score = _compute_liq_score(symbol, _oi, _vol)
+
+        if symbol in _HIGH_LIQUIDITY_SYMS and _liquidity_score < 0.3:
+            log(f"   [{symbol}] ⚠️  Liquidity-Score={_liquidity_score:.2f} — OI={_oi:.0f} suspekt"
+                f" niedrig für Haupt-Symbol (yfinance delayed?)")
+
+        # Bid-Ask bleibt als Datenqualitäts-Gate (messbarer Spread = echter Markt)
         if _sb > 0 and _sa > 0:
             _mid_yf = (_sb + _sa) / 2
             _ba_pct = (_sa - _sb) / _mid_yf
@@ -1213,6 +1286,12 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         # ── Decision Engine: TradeContext aufbauen ────────────────────────
         dte_center = (MIN_DTE + MAX_DTE) / 2          # 52.5 Tage
         dte_ok     = max(0.0, 1.0 - abs(dte - dte_center) / (dte_center))
+        # IV-Penalty: Signal bleibt durch, aber Score wird reduziert
+        _iv_penalty = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
+
+        # Liquidity Risk: log10-Score → Risk-Komponente (BS override auf ≥0.6)
+        _liq_risk = max(0.6, 1.0 - _liquidity_score) if 'Black-Scholes' in praemie_quelle else (1.0 - _liquidity_score)
+
         ctx = TradeContext(
             ev_norm                = min(max(ev / 500.0, 0.0), 1.0),
             p_win                  = prob_otm,
@@ -1221,12 +1300,14 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             structure_quality      = dte_ok * min(rr / 0.30, 1.0),
             p_max_loss             = prob_max_loss,
             spread_cost            = 1.0 - rr / (1.0 + rr),
-            liquidity_risk         = 0.6 if 'Black-Scholes' in praemie_quelle else 0.0,
+            liquidity_risk         = _liq_risk,
             dte_risk               = 0.0 if MIN_DTE <= dte <= MAX_DTE else min(abs(dte - dte_center) / dte_center, 1.0),
             iv_expansion_confirmed = 1.0 if iv > 0.35 else 0.0,
             tight_spread_bonus     = 1.0 if rr >= 0.25 else 0.0,
-            liquidity_bonus        = 0.0 if 'Black-Scholes' in praemie_quelle else 1.0,
+            liquidity_bonus        = 0.0 if 'Black-Scholes' in praemie_quelle else min(1.0, _liquidity_score),
             no_event_conflict      = 1.0 if dte >= 21 else 0.0,
+            earnings_penalty       = earn_penalty,
+            iv_penalty             = _iv_penalty,
         )
         breakdown = _decision_engine.explain(ctx)
         decision, score = _decision_engine.decide(ctx)
@@ -1254,12 +1335,15 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             'ev_raw':          ev_raw,          # EV vor Slippage (Info)
             'ev_ratio':        ev_ratio,
             'slippage_factor': _slip,
-            'score':           score,           # final_score der Decision Engine
-            'decision':        decision,        # 'TRADE' / 'WATCH' / 'SKIP'
-            'edge':            breakdown['edge'],
-            'risk':            breakdown['risk'],
-            'quality':         breakdown['quality'],
-            'credit_ok_hard':  credit_ok_hard,
+            'score':            score,           # final_score der Decision Engine
+            'decision':         decision,        # 'TRADE' / 'WATCH' / 'SKIP'
+            'edge':             breakdown['edge'],
+            'risk':             breakdown['risk'],
+            'quality':          breakdown['quality'],
+            'liquidity_score':  round(_liquidity_score, 3),
+            'earnings_penalty': earn_penalty,
+            'iv_penalty':       _iv_penalty,
+            'credit_ok_hard':   credit_ok_hard,
         }
     except asyncio.TimeoutError:
         log(f"   [{symbol}] ⏱️  fetch_signal Timeout — überspringe")
@@ -2444,8 +2528,20 @@ async def run_bot(stop_event: threading.Event = None):
                 except Exception:
                     pass
 
+                # Daily Trade Budget: Wie viele neue Trades heute noch erlaubt?
+                _today_str   = datetime.now().strftime('%Y-%m-%d')
+                _day_count   = _trades_today.get(_today_str, 0)
+                _day_budget  = MAX_TRADES_PER_DAY - _day_count
+                _effective_slots = min(slots, _day_budget)
+                if _day_budget <= 0:
+                    log(f"  ⛔ Daily Budget erschöpft ({MAX_TRADES_PER_DAY}/Tag) — kein neuer Trade heute")
+                    tradeable = []
+                elif _day_budget < slots:
+                    log(f"  📆 Daily Budget: {_day_count}/{MAX_TRADES_PER_DAY} heute — "
+                        f"noch {_day_budget} Trade(s) möglich")
+
                 for sig in tradeable:
-                    if len(selected) >= slots:
+                    if len(selected) >= _effective_slots:
                         break
                     if already_traded(sig['symbol']):
                         log(f"  ⏸️  [{sig['symbol']}] Bereits in dieser Session gehandelt — übersprungen")
@@ -2533,6 +2629,8 @@ async def run_bot(stop_event: threading.Event = None):
                     f" | Slip {sig.get('slippage_factor', 1.0):.0%}")
                 _shadow_from_sig(sig, 'taken', 'entry', 'Trade platziert')
                 await place_order(ib, sig)
+                _today_str = datetime.now().strftime('%Y-%m-%d')
+                _trades_today[_today_str] = _trades_today.get(_today_str, 0) + 1
 
             # Positionen für Launcher-Anzeige schreiben
             _write_positions_file()

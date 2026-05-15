@@ -2,7 +2,7 @@
   "ib_host": "127.0.0.1",
   "ib_port": 4002,
   "ib_account": "",
-  "min_vola": 0.28,
+  "min_vola": 0.18,
   "abstand_y": 0.1,
   "min_credit": 70,
   "min_risk_reward": 0.2,
@@ -29,5 +29,8 @@
   "event_lock_hours": 24,
   "fill_timeout_seconds": 300,
   "reconnect_max_attempts": 10,
-  "reconnect_base_wait": 15
+  "reconnect_base_wait": 15,
+  "max_trades_per_day": 10,
+  "liquidity_floor_oi": 20,
+  "liquidity_floor_vol": 10
 }
