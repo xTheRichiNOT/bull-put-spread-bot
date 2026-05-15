@@ -140,7 +140,7 @@ SCAN_INTERVALL   = int(_cfg['scan_intervall'])
 MAX_POSITIONS    = int(_cfg['max_positions'])
 MAX_PER_SECTOR   = int(_cfg['max_per_sector'])
 AUTO_TRADE       = bool(_cfg['auto_trade'])
-IB_SCAN_BATCH    = 10   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
+IB_SCAN_BATCH    = 8    # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
 
 # Confidence-Score je nach Preis-Datenquelle
 PRICE_CONFIDENCE: dict[str, float] = {
@@ -996,13 +996,28 @@ async def close_spread(ib, symbol, info, reason):
                             ib.client.cancelOrder(stored_oid, '')
 
             if not cancel_confirmed:
-                remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
-                                 for t in still_active]
-                log(f"  ❌ [{symbol}] Fehler: Alte Orders konnten nicht gelöscht werden (10s Timeout). "
-                    f"Exit abgebrochen. Noch aktiv: {remaining_ids} — "
-                    f"Bitte manuell in IBKR/TWS stornieren!")
-                info['status'] = 'open'
-                return
+                # Reconciliation: lokaler Cache kann veraltet sein — IB-Server-Wahrheit prüfen.
+                # Manchmal bestätigt IB serversseitig einen Cancel, aber ib_insync hat es noch
+                # nicht verarbeitet. 2s extra warten und nochmals frisch abfragen.
+                log(f"  🔄 [{symbol}] Timeout (10s) — Reconciliation-Check (2s Extra-Puffer) ...")
+                info['status'] = 'recovery_pending'
+                await asyncio.sleep(2.0)
+                fresh_recon = await ib.reqAllOpenOrdersAsync()
+                recon_active = [
+                    t for t in (fresh_recon if fresh_recon else ib.openTrades())
+                    if t.contract.symbol == symbol
+                    and t.orderStatus.status in active_statuses
+                ]
+                if recon_active:
+                    remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
+                                     for t in recon_active]
+                    log(f"  ❌ [{symbol}] Reconciliation: {len(recon_active)} Order(s) auf IB-Server noch aktiv: "
+                        f"{remaining_ids} — Exit abgebrochen. Bitte manuell in IBKR/TWS stornieren!")
+                    info['status'] = 'open'
+                    return
+                log(f"  ✅ [{symbol}] Reconciliation: Orders serversseitig bestätigt (lokaler Cache war veraltet)")
+                cancel_confirmed = True
+
             await asyncio.sleep(1.5)    # Extra-Puffer: IB-interne Propagierung abwarten
             log(f"  ✅ [{symbol}] Alle alten Orders storniert — sende Exit-Order")
 
@@ -1488,7 +1503,7 @@ async def run_bot(stop_event: threading.Event = None):
         ib.orderStatusEvent += _on_order_status
 
         # Event-Handler: IBKR-Fehler prominent loggen (insb. Error 201)
-        def _on_ib_error(reqId, errorCode, errorString, contract):
+        def _on_ib_error(reqId, errorCode, errorString, _contract):
             if errorCode in (201, 202, 399, 10147):
                 log(f"  ⚠️  IBKR Error {errorCode} (reqId={reqId}): {errorString}")
         ib.errorEvent += _on_ib_error
@@ -1615,17 +1630,23 @@ async def run_bot(stop_event: threading.Event = None):
                     slept += chunk
                 continue
 
-            # ── Phase 1a: IB-Batch-Scan (20 Symbole gleichzeitig) ────────────
-            # Jeder Batch: subscribe → 2s warten → Preise lesen → alle canceln.
-            # Verhindert Error 101 durch kontrollierte sequenzielle Batches.
+            # ── Phase 1a: IB-Batch-Scan (8 Symbole pro Batch) ───────────────
+            # subscribe → 3s warten → Preise lesen → alle cancelMktData → nächster Batch.
+            # Kleine Batches + explizites Cleanup verhindern Error 101 (Max Tickers).
             t0 = datetime.now()
             ib_price_data: dict = {}
             if ib and ib.isConnected():
                 batches = [WATCHLIST[i:i + IB_SCAN_BATCH]
                            for i in range(0, len(WATCHLIST), IB_SCAN_BATCH)]
-                for batch in batches:
+                n_batches = len(batches)
+                for b_idx, batch in enumerate(batches, 1):
+                    log(f"   [Batch {b_idx}/{n_batches}] Scanne {len(batch)} Symbole: {', '.join(batch)}")
                     batch_result = await _batch_ib_price_scan(batch, ib)
                     ib_price_data.update(batch_result)
+                    log(f"   [Batch {b_idx}/{n_batches}] Ticker-Slots freigegeben — "
+                        f"{len(batch_result)}/{len(batch)} Preise erhalten")
+                    if b_idx < n_batches:
+                        await asyncio.sleep(0.3)   # IB-Rate-Limit: kurze Pause zwischen Batches
 
             # ── Phase 1b: yfinance-Fallback für fehlende Symbole ─────────────
             missing = [s for s in WATCHLIST if s not in ib_price_data]
@@ -1732,8 +1753,6 @@ async def run_bot(stop_event: threading.Event = None):
             # Slot-Limit begrenzt natürlich auf die besten N
             tradeable = qualified
             best_rr   = qualified[0]['risk_reward'] if qualified else None
-            best_score = qualified[0]['score'] if qualified else None
-            threshold = None
 
             all_signals.sort(key=lambda s: s['risk_reward'], reverse=True)
 
