@@ -1257,6 +1257,32 @@ async def run_bot(stop_event: threading.Event = None):
         # Demo/Live erkennen und Marktdaten-Typ + Modus-Banner konfigurieren
         await configure_environment(ib)
 
+        # ib_insync-Logger filtern: informative Codes und bekannte Nicht-Fehler unterdrücken
+        import logging as _logging
+
+        _IB_SUPPRESS_CODES = {
+            10090, 10091,           # Kein Abo — Delayed verfügbar (informativ)
+            2104, 2106, 2107,       # Market-Data-Farm OK
+            2108, 2158, 2157,       # Hist./SecDef-Farm OK
+            504,                    # Not connected (transient)
+        }
+        _IB_SUPPRESS_PHRASES = (
+            'cancelMktData: No reqId found',   # Cancel auf bereits bereinigter Subscription
+            'Es sind verzögerte Marktdaten',   # Duplicate des 10091-Textes
+        )
+
+        class _IBNoiseFilter(_logging.Filter):
+            def filter(self, record):
+                msg = record.getMessage()
+                for code in _IB_SUPPRESS_CODES:
+                    if f'Error {code}' in msg or f'error {code},' in msg.lower():
+                        return False
+                return not any(p in msg for p in _IB_SUPPRESS_PHRASES)
+
+        _ib_filter = _IBNoiseFilter()
+        for _logger_name in ('ib_insync.wrapper', 'ib_insync.client', 'ib_insync'):
+            _logging.getLogger(_logger_name).addFilter(_ib_filter)
+
         # Event-Handler: gecancelte Orders in Echtzeit tracken
         ib.orderStatusEvent += _on_order_status
 
