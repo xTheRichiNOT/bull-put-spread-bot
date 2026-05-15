@@ -250,6 +250,8 @@ _bot_trades: dict = {}
 _strike_map: dict = {}
 # Order-IDs die absichtlich storniert werden (TP/SL-Rotation → kein falsches 'cancelled')
 _expected_cancels: set = set()
+# Begrenzt gleichzeitige IB reqMktData-Aufrufe — verhindert Error 101 (Max Tickers)
+_sem_ib_mktdata: asyncio.Semaphore | None = None
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -454,9 +456,13 @@ async def get_market_data(symbol, ib=None):
     # ── IB-Pfad ───────────────────────────────────────────────────────────────
     if ib and ib.isConnected():
         try:
+            global _sem_ib_mktdata
+            if _sem_ib_mktdata is None:
+                _sem_ib_mktdata = asyncio.Semaphore(5)
             from ib_insync import Stock as _Stock
-            t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
-            await asyncio.sleep(2)
+            async with _sem_ib_mktdata:
+                t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
+                await asyncio.sleep(2)
             try:
                 ib.cancelMktData(t)
             except Exception:
@@ -632,9 +638,13 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                             ComboLeg(conId=l_con.conId, ratio=1, action='BUY',  exchange='SMART'),
                         ]
                     )
-                    t_combo = ib.reqMktData(combo_bag, '', False, False)
-                    await asyncio.sleep(5)
-                    combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
+                    global _sem_ib_mktdata
+                    if _sem_ib_mktdata is None:
+                        _sem_ib_mktdata = asyncio.Semaphore(5)
+                    async with _sem_ib_mktdata:
+                        t_combo = ib.reqMktData(combo_bag, '', False, False)
+                        await asyncio.sleep(5)
+                        combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
                     try: ib.cancelMktData(t_combo)
                     except Exception: pass
                     if combo_bid is not None and combo_bid > 0:
@@ -734,12 +744,16 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             s_contract = Option(symbol, expiry_ib, short_strike, 'P', 'SMART')
             l_contract = Option(symbol, expiry_ib, long_strike,  'P', 'SMART')
             await ib.qualifyContractsAsync(s_contract, l_contract)
-            t_s = ib.reqMktData(s_contract, '', False, False)
-            t_l = ib.reqMktData(l_contract,  '', False, False)
-            await asyncio.sleep(4)
-            s_bid = t_s.bid if (t_s.bid and t_s.bid > 0) else None
-            s_ask = t_s.ask if (t_s.ask and t_s.ask > 0) else None
-            l_bid = t_l.bid if (t_l.bid and t_l.bid > 0) else None
+            global _sem_ib_mktdata
+            if _sem_ib_mktdata is None:
+                _sem_ib_mktdata = asyncio.Semaphore(5)
+            async with _sem_ib_mktdata:
+                t_s = ib.reqMktData(s_contract, '', False, False)
+                t_l = ib.reqMktData(l_contract,  '', False, False)
+                await asyncio.sleep(4)
+                s_bid = t_s.bid if (t_s.bid and t_s.bid > 0) else None
+                s_ask = t_s.ask if (t_s.ask and t_s.ask > 0) else None
+                l_bid = t_l.bid if (t_l.bid and t_l.bid > 0) else None
             try: ib.cancelMktData(t_s)
             except Exception: pass
             try: ib.cancelMktData(t_l)
@@ -937,11 +951,15 @@ async def place_order(ib, sig):
 
         # Echtes IBKR-Netto-Bid berechnen: Short-Bid minus Long-Ask der einzelnen Legs
         # (reqMktData auf Bag erfordert Combo-Abo — Legs sind mit Standard-Options-Abo verfügbar)
-        t_short = ib.reqMktData(short_contract, '', False, False)
-        t_long  = ib.reqMktData(long_contract,  '', False, False)
-        await asyncio.sleep(5)
-        short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
-        long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
+        global _sem_ib_mktdata
+        if _sem_ib_mktdata is None:
+            _sem_ib_mktdata = asyncio.Semaphore(5)
+        async with _sem_ib_mktdata:
+            t_short = ib.reqMktData(short_contract, '', False, False)
+            t_long  = ib.reqMktData(long_contract,  '', False, False)
+            await asyncio.sleep(5)
+            short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
+            long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
         try:
             ib.cancelMktData(t_short)
         except Exception:
