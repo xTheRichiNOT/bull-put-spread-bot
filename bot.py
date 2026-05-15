@@ -378,20 +378,22 @@ def _on_order_status(trade):
             _expected_cancels.discard(order_id)
             return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
         _bot_trades[sym]['status'] = 'cancelled'
-        log(f"  ⚠️  [{sym}] Order gecancelt — Symbol für diese Session gesperrt")
+        log(f"  🚫 [{sym}] Order #{order_id} abgelehnt/gecancelt — Symbol für diese Session gesperrt")
         _save_state()
     elif status == 'Filled':
         if _bot_trades[sym].get('status') == 'closing':
             exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
             _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
-            log(f"  ✅ [{sym}] Exit-Order gefüllt — Position geschlossen")
+            log(f"  💰 [{sym}] EXIT AUSGEFÜHRT @ ${exit_fill:.2f}/Share — Position geschlossen!")
         else:
             _bot_trades[sym]['status'] = 'open'
             fill = trade.orderStatus.avgFillPrice
             if fill and fill > 0:
                 _bot_trades[sym]['entry_per_share'] = abs(fill)
-                log(f"  📋 [{sym}] Entry-Fill: ${abs(fill):.2f}/Share")
+                log(f"  💰 [{sym}] TRADE AUSGEFÜHRT @ ${abs(fill):.2f}/Share — Viel Erfolg!")
+            else:
+                log(f"  ✅ [{sym}] Entry-Order bestätigt (Fill-Preis folgt)")
         _save_state()
 
 def _bs_put(S, K, T, sigma, r=0.045):
@@ -406,6 +408,40 @@ def _bs_put(S, K, T, sigma, r=0.045):
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return K * math.exp(-r * T) * ncdf(-d2) - S * ncdf(-d1)
+
+def _yf_net_credit(puts, short_strike, long_strike, short_bid_yf, demo_mode: bool):
+    """Berechnet den Netto-Credit aus yfinance-Daten.
+    Demo-Modus:  Mid-Point pro Leg: (Short-Bid+Ask)/2 − (Long-Bid+Ask)/2
+    Live-Modus:  Konservativ: Short-Bid − Long-Ask
+    Gibt (praemie, quelle) zurück oder None wenn Daten fehlen."""
+    import math as _m
+    def _safe(v):
+        try:
+            f = float(v)
+            return f if f > 0 and not _m.isnan(f) else None
+        except Exception:
+            return None
+    try:
+        sr = puts[puts['strike'] == short_strike]
+        lr = puts[puts['strike'] == long_strike]
+        if sr.empty or lr.empty:
+            return None
+        s_bid = _safe(sr.iloc[0]['bid'])
+        s_ask = _safe(sr.iloc[0]['ask'])
+        l_bid = _safe(lr.iloc[0]['bid'])
+        l_ask = _safe(lr.iloc[0]['ask'])
+        if demo_mode and s_bid and s_ask:
+            s_mid = (s_bid + s_ask) / 2
+            l_mid = ((l_bid + l_ask) / 2) if l_bid and l_ask else (l_ask or 0)
+            net = round(s_mid - l_mid, 2)
+            if net > 0:
+                return net, "yfinance (Mid-Point)"
+        elif s_bid and l_ask:
+            net = round(max(s_bid - l_ask, 0.01), 2)
+            return net, "yfinance (Net Bid-Ask)"
+    except Exception:
+        pass
+    return None
 
 def _bs_prob_otm(S, K, T, sigma, r=0.045):
     """Wahrscheinlichkeit, dass Put OTM verfällt = N(d2) = Gewinnwahrscheinlichkeit für Short Put."""
@@ -736,29 +772,30 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                         praemie = combo_bid
                         praemie_quelle = "IB (Combo)"
                     else:
-                        # Combo-Bid ≤ 0 → Debit-Spread oder kein Markt → BS-Schätzung markieren
-                        praemie_quelle = "Black-Scholes (geschätzt)"
+                        # IB Combo Bid ≤ 0: Im Demo-Konto liefern verzögerte Daten oft 0.
+                        # Fallback: yfinance Mid-Point (Demo) oder Net Bid-Ask (Live).
+                        _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
+                        if _r:
+                            praemie, praemie_quelle = _r
+                        else:
+                            praemie_quelle = "Black-Scholes (geschätzt)"
                 else:
-                    # Strike existiert nicht bei IB → wird durch BS-Filter blockiert
-                    praemie_quelle = "Black-Scholes (geschätzt)"
+                    # Strike existiert nicht bei IB → yfinance-Fallback
+                    _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
+                    if _r:
+                        praemie, praemie_quelle = _r
+                    else:
+                        praemie_quelle = "Black-Scholes (geschätzt)"
             except Exception:
-                # IB-Fehler → yfinance Net Bid-Ask als Fallback
-                if praemie_quelle == "yfinance (Bid)":
-                    long_rows = puts[puts['strike'] == long_strike]
-                    if not long_rows.empty:
-                        long_ask_yf = float(long_rows.iloc[0]['ask'])
-                        if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
-                            praemie = max(bid - long_ask_yf, 0.01)
-                            praemie_quelle = "yfinance (Net Bid-Ask)"
+                # IB-Fehler → yfinance Net-Credit als Fallback
+                _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
+                if _r:
+                    praemie, praemie_quelle = _r
         else:
-            # Kein IB → yfinance Net Bid-Ask
-            if praemie_quelle == "yfinance (Bid)":
-                long_rows = puts[puts['strike'] == long_strike]
-                if not long_rows.empty:
-                    long_ask_yf = float(long_rows.iloc[0]['ask'])
-                    if long_ask_yf > 0 and long_ask_yf == long_ask_yf:
-                        praemie = max(bid - long_ask_yf, 0.01)
-                        praemie_quelle = "yfinance (Net Bid-Ask)"
+            # Kein IB → yfinance Net-Credit
+            _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
+            if _r:
+                praemie, praemie_quelle = _r
 
         credit    = praemie * 100
         max_risk  = (breite - praemie) * 100
@@ -910,22 +947,37 @@ async def close_spread(ib, symbol, info, reason):
                 cancelled_ids.add(oid)
                 log(f"  🗑  [{symbol}] Order #{oid} storniert (Sweep)")
 
-            if cancelled_ids:
-                await asyncio.sleep(1.0)
+            # Polling-Loop: warten bis IB Cancelled-Status bestätigt (max 5 Sekunden)
+            # Erst wenn alle bekannten aktiven Orders weg sind, darf die Exit-Order folgen.
+            cancel_confirmed = False
+            for _attempt in range(10):          # 10 × 0.5s = 5s Timeout
+                await asyncio.sleep(0.5)
+                await ib.reqAllOpenOrdersAsync()
+                still_active = [
+                    t for t in ib.trades()
+                    if t.contract.symbol == symbol
+                    and t.orderStatus.status in active_statuses
+                    and (t.order.orderId or 0) > 0
+                ]
+                if not still_active:
+                    cancel_confirmed = True
+                    break
+                # Erneut stornieren falls noch offen (IB ignoriert gelegentlich den ersten Cancel)
+                for t in still_active:
+                    oid = t.order.orderId
+                    if oid not in cancelled_ids:
+                        _expected_cancels.add(oid)
+                        ib.client.cancelOrder(oid, '')
+                        cancelled_ids.add(oid)
 
-            # Sicherheits-Check: aktive Orders mit bekannter orderId
-            remaining = [
-                t for t in ib.trades()
-                if t.contract.symbol == symbol
-                and t.orderStatus.status in active_statuses
-                and (t.order.orderId or 0) > 0
-            ]
-            if remaining:
-                ids = [t.order.orderId for t in remaining]
-                log(f"  ❌ [{symbol}] Exit abgebrochen — {len(remaining)} Order(s) noch aktiv "
-                    f"nach Stornierung: {ids}. Bitte manuell in IBKR/TWS stornieren!")
+            if not cancel_confirmed:
+                remaining_ids = [t.order.orderId for t in still_active]
+                log(f"  ❌ [{symbol}] Fehler: Alte Orders konnten nicht gelöscht werden. "
+                    f"Exit abgebrochen. Noch aktiv: {remaining_ids} — "
+                    f"Bitte manuell in IBKR/TWS stornieren!")
                 info['status'] = 'open'
                 return
+            log(f"  ✅ [{symbol}] Alle alten Orders storniert — sende Exit-Order")
 
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
@@ -1262,7 +1314,8 @@ async def place_order(ib, sig):
         _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
         _save_state()
 
-        log(f"  ✅ [{sym}] Bracket-Order platziert (alle GTC)!")
+        log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
+        log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC)")
         log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit:.0f})  R/R: {market_rr:.2f}x")
         log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100:.0f})")
         log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100:.0f})")
