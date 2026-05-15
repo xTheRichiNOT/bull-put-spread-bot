@@ -125,7 +125,9 @@ MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
-MIN_CREDIT       = int(_cfg['min_credit'])
+MIN_CREDIT            = int(_cfg['min_credit'])        # $70 Standard
+MIN_CREDIT_REDUCED    = 50                             # $50 erlaubt wenn P(Win) ≥ 80 %
+MIN_PROB_REDUCED_CREDIT = 0.80                         # Mindest-P(Win) für reduzierten Credit
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
@@ -1072,8 +1074,15 @@ async def place_order(ib, sig):
             log(f"  ✗ [{sym}] R/R {market_rr:.2f}x < {rr_minimum:.2f}x ({quelle}) — Trade abgebrochen")
             _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
             return
-        if market_credit < MIN_CREDIT:
-            log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < ${MIN_CREDIT} (Markt ${ibkr_net:.2f}) — Trade abgebrochen")
+        sig_prob = sig.get('prob_otm', 0)
+        credit_ok = (market_credit >= MIN_CREDIT
+                     or (market_credit >= MIN_CREDIT_REDUCED
+                         and sig_prob >= MIN_PROB_REDUCED_CREDIT))
+        if not credit_ok:
+            if market_credit >= MIN_CREDIT_REDUCED:
+                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} ≥ ${MIN_CREDIT_REDUCED} aber P(Win) {sig_prob:.1%} < {MIN_PROB_REDUCED_CREDIT:.0%} — Trade abgebrochen")
+            else:
+                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < ${MIN_CREDIT_REDUCED} — Trade abgebrochen")
             _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
             return
 
@@ -1384,7 +1393,9 @@ async def run_bot(stop_event: threading.Event = None):
             qualified = [
                 s for s in all_signals
                 if s['praemie_quelle'] != "Black-Scholes (geschätzt)"
-                and s['credit']                 >= MIN_CREDIT
+                and (s['credit'] >= MIN_CREDIT
+                     or (s['credit'] >= MIN_CREDIT_REDUCED
+                         and s.get('prob_otm', 0) >= MIN_PROB_REDUCED_CREDIT))
                 and s['risk_reward']            >= MIN_RISK_REWARD
                 and MIN_PROBABILITY             <= s['prob_otm'] <= MAX_PROBABILITY
                 and s.get('prob_max_loss', 1.0) <= MAX_LOSS_PROB
@@ -1460,8 +1471,14 @@ async def run_bot(stop_event: threading.Event = None):
                     reasons = []
                     if s['praemie_quelle'] == "Black-Scholes (geschätzt)":
                         reasons.append("kein echtes Bid (BS-Schätzung)")
-                    if s['credit'] < MIN_CREDIT:
-                        reasons.append(f"Credit ${s['credit']:.0f} < ${MIN_CREDIT}")
+                    _c, _p = s['credit'], s.get('prob_otm', 0)
+                    _credit_ok = (_c >= MIN_CREDIT
+                                  or (_c >= MIN_CREDIT_REDUCED and _p >= MIN_PROB_REDUCED_CREDIT))
+                    if not _credit_ok:
+                        if _c >= MIN_CREDIT_REDUCED:
+                            reasons.append(f"Credit ${_c:.0f} ≥ ${MIN_CREDIT_REDUCED} aber P(Win) {_p:.1%} < {MIN_PROB_REDUCED_CREDIT:.0%}")
+                        else:
+                            reasons.append(f"Credit ${_c:.0f} < ${MIN_CREDIT_REDUCED}")
                     if s['risk_reward'] < MIN_RISK_REWARD:
                         reasons.append(f"R/R {s['risk_reward']:.2f}x < {MIN_RISK_REWARD:.2f}x")
                     if s.get('prob_otm', 0) < MIN_PROBABILITY:
