@@ -125,9 +125,8 @@ MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
-MIN_CREDIT            = int(_cfg['min_credit'])        # $70 Standard
-MIN_CREDIT_REDUCED    = 50                             # $50 erlaubt wenn P(Win) ≥ 80 %
-MIN_PROB_REDUCED_CREDIT = 0.80                         # Mindest-P(Win) für reduzierten Credit
+MIN_CREDIT_PERCENT = 0.12   # 12 % der Spread-Breite als Mindest-Credit
+MIN_CREDIT_ABS     = 45    # Absolutes Minimum unabhängig von der Breite ($)
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
@@ -415,6 +414,34 @@ def _bs_prob_otm(S, K, T, sigma, r=0.045):
     p = 0.3989423 * math.exp(-d2 * d2 / 2) * t * (
         0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))))
     return (1 - p) if d2 > 0 else p
+
+
+def _check_credit(credit: float, breite: float, prob_otm: float):
+    """Dynamischer Credit-Check: Mindestprämie = MAX(12% der Spread-Breite, $45).
+    P(Win)-Anforderung steigt wenn die Prämie niedrig relativ zur Breite ist.
+
+    Returns (passes: bool, required_credit: float, min_pwin: float)
+    """
+    spread_risk = breite * 100
+    required    = max(spread_risk * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
+
+    if credit < required:
+        return False, required, None
+
+    # Credit-Ratio bestimmt die P(Win)-Anforderung
+    ratio = credit / spread_risk
+    if ratio < 0.15:
+        min_pwin = 0.78   # Niedrige Prämie → höhere Sicherheit gefordert
+    elif ratio > 0.20:
+        min_pwin = 0.70   # Hohe Prämie → P(Win)-Hürde etwas niedriger
+    else:
+        min_pwin = MIN_PROBABILITY  # 15–20 %: Standard 72 %
+
+    if prob_otm < min_pwin:
+        return False, required, min_pwin
+
+    return True, required, min_pwin
+
 
 async def build_strike_map(ib):
     """Lädt IB-verfügbare Strikes und Expiries für alle Watchlist-Symbole.
@@ -1075,14 +1102,13 @@ async def place_order(ib, sig):
             _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
             return
         sig_prob = sig.get('prob_otm', 0)
-        credit_ok = (market_credit >= MIN_CREDIT
-                     or (market_credit >= MIN_CREDIT_REDUCED
-                         and sig_prob >= MIN_PROB_REDUCED_CREDIT))
+        credit_ok, req_credit, req_pwin = _check_credit(market_credit, sig['breite'], sig_prob)
         if not credit_ok:
-            if market_credit >= MIN_CREDIT_REDUCED:
-                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} ≥ ${MIN_CREDIT_REDUCED} aber P(Win) {sig_prob:.1%} < {MIN_PROB_REDUCED_CREDIT:.0%} — Trade abgebrochen")
+            spread_risk = sig['breite'] * 100
+            if market_credit >= req_credit:
+                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} OK aber P(Win) {sig_prob:.1%} < {req_pwin:.0%} — Trade abgebrochen")
             else:
-                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < ${MIN_CREDIT_REDUCED} — Trade abgebrochen")
+                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < erforderlich ${req_credit:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${spread_risk:.0f} Risiko) — Trade abgebrochen")
             _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
             return
 
@@ -1393,11 +1419,9 @@ async def run_bot(stop_event: threading.Event = None):
             qualified = [
                 s for s in all_signals
                 if s['praemie_quelle'] != "Black-Scholes (geschätzt)"
-                and (s['credit'] >= MIN_CREDIT
-                     or (s['credit'] >= MIN_CREDIT_REDUCED
-                         and s.get('prob_otm', 0) >= MIN_PROB_REDUCED_CREDIT))
+                and _check_credit(s['credit'], s['breite'], s.get('prob_otm', 0))[0]
                 and s['risk_reward']            >= MIN_RISK_REWARD
-                and MIN_PROBABILITY             <= s['prob_otm'] <= MAX_PROBABILITY
+                and s['prob_otm']               <= MAX_PROBABILITY
                 and s.get('prob_max_loss', 1.0) <= MAX_LOSS_PROB
                 and s.get('ev_ratio', 0)        >= MIN_EV_RATIO
             ]
@@ -1471,18 +1495,16 @@ async def run_bot(stop_event: threading.Event = None):
                     reasons = []
                     if s['praemie_quelle'] == "Black-Scholes (geschätzt)":
                         reasons.append("kein echtes Bid (BS-Schätzung)")
-                    _c, _p = s['credit'], s.get('prob_otm', 0)
-                    _credit_ok = (_c >= MIN_CREDIT
-                                  or (_c >= MIN_CREDIT_REDUCED and _p >= MIN_PROB_REDUCED_CREDIT))
+                    _c, _p, _b = s['credit'], s.get('prob_otm', 0), s['breite']
+                    _credit_ok, _req, _req_pwin = _check_credit(_c, _b, _p)
                     if not _credit_ok:
-                        if _c >= MIN_CREDIT_REDUCED:
-                            reasons.append(f"Credit ${_c:.0f} ≥ ${MIN_CREDIT_REDUCED} aber P(Win) {_p:.1%} < {MIN_PROB_REDUCED_CREDIT:.0%}")
+                        _risk = _b * 100
+                        if _c >= _req:
+                            reasons.append(f"Credit ${_c:.0f} OK aber P(Win) {_p:.1%} < {_req_pwin:.0%}")
                         else:
-                            reasons.append(f"Credit ${_c:.0f} < ${MIN_CREDIT_REDUCED}")
+                            reasons.append(f"Credit ${_c:.0f} < erforderlich ${_req:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${_risk:.0f} Risiko)")
                     if s['risk_reward'] < MIN_RISK_REWARD:
                         reasons.append(f"R/R {s['risk_reward']:.2f}x < {MIN_RISK_REWARD:.2f}x")
-                    if s.get('prob_otm', 0) < MIN_PROBABILITY:
-                        reasons.append(f"P(Win) {s.get('prob_otm',0):.1%} < {MIN_PROBABILITY:.0%}")
                     if s.get('prob_otm', 0) > MAX_PROBABILITY:
                         reasons.append(f"P(Win) {s.get('prob_otm',0):.1%} > {MAX_PROBABILITY:.0%} (Prämie zu klein)")
                     if s.get('prob_max_loss', 1.0) > MAX_LOSS_PROB:
@@ -1501,7 +1523,7 @@ async def run_bot(stop_event: threading.Event = None):
             elif slots <= 0:
                 log(f"  ⏸️  Bot-Limit erreicht ({open_count}/{MAX_POSITIONS} Orders diese Session) — kein neuer Trade")
             elif not tradeable:
-                log(f"  ⏸️  Kein Signal über Mindest-R/R {MIN_RISK_REWARD:.2f}x oder Credit ${MIN_CREDIT}")
+                log(f"  ⏸️  Kein Signal über Mindest-R/R {MIN_RISK_REWARD:.2f}x oder dynamischen Credit (≥{MIN_CREDIT_PERCENT:.0%} der Spread-Breite, mind. ${MIN_CREDIT_ABS})")
 
             # ── Phase 4: Orders platzieren ────────────────────────────────────
             for sig in selected:
