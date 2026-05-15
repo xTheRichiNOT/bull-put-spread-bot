@@ -676,9 +676,14 @@ async def fetch_signal(symbol, preis, iv, ib=None):
         if symbol in _strike_map and _strike_map[symbol]['strikes']:
             ib_strikes = _strike_map[symbol]['strikes']
             # Short Strike: nächster IB-Strike unter Kurs, nahe am Ziel
+            # Double-snap: erst nächster Map-Strike, dann auf Standard-Inkrement runden,
+            # dann nochmals nächster Map-Strike — verhindert Error 200 bei Quartals-Expiries
+            # (reqSecDefOptParamsAsync enthält Strikes aus ALLEN Expiries, nicht nur der gewählten)
             valid_short = [s for s in ib_strikes if s < preis]
             if valid_short:
-                short_strike = min(valid_short, key=lambda s: abs(s - short_strike))
+                snapped_short  = min(valid_short, key=lambda s: abs(s - short_strike))
+                rounded_short  = _round_to_standard_strike(snapped_short, preis)
+                short_strike   = min(valid_short, key=lambda s: abs(s - rounded_short))
             # Long Strike: nächster IB-Strike unter short_strike
             valid_long = [s for s in ib_strikes if s < short_strike]
             if valid_long:
@@ -686,7 +691,9 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                 spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
                 breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
                 long_target = short_strike - breite_ziel
-                long_strike = min(valid_long, key=lambda s: abs(s - long_target))
+                snapped_long  = min(valid_long, key=lambda s: abs(s - long_target))
+                rounded_long  = _round_to_standard_strike(snapped_long, preis)
+                long_strike   = min(valid_long, key=lambda s: abs(s - rounded_long))
             else:
                 long_strike = short_strike - SPREAD_MIN
         else:
@@ -867,10 +874,21 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
 async def close_spread(ib, symbol, info, reason):
     """Storniert bestehende Bracket-Orders und platziert einen manuellen Exit (DTE-Exit)."""
     try:
-        # Bestehende Bracket TP/SL stornieren damit keine doppelten Exit-Orders entstehen
+        # Alle offenen Orders für dieses Symbol abräumen bevor neue Exit-Order gesendet wird
+        # (verhindert Error 201 — entgegengesetzte Orders auf selben Contract verboten)
         if ib is not None:
-            _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
-            _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
+            log(f"  🧹 [{symbol}] Bereinige offene Orders vor Exit ...")
+            await ib.reqAllOpenOrdersAsync()
+            await asyncio.sleep(0.5)
+            cancelled_count = 0
+            for t in ib.openTrades():
+                if t.contract.symbol == symbol:
+                    _expected_cancels.add(t.order.orderId)
+                    ib.cancelOrder(t.order)
+                    cancelled_count += 1
+                    log(f"  🗑  [{symbol}] Order #{t.order.orderId} storniert (vor Exit)")
+            if cancelled_count > 0:
+                await asyncio.sleep(1.5)  # warten bis IB Stornierung bestätigt
 
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
