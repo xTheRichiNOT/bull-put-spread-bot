@@ -348,6 +348,7 @@ _vix_regime: str   = 'unknown'
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
 _POSITIONS_FILE = os.path.join(_BASE, 'positions.json')
+_SHADOW_FILE    = os.path.join(_BASE, 'shadow_trades.jsonl')
 
 def _write_positions_file():
     """Schreibt offene Positionen für den Launcher (Live-Anzeige im Historie-Tab)."""
@@ -381,6 +382,61 @@ def _write_positions_file():
             }, f, indent=2)
     except Exception:
         pass
+
+def _log_shadow(entry: dict) -> None:
+    """Hängt einen Shadow-Trade-Eintrag an shadow_trades.jsonl an (eine JSON-Zeile pro Eintrag)."""
+    try:
+        entry.setdefault('ts', datetime.now().isoformat(timespec='seconds'))
+        with open(_SHADOW_FILE, 'a', encoding='utf-8') as _sf:
+            _sf.write(_json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def _shadow_from_sig(sig: dict, type_: str, stage: str, reason: str) -> None:
+    """Logt einen vollständigen Signal-Dict als Shadow-Eintrag."""
+    _log_shadow({
+        'type':          type_,      # 'rejected' | 'blocked' | 'taken'
+        'stage':         stage,      # 'score' | 'credit' | 'sector' | 'event_lock' | 'vix' | ...
+        'reason':        reason,
+        'symbol':        sig.get('symbol'),
+        'preis':         sig.get('preis'),
+        'iv':            round(sig.get('iv', 0), 4),
+        'short_strike':  sig.get('short_strike'),
+        'long_strike':   sig.get('long_strike'),
+        'expiry':        sig.get('expiry_ib', '')[:8],
+        'credit':        round(sig.get('credit', 0), 2),
+        'risk_reward':   round(sig.get('risk_reward', 0), 3),
+        'prob_otm':      round(sig.get('prob_otm', 0), 4),
+        'prob_max_loss': round(sig.get('prob_max_loss', 0), 4),
+        'ev':            round(sig.get('ev', 0), 2),
+        'ev_raw':        round(sig.get('ev_raw', sig.get('ev', 0)), 2),
+        'slippage':      sig.get('slippage_factor', 1.0),
+        'score':         round(sig.get('score', 0), 4),
+        'decision':      sig.get('decision'),
+        'edge':          round(sig.get('edge', 0), 4),
+        'risk':          round(sig.get('risk', 0), 4),
+        'quality':       round(sig.get('quality', 0), 4),
+        'vix':           round(_vix_level, 1),
+        'vix_regime':    _vix_regime,
+    })
+
+
+def _shadow_partial(symbol: str, preis: float, iv: float,
+                    stage: str, reason: str, **kwargs) -> None:
+    """Logt einen partiellen Shadow-Eintrag (wenn Signal noch nicht vollständig berechnet ist)."""
+    _log_shadow({
+        'type':      'rejected',
+        'stage':     stage,
+        'reason':    reason,
+        'symbol':    symbol,
+        'preis':     preis,
+        'iv':        round(iv, 4),
+        'vix':       round(_vix_level, 1),
+        'vix_regime': _vix_regime,
+        **kwargs,
+    })
+
 
 def _append_history(symbol: str, info: dict, exit_per_share: float = 0.0):
     """Hängt einen abgeschlossenen Trade an trade_history.json an."""
@@ -980,6 +1036,7 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         conflict, conflict_reason = await check_earnings_conflict(symbol, expiry_yf)
         if conflict:
             log(f"   [{symbol}] 🚫 Earnings-Konflikt: {conflict_reason} — überspringe")
+            _shadow_partial(symbol, preis, iv, 'earnings', conflict_reason, expiry=expiry_yf)
             return None
 
         # Short Strike: nächster echter Strike ~OTM unter Kurs
@@ -997,15 +1054,22 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         _sa  = float(short_row.get('ask', 0) or 0)
         if _oi < MIN_OPEN_INTEREST:
             log(f"   [{symbol}] ✗ OI={_oi:.0f} < {MIN_OPEN_INTEREST} — zu illiquide")
+            _shadow_partial(symbol, preis, iv, 'liquidity', f"OI={_oi:.0f} < {MIN_OPEN_INTEREST}",
+                            short_strike=float(short_row['strike']))
             return None
         if _vol < MIN_OPTION_VOLUME:
             log(f"   [{symbol}] ✗ Volume={_vol:.0f} < {MIN_OPTION_VOLUME} — zu wenig Umsatz")
+            _shadow_partial(symbol, preis, iv, 'liquidity', f"Volume={_vol:.0f} < {MIN_OPTION_VOLUME}",
+                            short_strike=float(short_row['strike']))
             return None
         if _sb > 0 and _sa > 0:
             _mid_yf = (_sb + _sa) / 2
             _ba_pct = (_sa - _sb) / _mid_yf
             if _ba_pct > MAX_BID_ASK_SPREAD:
                 log(f"   [{symbol}] ✗ Bid/Ask-Spread {_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%} — zu illiquide")
+                _shadow_partial(symbol, preis, iv, 'liquidity',
+                                f"BidAskSpread={_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%}",
+                                short_strike=float(short_row['strike']))
                 return None
 
         # Prämie: Short-Bid für Spread-Breiten-Berechnung
@@ -1861,9 +1925,59 @@ async def configure_environment(ib) -> bool:
     return IS_DEMO_MODE
 
 
+def _print_shadow_summary(days: int = 30) -> None:
+    """Gibt eine kurze Auswertung der Shadow-Trades der letzten `days` Tage aus."""
+    if not os.path.exists(_SHADOW_FILE):
+        return
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows: list[dict] = []
+        with open(_SHADOW_FILE, encoding='utf-8') as sf:
+            for line in sf:
+                try:
+                    r = _json.loads(line)
+                    if r.get('ts', '') >= cutoff:
+                        rows.append(r)
+                except Exception:
+                    continue
+        if not rows:
+            return
+
+        taken    = [r for r in rows if r.get('type') == 'taken']
+        rejected = [r for r in rows if r.get('type') == 'rejected']
+        blocked  = [r for r in rows if r.get('type') == 'blocked']
+
+        log(f"\n{'─'*60}")
+        log(f"  📊 SHADOW ANALYTICS — letzte {days} Tage ({len(rows)} Einträge)")
+        log(f"  Taken: {len(taken)}  |  Rejected: {len(rejected)}  |  Blocked: {len(blocked)}")
+
+        # Rejection-Gründe zusammenfassen
+        from collections import Counter
+        stages = Counter(r.get('stage') for r in rejected + blocked)
+        for stage, cnt in stages.most_common():
+            log(f"     {stage:<20} {cnt:>4}×")
+
+        # Häufigste blockierte Symbole
+        sym_blocked = Counter(r.get('symbol') for r in rejected + blocked)
+        top5 = sym_blocked.most_common(5)
+        if top5:
+            log(f"  Top-5 geblockte Symbole: {', '.join(f'{s}({n})' for s, n in top5)}")
+
+        # Avg Score der WATCH-Kandidaten
+        watch = [r for r in rejected if r.get('decision') == 'WATCH']
+        if watch:
+            avg_score = sum(r.get('score', 0) for r in watch) / len(watch)
+            avg_ev    = sum(r.get('ev', 0) for r in watch) / len(watch)
+            log(f"  WATCH-Kandidaten: {len(watch)} | ⌀Score {avg_score:.3f} | ⌀EV ${avg_ev:+.0f}")
+        log(f"{'─'*60}\n")
+    except Exception as e:
+        log(f"  ⚠️  Shadow-Analytics fehlgeschlagen: {e}")
+
+
 async def run_bot(stop_event: threading.Event = None):
     ib = IB()
     log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7497)})")
+    _print_shadow_summary(days=30)
 
     try:
         client_id = random.randint(10, 999)
@@ -2229,13 +2343,17 @@ async def run_bot(stop_event: threading.Event = None):
                         break
                     if already_traded(sig['symbol']):
                         log(f"  ⏸️  [{sig['symbol']}] Bereits in dieser Session gehandelt — übersprungen")
+                        _shadow_from_sig(sig, 'blocked', 'already_traded', 'bereits diese Session gehandelt')
                         continue
                     if await has_open_position(ib, sig['symbol']):
                         log(f"  ⏸️  [{sig['symbol']}] Position im Portfolio — übersprungen")
+                        _shadow_from_sig(sig, 'blocked', 'open_position', 'Position bereits im Portfolio')
                         continue
                     sector = SECTOR_MAP.get(sig['symbol'], 'Unbekannt')
                     if sector_counts.get(sector, 0) >= MAX_PER_SECTOR:
                         log(f"  ⏸️  [{sig['symbol']}] Sektor-Limit: {sector} bereits {sector_counts[sector]}/{MAX_PER_SECTOR} — übersprungen")
+                        _shadow_from_sig(sig, 'blocked', 'sector_limit',
+                                         f"Sektor {sector}: {sector_counts[sector]}/{MAX_PER_SECTOR}")
                         # IV-Memory löschen: nächsten Zyklus neu bewerten wenn Slot frei wird
                         _iv_memory.pop(sig['symbol'], None)
                         continue
@@ -2266,6 +2384,8 @@ async def run_bot(stop_event: threading.Event = None):
                             f" | Edge={edge:.3f} Risk={risk:.3f} Quality={quality:.3f}"
                         )
                     log(f"  ✗ [{s['symbol']}] blockiert: {', '.join(reasons) or 'unbekannt'}")
+                    _stage = 'credit' if not s.get('credit_ok_hard', True) else 'score'
+                    _shadow_from_sig(s, 'rejected', _stage, ' | '.join(reasons) or 'unbekannt')
             else:
                 log("\n  Keine Signale in diesem Zyklus.")
 
@@ -2284,16 +2404,21 @@ async def run_bot(stop_event: threading.Event = None):
             _cur_regime, _cur_factor = vix_regime(_vix_level)
             if _cur_factor <= 0 and selected:
                 log(f"  🚨 VIX {_vix_level:.1f} [CRISIS] — {len(selected)} Trade(s) blockiert")
+                for _s in selected:
+                    _shadow_from_sig(_s, 'blocked', 'vix_crisis', f"VIX {_vix_level:.1f} > {VIX_CRISIS_THRESHOLD}")
                 selected = []
             # Event-Lock: keine neuen Trades vor Makro-Ereignis
             if _ev_locked and selected:
                 log(f"  🔒 EVENT-LOCK ({_ev_reason}) — {len(selected)} Trade(s) blockiert")
+                for _s in selected:
+                    _shadow_from_sig(_s, 'blocked', 'event_lock', _ev_reason)
                 selected = []
 
             for sig in selected:
                 log(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}"
                     f" | EV adj. ${sig['ev']:+.0f} (raw ${sig.get('ev_raw', sig['ev']):+.0f})"
                     f" | Slip {sig.get('slippage_factor', 1.0):.0%}")
+                _shadow_from_sig(sig, 'taken', 'entry', 'Trade platziert')
                 await place_order(ib, sig)
 
             # Positionen für Launcher-Anzeige schreiben
