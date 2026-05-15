@@ -254,6 +254,14 @@ _strike_map: dict = {}
 _expected_cancels: set = set()
 # Begrenzt gleichzeitige IB reqMktData-Aufrufe — verhindert Error 101 (Max Tickers)
 _sem_ib_mktdata: asyncio.Semaphore | None = None
+# Mutex pro Symbol — serialisiert Entry/Exit/Breakeven/Cancel auf demselben Contract
+# (verhindert Error 201: gleichzeitige gegensätzliche Orders auf denselben Legs)
+_contract_locks: dict[str, asyncio.Lock] = {}
+
+def _sym_lock(symbol: str) -> asyncio.Lock:
+    """Gibt einen asyncio.Lock pro Symbol zurück — immer nur EIN Order-Vorgang gleichzeitig."""
+    return _contract_locks.setdefault(symbol, asyncio.Lock())
+
 # Demo/Live-Modus — wird beim Start via Kontonummer gesetzt
 IS_DEMO_MODE: bool = False
 ACCOUNT_ID:   str  = ''
@@ -1030,7 +1038,8 @@ async def monitor_exits(ib=None):
                 if puffer < BUFFER_MIN_PCT:
                     log(f"  ⏰ [{symbol}] 21-DTE-Exit: Kurs ${preis:.2f} nur {puffer:.1%} über Short Strike "
                         f"${info['short_strike']:.0f} — soft close")
-                    await close_spread(ib, symbol, info, 'DTE_EXIT')
+                    async with _sym_lock(symbol):
+                        await close_spread(ib, symbol, info, 'DTE_EXIT')
                     continue
                 else:
                     log(f"  ✅ [{symbol}] 21-DTE erreicht — Puffer {puffer:.1%} > {BUFFER_MIN_PCT:.0%} "
@@ -1057,34 +1066,38 @@ async def monitor_exits(ib=None):
         # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put
         # tritt nur auf wenn neues Bag mit umgekehrten Legs platziert wird)
         if pnl_share >= entry * BREAKEVEN_TRIGGER_PCT and not info.get('at_breakeven'):
-            info['at_breakeven'] = True
-            be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
-            sl_order_id = info.get('sl_order_id', 0)
-            sl_modified = False
+            async with _sym_lock(symbol):
+                if info.get('at_breakeven'):     # double-check nach Lock-Erwerb
+                    pass
+                else:
+                    info['at_breakeven'] = True
+                    be_close = round(entry * 1.02, 2)  # entry + 2% Puffer für Slippage
+                    sl_order_id = info.get('sl_order_id', 0)
+                    sl_modified = False
 
-            # Primär: bestehende SL-Order auf Breakeven-Preis modifizieren (kein Cancel nötig)
-            if sl_order_id and ib is not None:
-                await ib.reqAllOpenOrdersAsync()
-                await asyncio.sleep(0.5)
-                for t in ib.openTrades():
-                    if t.order.orderId == sl_order_id:
-                        t.order.lmtPrice = be_close
-                        ib.placeOrder(t.contract, t.order)
-                        sl_modified = True
-                        log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC "
-                            f"(Modify #{sl_order_id}) | P&L: +${pnl_dollar:.0f}")
-                        break
+                    # Primär: bestehende SL-Order auf Breakeven-Preis modifizieren (kein Cancel nötig)
+                    if sl_order_id and ib is not None:
+                        await ib.reqAllOpenOrdersAsync()
+                        await asyncio.sleep(0.5)
+                        for t in ib.openTrades():
+                            if t.order.orderId == sl_order_id:
+                                t.order.lmtPrice = be_close
+                                ib.placeOrder(t.contract, t.order)
+                                sl_modified = True
+                                log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC "
+                                    f"(Modify #{sl_order_id}) | P&L: +${pnl_dollar:.0f}")
+                                break
 
-            if not sl_modified:
-                # SL bereits weg → neue Closing-Bag-Order würde Error 201 riskieren
-                # (TP-Leg BUY long_put ↔ neues SELL long_put = gegenläufig auf selben Contract)
-                # Sicher: TP und SL stornieren, Position läuft bis Verfall oder 21-DTE-Exit
-                _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
-                _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
-                log(f"  🔒 [{symbol}] Breakeven: TP/SL storniert — "
-                    f"keine neue Order (läuft bis Verfall/DTE-Exit) | P&L: +${pnl_dollar:.0f}")
+                    if not sl_modified:
+                        # SL bereits weg → neue Closing-Bag-Order würde Error 201 riskieren
+                        # (TP-Leg BUY long_put ↔ neues SELL long_put = gegenläufig auf selben Contract)
+                        # Sicher: TP und SL stornieren, Position läuft bis Verfall oder 21-DTE-Exit
+                        _cancel_order_by_id(ib, info.get('tp_order_id', 0), symbol, 'TP')
+                        _cancel_order_by_id(ib, info.get('sl_order_id', 0), symbol, 'SL')
+                        log(f"  🔒 [{symbol}] Breakeven: TP/SL storniert — "
+                            f"keine neue Order (läuft bis Verfall/DTE-Exit) | P&L: +${pnl_dollar:.0f}")
 
-            _save_state()
+                    _save_state()
 
         # Unrealized P&L in trade-Info speichern (für Launcher-Anzeige)
         info['unrealized_pnl'] = round(pnl_dollar, 2)
@@ -1103,7 +1116,6 @@ async def place_order(ib, sig):
     """Platziert eine Combo-Order auf IB für ein gegebenes Signal-Dict."""
     try:
         sym = sig['symbol']
-
         # ── Schritt 1: IBKR-Liste zwingend aktualisieren vor jedem Check ────
         await ib.reqAllOpenOrdersAsync()
         await asyncio.sleep(0.5)  # kurz warten bis interne Liste befüllt ist
@@ -1135,211 +1147,192 @@ async def place_order(ib, sig):
             _save_state()
             return
 
-        short_contract = Option(sym, sig['expiry_ib'], sig['short_strike'], 'P', 'SMART')
-        long_contract  = Option(sym, sig['expiry_ib'], sig['long_strike'],  'P', 'SMART')
+        # Mutex: alle Order-Aktionen für dieses Symbol serialisiert
+        # (verhindert Error 201: Entry/Exit/Breakeven dürfen nie gleichzeitig Orders senden)
+        async with _sym_lock(sym):
+            short_contract = Option(sym, sig['expiry_ib'], sig['short_strike'], 'P', 'SMART')
+            long_contract  = Option(sym, sig['expiry_ib'], sig['long_strike'],  'P', 'SMART')
 
-        await ib.qualifyContractsAsync(short_contract, long_contract)
-        if not (short_contract.conId > 0 and long_contract.conId > 0):
-            log(f"  ❌ [{sym}] Qualifizierung fehlgeschlagen — Order abgebrochen")
-            return
+            await ib.qualifyContractsAsync(short_contract, long_contract)
+            if not (short_contract.conId > 0 and long_contract.conId > 0):
+                log(f"  ❌ [{sym}] Qualifizierung fehlgeschlagen — Order abgebrochen")
+                return
 
-        bag = Bag(
-            symbol=sym, exchange='SMART', currency='USD',
-            comboLegs=[
-                ComboLeg(conId=short_contract.conId, ratio=1, action='SELL', exchange='SMART'),
-                ComboLeg(conId=long_contract.conId,  ratio=1, action='BUY',  exchange='SMART'),
-            ]
-        )
+            bag = Bag(
+                symbol=sym, exchange='SMART', currency='USD',
+                comboLegs=[
+                    ComboLeg(conId=short_contract.conId, ratio=1, action='SELL', exchange='SMART'),
+                    ComboLeg(conId=long_contract.conId,  ratio=1, action='BUY',  exchange='SMART'),
+                ]
+            )
 
-        # Echtes IBKR-Netto-Bid berechnen: Short-Bid minus Long-Ask der einzelnen Legs
-        # (reqMktData auf Bag erfordert Combo-Abo — Legs sind mit Standard-Options-Abo verfügbar)
-        global _sem_ib_mktdata
-        if _sem_ib_mktdata is None:
-            _sem_ib_mktdata = asyncio.Semaphore(2)
-        async with _sem_ib_mktdata:
-            t_short = ib.reqMktData(short_contract, '', False, False)
-            t_long  = ib.reqMktData(long_contract,  '', False, False)
-            await asyncio.sleep(5)
-            short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
-            long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
-        try:
-            ib.cancelMktData(t_short)
-        except Exception:
-            pass
-        try:
-            ib.cancelMktData(t_long)
-        except Exception:
-            pass
+            # Echtes IBKR-Netto-Bid berechnen: Short-Bid minus Long-Ask der einzelnen Legs
+            global _sem_ib_mktdata
+            if _sem_ib_mktdata is None:
+                _sem_ib_mktdata = asyncio.Semaphore(2)
+            async with _sem_ib_mktdata:
+                t_short = ib.reqMktData(short_contract, '', False, False)
+                t_long  = ib.reqMktData(long_contract,  '', False, False)
+                await asyncio.sleep(5)
+                short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
+                long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
+            try:
+                ib.cancelMktData(t_short)
+            except Exception:
+                pass
+            try:
+                ib.cancelMktData(t_long)
+            except Exception:
+                pass
 
-        if short_bid is None or long_ask is None:
-            # Fallback Stufe 1: bidGreeks/askGreeks optPrice
-            def _greek_price(ticker, side):
-                g = ticker.bidGreeks if side == 'bid' else ticker.askGreeks
-                return g.optPrice if g and g.optPrice and g.optPrice > 0 else None
-
-            sb_greek = _greek_price(t_short, 'bid')
-            la_greek = _greek_price(t_long,  'ask')
-
-            if sb_greek and la_greek:
-                short_bid = sb_greek
-                long_ask  = la_greek
-                log(f"  ⚠️  [{sym}] Kein Bid/Ask — bidGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
-            else:
-                # Fallback Stufe 2: modelGreeks optPrice (IBKR BS-Modell — genauer als Last)
-                def _model_price(ticker):
-                    g = ticker.modelGreeks
+            if short_bid is None or long_ask is None:
+                def _greek_price(ticker, side):
+                    g = ticker.bidGreeks if side == 'bid' else ticker.askGreeks
                     return g.optPrice if g and g.optPrice and g.optPrice > 0 else None
-
-                sb_model = _model_price(t_short)
-                la_model = _model_price(t_long)
-
-                if sb_model and la_model:
-                    short_bid = sb_model
-                    long_ask  = la_model
-                    log(f"  ⚠️  [{sym}] Kein Bid/Ask — modelGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
+                sb_greek = _greek_price(t_short, 'bid')
+                la_greek = _greek_price(t_long,  'ask')
+                if sb_greek and la_greek:
+                    short_bid = sb_greek
+                    long_ask  = la_greek
+                    log(f"  ⚠️  [{sym}] Kein Bid/Ask — bidGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
                 else:
-                    # Fallback Stufe 3: letzter Handelspreis — kann veraltet sein, strenger Abschlag
-                    short_last = t_short.last if t_short.last and t_short.last > 0 else None
-                    long_last  = t_long.last  if t_long.last  and t_long.last  > 0 else None
-                    if short_last and long_last:
-                        short_bid = short_last
-                        long_ask  = long_last
-                        log(f"  ⚠️  [{sym}] Kein Bid/Ask, kein Greek — Last-Preis: Short ${short_last:.2f}  Long ${long_last:.2f}")
+                    def _model_price(ticker):
+                        g = ticker.modelGreeks
+                        return g.optPrice if g and g.optPrice and g.optPrice > 0 else None
+                    sb_model = _model_price(t_short)
+                    la_model = _model_price(t_long)
+                    if sb_model and la_model:
+                        short_bid = sb_model
+                        long_ask  = la_model
+                        log(f"  ⚠️  [{sym}] Kein Bid/Ask — modelGreeks: Short ${short_bid:.2f}  Long ${long_ask:.2f}")
                     else:
-                        if IS_DEMO_MODE and sig.get('praemie', 0) > 0:
-                            # PAPER MODE: Alle IB-Fallbacks erschöpft → BS/yfinance-Schätzung aus Scan-Phase
-                            short_bid = sig['praemie']
-                            long_ask  = 0.0
-                            log(f"  ⚠️  [{sym}] PAPER MODE: Keine IB-Marktdaten — "
-                                f"Scan-Schätzung ${sig['praemie']:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                        short_last = t_short.last if t_short.last and t_short.last > 0 else None
+                        long_last  = t_long.last  if t_long.last  and t_long.last  > 0 else None
+                        if short_last and long_last:
+                            short_bid = short_last
+                            long_ask  = long_last
+                            log(f"  ⚠️  [{sym}] Kein Bid/Ask, kein Greek — Last-Preis: Short ${short_last:.2f}  Long ${long_last:.2f}")
                         else:
-                            log(f"  ✗ [{sym}] Keine Preisdaten verfügbar — Trade abgebrochen")
-                            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                            return
+                            if IS_DEMO_MODE and sig.get('praemie', 0) > 0:
+                                short_bid = sig['praemie']
+                                long_ask  = 0.0
+                                log(f"  ⚠️  [{sym}] PAPER MODE: Keine IB-Marktdaten — "
+                                    f"Scan-Schätzung ${sig['praemie']:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                            else:
+                                log(f"  ✗ [{sym}] Keine Preisdaten verfügbar — Trade abgebrochen")
+                                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                                return
 
-        has_real_bid = t_short.bid and t_short.bid > 0
-        has_real_ask = t_long.ask  and t_long.ask  > 0
+            has_real_bid = bool(t_short.bid and t_short.bid > 0)
 
-        if IS_DEMO_MODE:
-            # Demo: Mid-Point-Pricing — weite Delayed-Spreads werden gemittelt
-            # (Short-Bid ist oft zu klein, Long-Ask zu groß → Netto negativ)
-            def _mid(t, fallback):
-                b = t.bid if (t.bid and t.bid > 0) else None
-                a = t.ask if (t.ask and t.ask > 0) else None
-                if b and a:
-                    return (b + a) / 2
-                return b or a or fallback
-            short_val = _mid(t_short, short_bid)
-            long_val  = _mid(t_long,  long_ask)
-            ibkr_net  = round(short_val - long_val, 2)
-            # Wenn Mid-Point negativ/null → Scan-Schätzung als Fallback (Demo-Daten oft verzerrt)
-            if ibkr_net <= 0 and sig.get('praemie', 0) > 0:
-                ibkr_net = sig['praemie']
-                log(f"  ⚠️  [{sym}] PAPER MODE: Mid-Point ≤0 — "
-                    f"Scan-Schätzung ${ibkr_net:.2f}/Share ({sig.get('praemie_quelle','?')})")
-            limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
-            quelle = "Mid-Point (Demo)"
-        else:
-            ibkr_net = round(short_bid - long_ask, 2)
-            has_model = not has_real_bid and (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
-            discount  = 0.75 if (has_real_bid or has_model) else 0.65
-            limit_price = round(max(ibkr_net * discount, 0.01), 2)
-            quelle = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
-
-        has_model = (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
-        # Bei theoretischen Preisen (kein echtes Bid) strengeres R/R-Minimum im Live-Modus
-        rr_minimum = MIN_RISK_REWARD if (IS_DEMO_MODE or has_real_bid) else MIN_RISK_REWARD * 1.5
-
-        # Delta-Check: IBKR modelGreeks liefert das zuverlässigste Delta
-        short_delta = None
-        if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
-            short_delta = abs(t_short.modelGreeks.delta)
-        delta_str = f"Δ={short_delta:.3f}" if short_delta is not None else "Δ=n/a"
-        log(f"  📡 [{sym}] {quelle}: Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
-              f"Netto: ${ibkr_net:.2f} → Limit: ${limit_price:.2f}  {delta_str}")
-
-        if short_delta is not None and short_delta > MAX_DELTA:
-            log(f"  ✗ [{sym}] Delta {short_delta:.3f} > {MAX_DELTA} — Short-Put zu nah am Kurs, Trade abgebrochen")
-            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-            return
-
-        # Beide Checks auf IBKR-Netto (Marktwert), nicht auf dem diskontierten Limit.
-        market_rr     = ibkr_net / (sig['breite'] - ibkr_net) if sig['breite'] > ibkr_net else 0.0
-        market_credit = ibkr_net * 100
-
-        if market_rr < rr_minimum:
-            log(f"  ✗ [{sym}] R/R {market_rr:.2f}x < {rr_minimum:.2f}x ({quelle}) — Trade abgebrochen")
-            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-            return
-        sig_prob = sig.get('prob_otm', 0)
-        credit_ok, req_credit, req_pwin = _check_credit(market_credit, sig['breite'], sig_prob)
-        if not credit_ok:
-            spread_risk = sig['breite'] * 100
-            if market_credit >= req_credit:
-                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} OK aber P(Win) {sig_prob:.1%} < {req_pwin:.0%} — Trade abgebrochen")
+            if IS_DEMO_MODE:
+                def _mid(t, fallback):
+                    b = t.bid if (t.bid and t.bid > 0) else None
+                    a = t.ask if (t.ask and t.ask > 0) else None
+                    if b and a:
+                        return (b + a) / 2
+                    return b or a or fallback
+                short_val = _mid(t_short, short_bid)
+                long_val  = _mid(t_long,  long_ask)
+                ibkr_net  = round(short_val - long_val, 2)
+                if ibkr_net <= 0 and sig.get('praemie', 0) > 0:
+                    ibkr_net = sig['praemie']
+                    log(f"  ⚠️  [{sym}] PAPER MODE: Mid-Point ≤0 — "
+                        f"Scan-Schätzung ${ibkr_net:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
+                quelle = "Mid-Point (Demo)"
             else:
-                log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < erforderlich ${req_credit:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${spread_risk:.0f} Risiko) — Trade abgebrochen")
-            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-            return
+                ibkr_net = round(short_bid - long_ask, 2)
+                has_model = not has_real_bid and bool(
+                    t_short.modelGreeks and t_short.modelGreeks.optPrice
+                    and t_short.modelGreeks.optPrice > 0)
+                discount    = 0.75 if (has_real_bid or has_model) else 0.65
+                limit_price = round(max(ibkr_net * discount, 0.01), 2)
+                quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
 
-        expiry_yf = sig['expiry_ib'][:4] + '-' + sig['expiry_ib'][4:6] + '-' + sig['expiry_ib'][6:]
+            has_model  = bool(t_short.modelGreeks and t_short.modelGreeks.optPrice
+                              and t_short.modelGreeks.optPrice > 0)
+            rr_minimum = MIN_RISK_REWARD if (IS_DEMO_MODE or has_real_bid) else MIN_RISK_REWARD * 1.5
 
-        # Registrieren VOR placeOrder — verhindert Duplikate auch wenn Placement danach wirft
-        _bot_trades[sym] = {
-            'entry_per_share': limit_price,
-            'expiry_yf':       expiry_yf,
-            'short_strike':    sig['short_strike'],
-            'long_strike':     sig['long_strike'],
-            'short_conid':     short_contract.conId,
-            'long_conid':      long_contract.conId,
-            'status':          'open',
-            'at_breakeven':    False,
-            'tp_order_id':     0,
-            'sl_order_id':     0,
-            'opened_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
-        }
+            short_delta = None
+            if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
+                short_delta = abs(t_short.modelGreeks.delta)
+            delta_str = f"Δ={short_delta:.3f}" if short_delta is not None else "Δ=n/a"
+            log(f"  📡 [{sym}] {quelle}: Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
+                f"Netto: ${ibkr_net:.2f} → Limit: ${limit_price:.2f}  {delta_str}")
 
-        # ── Bracket-Order: Entry + TP + SL, alle GTC ─────────────────────────
-        # Preise
-        tp_close = max(round(limit_price * (1 - TAKE_PROFIT_PCT), 2), 0.01)
-        sl_close = round(limit_price * STOP_LOSS_MULT, 2)
+            if short_delta is not None and short_delta > MAX_DELTA:
+                log(f"  ✗ [{sym}] Delta {short_delta:.3f} > {MAX_DELTA} — Short-Put zu nah am Kurs, Trade abgebrochen")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
 
-        # Entry: negativer Preis = Credit empfangen (IBKR-Konvention für Combo-Spreads)
-        # transmit=False → Order geht zu TWS aber wird noch nicht weitergeleitet
-        entry_order = LimitOrder('BUY', 1, -limit_price, tif='GTC')
-        entry_order.transmit = False
-        entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-        entry_order.account = _cfg.get('ib_account', '')
-        entry_trade = ib.placeOrder(bag, entry_order)
-        parent_id = entry_trade.order.orderId
+            market_rr     = ibkr_net / (sig['breite'] - ibkr_net) if sig['breite'] > ibkr_net else 0.0
+            market_credit = ibkr_net * 100
 
-        # Take-Profit: positiver Preis = Debit bezahlen zum Schließen
-        # parentId verknüpft mit Entry — IBKR storniert SL automatisch wenn TP füllt
-        tp_order = LimitOrder('BUY', 1, tp_close, tif='GTC')
-        tp_order.parentId = parent_id
-        tp_order.transmit = False
-        tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-        tp_order.account = _cfg.get('ib_account', '')
-        tp_trade = ib.placeOrder(bag, tp_order)
+            if market_rr < rr_minimum:
+                log(f"  ✗ [{sym}] R/R {market_rr:.2f}x < {rr_minimum:.2f}x ({quelle}) — Trade abgebrochen")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
+            sig_prob = sig.get('prob_otm', 0)
+            credit_ok, req_credit, req_pwin = _check_credit(market_credit, sig['breite'], sig_prob)
+            if not credit_ok:
+                spread_risk = sig['breite'] * 100
+                if market_credit >= req_credit:
+                    log(f"  ✗ [{sym}] Credit ${market_credit:.0f} OK aber P(Win) {sig_prob:.1%} < {req_pwin:.0%} — Trade abgebrochen")
+                else:
+                    log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < erforderlich ${req_credit:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${spread_risk:.0f} Risiko) — Trade abgebrochen")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
 
-        # Stop-Loss: transmit=True übermittelt alle drei Orders gleichzeitig an die Börse
-        sl_order = LimitOrder('BUY', 1, sl_close, tif='GTC')
-        sl_order.parentId = parent_id
-        sl_order.transmit = True
-        sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-        sl_order.account = _cfg.get('ib_account', '')
-        sl_trade = ib.placeOrder(bag, sl_order)
+            expiry_yf = sig['expiry_ib'][:4] + '-' + sig['expiry_ib'][4:6] + '-' + sig['expiry_ib'][6:]
 
-        # IDs für spätere Stornierung (DTE-Exit, Breakeven-Update) speichern
-        _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
-        _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
-        _save_state()
+            _bot_trades[sym] = {
+                'entry_per_share': limit_price,
+                'expiry_yf':       expiry_yf,
+                'short_strike':    sig['short_strike'],
+                'long_strike':     sig['long_strike'],
+                'short_conid':     short_contract.conId,
+                'long_conid':      long_contract.conId,
+                'status':          'open',
+                'at_breakeven':    False,
+                'tp_order_id':     0,
+                'sl_order_id':     0,
+                'opened_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
+            }
 
-        log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
-        log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC)")
-        log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit:.0f})  R/R: {market_rr:.2f}x")
-        log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100:.0f})")
-        log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100:.0f})")
+            tp_close = max(round(limit_price * (1 - TAKE_PROFIT_PCT), 2), 0.01)
+            sl_close = round(limit_price * STOP_LOSS_MULT, 2)
+
+            entry_order = LimitOrder('BUY', 1, -limit_price, tif='GTC')
+            entry_order.transmit = False
+            entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+            entry_order.account = _cfg.get('ib_account', '')
+            entry_trade = ib.placeOrder(bag, entry_order)
+            parent_id = entry_trade.order.orderId
+
+            tp_order = LimitOrder('BUY', 1, tp_close, tif='GTC')
+            tp_order.parentId = parent_id
+            tp_order.transmit = False
+            tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+            tp_order.account = _cfg.get('ib_account', '')
+            tp_trade = ib.placeOrder(bag, tp_order)
+
+            sl_order = LimitOrder('BUY', 1, sl_close, tif='GTC')
+            sl_order.parentId = parent_id
+            sl_order.transmit = True
+            sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+            sl_order.account = _cfg.get('ib_account', '')
+            sl_trade = ib.placeOrder(bag, sl_order)
+
+            _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+            _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+            _save_state()
+
+            log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
+            log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC)")
+            log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit:.0f})  R/R: {market_rr:.2f}x")
+            log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100:.0f})")
+            log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100:.0f})")
     except Exception as e:
         import traceback
         log(f"  ❌ [{sym}] Order-Fehler: {e}\n{traceback.format_exc()}")
