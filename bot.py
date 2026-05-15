@@ -686,14 +686,23 @@ class TradeContext:
 
 
 class DecisionEngine:
-    """Ersetzt alle Hard-Filter durch einen einzigen gewichteten Score.
-    Einzige Hard-Gates: Infrastrukturprobleme (kein Vertrag, kein Preis) und
-    Mindest-Credit-Größe. Alles andere ist Score-Komponente."""
+    """Prop-Desk Ranking Engine mit konfigurierbaren Regime-Gewichten.
+    Einzige Hard-Gates: Infrastrukturprobleme (kein Vertrag, kein Preis)
+    und Mindest-Credit-Größe. Alles andere ist Score-Komponente."""
 
-    def __init__(self, trade_threshold: float = ENTRY_THRESHOLD,
-                       watch_threshold: float = WATCH_THRESHOLD):
+    def __init__(self,
+                 trade_threshold: float = ENTRY_THRESHOLD,
+                 watch_threshold: float = WATCH_THRESHOLD,
+                 w_edge: float = 0.45,
+                 w_exec: float = 0.25,
+                 w_risk: float = 0.25,
+                 w_liq:  float = 0.05):
         self.trade_threshold = trade_threshold
         self.watch_threshold = watch_threshold
+        self.w_edge = w_edge
+        self.w_exec = w_exec
+        self.w_risk = w_risk
+        self.w_liq  = w_liq
 
     def _edge(self, s: TradeContext) -> float:
         return (0.30 * s.ev_norm
@@ -709,18 +718,17 @@ class DecisionEngine:
               + 0.20 * s.dte_risk)
 
     def _quality(self, s: TradeContext) -> float:
-        """Diagnostik-only (nicht mehr im Score). Zeigt Bonus-Faktoren."""
+        """Diagnostik-only (kein Score-Einfluss). Zeigt Bonus-Faktoren."""
         return (0.07 * s.iv_expansion_confirmed
               + 0.07 * s.tight_spread_bonus
               + 0.07 * s.liquidity_bonus
               + 0.07 * s.no_event_conflict)
 
     def compute_score(self, s: TradeContext) -> float:
-        """Prop-Desk Formel: 0.45×Edge + 0.25×Exec + 0.25×(1−Risk) + 0.05×Liq − Penalties."""
-        return (0.45 * self._edge(s)
-              + 0.25 * s.exec_score
-              + 0.25 * (1.0 - self._risk(s))
-              + 0.05 * s.liquidity_score_raw
+        return (self.w_edge * self._edge(s)
+              + self.w_exec * s.exec_score
+              + self.w_risk * (1.0 - self._risk(s))
+              + self.w_liq  * s.liquidity_score_raw
               - s.earnings_penalty
               - s.iv_penalty)
 
@@ -741,14 +749,41 @@ class DecisionEngine:
             'exec':        round(ctx.exec_score,          4),
             'risk':        round(self._risk(ctx),         4),
             'liq':         round(ctx.liquidity_score_raw, 4),
-            'quality':     round(self._quality(ctx),      4),  # diagnostik
+            'quality':     round(self._quality(ctx),      4),
             'earn_pen':    round(ctx.earnings_penalty,    4),
             'iv_pen':      round(ctx.iv_penalty,          4),
             'final_score': round(score,                   4),
         }
 
 
-_decision_engine = DecisionEngine()
+# ── Regime-spezifische Engine-Instanzen ──────────────────────────────────────
+# HIGH_IV: IV ≥ 35 %, kein Earnings-Risiko — Edge dominiert (fette Prämie)
+_engine_high_iv  = DecisionEngine(w_edge=0.55, w_exec=0.20, w_risk=0.20, w_liq=0.05)
+# MODERATE_IV: IV 25–35 % — ausgewogen
+_engine_moderate = DecisionEngine(w_edge=0.45, w_exec=0.25, w_risk=0.25, w_liq=0.05)
+# LOW_IV: IV 18–25 % — nur wenn Fill und Liquidität gesichert
+_engine_low_iv   = DecisionEngine(w_edge=0.35, w_exec=0.30, w_risk=0.25, w_liq=0.10)
+
+# Fallback für Kompatibilität (wird in fetch_signal durch classify_strategy ersetzt)
+_decision_engine = _engine_moderate
+
+
+def classify_strategy(iv: float, earn_penalty: float) -> tuple:
+    """Wählt Setup-Regime + passende DecisionEngine-Instanz.
+
+    Returns: (regime_name: str, engine: DecisionEngine)
+
+    Regimes:
+      BULL_PUT_PREMIUM  — IV ≥ 35 %, Earnings-Penalty ≤ 0.05  → Edge schwer
+      BULL_PUT_STANDARD — IV ≥ 25 % (oder moderates Earnings-Risiko) → ausgewogen
+      BULL_PUT_CAUTIOUS — IV 18–25 %                             → Exec + Liq schwer
+    """
+    if iv >= 0.35 and earn_penalty <= 0.05:
+        return 'BULL_PUT_PREMIUM', _engine_high_iv
+    elif iv >= 0.25:
+        return 'BULL_PUT_STANDARD', _engine_moderate
+    else:
+        return 'BULL_PUT_CAUTIOUS', _engine_low_iv
 
 
 def _round_to_standard_strike(strike: float, price: float) -> float:
@@ -1330,8 +1365,9 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             exec_score             = _exec_score,
             liquidity_score_raw    = _liquidity_score,
         )
-        breakdown = _decision_engine.explain(ctx)
-        decision, score = _decision_engine.decide(ctx)
+        iv_regime, _regime_engine = classify_strategy(iv, earn_penalty)
+        breakdown = _regime_engine.explain(ctx)
+        decision, score = _regime_engine.decide(ctx)
 
         # Hard-Gate: Mindest-Credit-Größe (Infrastruktur, kein Score-Thema)
         credit_ok_hard = credit >= max(breite * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
@@ -1358,11 +1394,12 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
             'slippage_factor': _slip,
             'score':            score,
             'decision':         decision,        # 'TRADE' / 'WATCH' / 'SKIP'
+            'strategy':         iv_regime,       # BULL_PUT_PREMIUM / STANDARD / CAUTIOUS
             'edge':             breakdown['edge'],
             'exec':             breakdown['exec'],
             'risk':             breakdown['risk'],
             'liq':              breakdown['liq'],
-            'quality':          breakdown['quality'],   # diagnostik
+            'quality':          breakdown['quality'],
             'liquidity_score':  round(_liquidity_score, 3),
             'exec_score':       round(_exec_score, 3),
             'earnings_penalty': earn_penalty,
