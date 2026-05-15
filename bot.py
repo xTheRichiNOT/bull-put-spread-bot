@@ -193,6 +193,19 @@ SLIPPAGE_FACTOR: dict[str, float] = {
     'default':                0.80,
 }
 
+# Fill-Timeout: Entry-Order wird nach N Sekunden storniert wenn nicht gefüllt
+FILL_TIMEOUT_SECONDS = int(_cfg.get('fill_timeout_seconds', 300))   # 5 Minuten
+
+# Reconnect: maximale Versuche und Basis-Wartezeit zwischen den Versuchen
+RECONNECT_MAX_ATTEMPTS = int(_cfg.get('reconnect_max_attempts', 10))
+RECONNECT_BASE_WAIT    = int(_cfg.get('reconnect_base_wait',    15))   # Sekunden
+
+# Bekannte Hochliquiditätssymbole — OI-Warnung wenn auffällig niedrig
+_HIGH_LIQUIDITY_SYMS = frozenset({
+    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NFLX',
+    'AMD', 'AVGO', 'JPM', 'GS', 'SPY', 'QQQ',
+})
+
 # VIX-Regime (Bull Put Spreads = Short Premium → VIX-abhängige Größensteuerung)
 VIX_CALM_THRESHOLD    = float(_cfg.get('vix_calm',    16))   # < 16: zu wenig Prämie
 VIX_ELEVATED_THRESHOLD= float(_cfg.get('vix_elevated', 30))  # 16–30: optimal
@@ -539,7 +552,8 @@ def _on_order_status(trade):
             _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
             log(f"  💰 [{sym}] EXIT AUSGEFÜHRT @ ${exit_fill:.2f}/Share — Position geschlossen!")
         else:
-            _bot_trades[sym]['status'] = 'open'
+            _bot_trades[sym]['status']        = 'open'
+            _bot_trades[sym]['fill_confirmed'] = True   # Entry gefüllt — Fill-Timeout deaktiviert
             fill = trade.orderStatus.avgFillPrice
             if fill and fill > 0:
                 _bot_trades[sym]['entry_per_share'] = abs(fill)
@@ -1052,9 +1066,15 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
         _vol = float(short_row.get('volume', 0) or 0)
         _sb  = float(short_row.get('bid', 0) or 0)
         _sa  = float(short_row.get('ask', 0) or 0)
-        if _oi < MIN_OPEN_INTEREST:
-            log(f"   [{symbol}] ✗ OI={_oi:.0f} < {MIN_OPEN_INTEREST} — zu illiquide")
-            _shadow_partial(symbol, preis, iv, 'liquidity', f"OI={_oi:.0f} < {MIN_OPEN_INTEREST}",
+        # Im Demo-Modus: yfinance liefert oft niedrigere OI-Werte (delayed/stale) → Schwelle reduzieren
+        _oi_threshold = MIN_OPEN_INTEREST if not IS_DEMO_MODE else max(MIN_OPEN_INTEREST // 5, 50)
+        if _oi < _oi_threshold:
+            # Warnung bei bekannt hochliquiden Symbolen — deutet auf falschen Strike/Expiry hin
+            if symbol in _HIGH_LIQUIDITY_SYMS and _oi > 0:
+                log(f"   [{symbol}] ⚠️  OI={_oi:.0f} suspekt niedrig für Haupt-Symbol"
+                    f" (erwartet >1000) — evtl. falscher Strike/Expiry (yfinance delayed?)")
+            log(f"   [{symbol}] ✗ OI={_oi:.0f} < {_oi_threshold} — zu illiquide")
+            _shadow_partial(symbol, preis, iv, 'liquidity', f"OI={_oi:.0f} < {_oi_threshold}",
                             short_strike=float(short_row['strike']))
             return None
         if _vol < MIN_OPTION_VOLUME:
@@ -1487,6 +1507,24 @@ async def monitor_exits(ib=None):
 
         if info.get('status') != 'open':
             continue
+
+        # Fill-Timeout: Entry-Order nicht gefüllt innerhalb FILL_TIMEOUT_SECONDS?
+        if (not info.get('fill_confirmed', True)   # True = rückwärtskompatibel für alte Trades
+                and info.get('fill_deadline', '')):
+            if datetime.now().isoformat() > info['fill_deadline']:
+                entry_oid = info.get('entry_order_id', 0)
+                log(f"  ⏱️  [{symbol}] Fill-Timeout ({FILL_TIMEOUT_SECONDS}s) — "
+                    f"storniere Entry #{entry_oid}")
+                if entry_oid and ib is not None:
+                    try:
+                        _expected_cancels.add(entry_oid)
+                        ib.client.cancelOrder(entry_oid, '')
+                    except Exception as e:
+                        log(f"  ⚠️  [{symbol}] Entry-Cancel fehlgeschlagen: {e}")
+                info['status'] = 'failed'
+                _save_state()
+                continue
+
         if not info.get('expiry_yf'):
             continue
 
@@ -1828,6 +1866,7 @@ async def place_order(ib, sig):
                 f" [Conf:{n_contracts_conf} × VIX:{vix_factor:.1f} → {n_contracts_vix},"
                 f" RiskCap:{max_by_risk if net_liq > 0 else '?'}]")
 
+            _fill_deadline = (datetime.now() + timedelta(seconds=FILL_TIMEOUT_SECONDS)).isoformat()
             _bot_trades[sym] = {
                 'entry_per_share': limit_price,
                 'expiry_yf':       expiry_yf,
@@ -1840,6 +1879,9 @@ async def place_order(ib, sig):
                 'tp_order_id':     0,
                 'sl_order_id':     0,
                 'opened_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'fill_confirmed':  False,          # wird True wenn Entry-Fill-Event feuert
+                'fill_deadline':   _fill_deadline, # Timeout für Entry-Fill
+                'entry_order_id':  0,              # wird nach placeOrder gesetzt
             }
 
             tp_close = max(round(limit_price * (1 - TAKE_PROFIT_PCT), 2), 0.01)
@@ -1866,8 +1908,9 @@ async def place_order(ib, sig):
             sl_order.account = _cfg.get('ib_account', '')
             sl_trade = ib.placeOrder(bag, sl_order)
 
-            _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
-            _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+            _bot_trades[sym]['tp_order_id']    = tp_trade.order.orderId
+            _bot_trades[sym]['sl_order_id']    = sl_trade.order.orderId
+            _bot_trades[sym]['entry_order_id'] = parent_id
             _save_state()
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
@@ -1974,6 +2017,29 @@ def _print_shadow_summary(days: int = 30) -> None:
         log(f"  ⚠️  Shadow-Analytics fehlgeschlagen: {e}")
 
 
+async def _reconnect_ib(ib: 'IB', host: str, port: int,
+                         stop_event: 'threading.Event | None' = None) -> bool:
+    """Versucht die IB-Verbindung nach Trennung wiederherzustellen (exp. Backoff)."""
+    for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
+        if stop_event and stop_event.is_set():
+            return False
+        wait_sec = min(RECONNECT_BASE_WAIT * attempt, 300)
+        log(f"  🔄 IB-Reconnect Versuch {attempt}/{RECONNECT_MAX_ATTEMPTS} in {wait_sec}s ...")
+        await asyncio.sleep(wait_sec)
+        try:
+            if ib.isConnected():
+                return True
+            client_id = random.randint(10, 999)
+            await asyncio.wait_for(ib.connectAsync(host, port, clientId=client_id), timeout=30)
+            if ib.isConnected():
+                log(f"  ✅ IB-Reconnect erfolgreich (Versuch {attempt})")
+                return True
+        except Exception as e:
+            log(f"  ⚠️  Reconnect-Versuch {attempt} fehlgeschlagen: {e}")
+    log(f"  ❌ IB-Reconnect nach {RECONNECT_MAX_ATTEMPTS} Versuchen nicht möglich")
+    return False
+
+
 async def run_bot(stop_event: threading.Event = None):
     ib = IB()
     log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7497)})")
@@ -2031,6 +2097,11 @@ async def run_bot(stop_event: threading.Event = None):
 
         # Event-Handler: gecancelte Orders in Echtzeit tracken
         ib.orderStatusEvent += _on_order_status
+
+        # Event-Handler: Disconnect protokollieren
+        def _on_ib_disconnected():
+            log("  ⚠️  IB-Verbindung getrennt — nächster Zyklus: Reconnect-Versuch")
+        ib.disconnectedEvent += _on_ib_disconnected
 
         # Event-Handler: IBKR-Fehler prominent loggen (insb. Error 201)
         def _on_ib_error(reqId, errorCode, errorString, _contract):
@@ -2159,6 +2230,20 @@ async def run_bot(stop_event: threading.Event = None):
                     await asyncio.sleep(chunk)
                     slept += chunk
                 continue
+
+            # ── Verbindungscheck / Auto-Reconnect ────────────────────────────
+            if ib and not ib.isConnected():
+                log("  ⚠️  IB nicht verbunden — Auto-Reconnect ...")
+                _host = _cfg.get('ib_host', '127.0.0.1')
+                _port = int(_cfg.get('ib_port', 7497))
+                reconnected = await _reconnect_ib(ib, _host, _port, stop_event)
+                if reconnected:
+                    ib.orderStatusEvent += _on_order_status
+                    await ib.reqAllOpenOrdersAsync()
+                    await asyncio.sleep(1.0)
+                    log("  ✅ IB-State nach Reconnect synchronisiert")
+                else:
+                    log("  ❌ Reconnect fehlgeschlagen — nur Exit-Monitoring (ohne IB-Daten)")
 
             # ── VIX-Regime + Event-Lock ──────────────────────────────────────
             global _vix_level, _vix_regime

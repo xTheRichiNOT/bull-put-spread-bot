@@ -26,5 +26,8 @@
   "vix_calm": 16,
   "vix_elevated": 30,
   "vix_crisis": 40,
-  "event_lock_hours": 24
+  "event_lock_hours": 24,
+  "fill_timeout_seconds": 300,
+  "reconnect_max_attempts": 10,
+  "reconnect_base_wait": 15
 }
