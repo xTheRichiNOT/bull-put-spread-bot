@@ -947,36 +947,45 @@ async def close_spread(ib, symbol, info, reason):
                 cancelled_ids.add(oid)
                 log(f"  🗑  [{symbol}] Order #{oid} storniert (Sweep)")
 
-            # Polling-Loop: warten bis IB Cancelled-Status bestätigt (max 5 Sekunden)
-            # Erst wenn alle bekannten aktiven Orders weg sind, darf die Exit-Order folgen.
+            # Polling-Loop: warten bis IB Cancel wirklich bestätigt — 20 × 0.5s = 10s Timeout.
+            # Frische reqAllOpenOrdersAsync()-Antwort verwenden (NICHT ib.trades()-Cache).
+            # orderId=0-Orders (aus alter Session) werden EINGESCHLOSSEN — kein Filter.
             cancel_confirmed = False
-            for _attempt in range(10):          # 10 × 0.5s = 5s Timeout
+            still_active: list = []
+            for _attempt in range(20):          # 20 × 0.5s = 10s Timeout (User-Anforderung)
                 await asyncio.sleep(0.5)
-                await ib.reqAllOpenOrdersAsync()
+                fresh = await ib.reqAllOpenOrdersAsync()
                 still_active = [
-                    t for t in ib.trades()
+                    t for t in (fresh if fresh else ib.openTrades())
                     if t.contract.symbol == symbol
                     and t.orderStatus.status in active_statuses
-                    and (t.order.orderId or 0) > 0
                 ]
                 if not still_active:
                     cancel_confirmed = True
                     break
-                # Erneut stornieren falls noch offen (IB ignoriert gelegentlich den ersten Cancel)
+                # Erneut stornieren falls noch offen
                 for t in still_active:
-                    oid = t.order.orderId
-                    if oid not in cancelled_ids:
+                    oid = t.order.orderId or 0
+                    if oid > 0 and oid not in cancelled_ids:
                         _expected_cancels.add(oid)
                         ib.client.cancelOrder(oid, '')
                         cancelled_ids.add(oid)
+                # Alle 2 Sekunden: gespeicherte TP/SL-IDs nochmals direkt senden
+                if _attempt % 4 == 1:
+                    for _, stored_oid in [('TP', info.get('tp_order_id', 0)),
+                                          ('SL', info.get('sl_order_id', 0))]:
+                        if stored_oid and stored_oid > 0:
+                            ib.client.cancelOrder(stored_oid, '')
 
             if not cancel_confirmed:
-                remaining_ids = [t.order.orderId for t in still_active]
-                log(f"  ❌ [{symbol}] Fehler: Alte Orders konnten nicht gelöscht werden. "
+                remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
+                                 for t in still_active]
+                log(f"  ❌ [{symbol}] Fehler: Alte Orders konnten nicht gelöscht werden (10s Timeout). "
                     f"Exit abgebrochen. Noch aktiv: {remaining_ids} — "
                     f"Bitte manuell in IBKR/TWS stornieren!")
                 info['status'] = 'open'
                 return
+            await asyncio.sleep(1.5)    # Extra-Puffer: IB-interne Propagierung abwarten
             log(f"  ✅ [{symbol}] Alle alten Orders storniert — sende Exit-Order")
 
         bag = Bag(
