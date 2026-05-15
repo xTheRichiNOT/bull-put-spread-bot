@@ -879,43 +879,41 @@ async def close_spread(ib, symbol, info, reason):
             await asyncio.sleep(0.5)
 
             active_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel'}
+            cancelled_ids: set = set()
 
-            # Schritt 1: Gespeicherte TP/SL-IDs zuerst — diese haben garantiert eine gültige orderId
-            for label, oid in [('TP', info.get('tp_order_id', 0)),
-                                ('SL', info.get('sl_order_id', 0))]:
-                if not oid:
+            # Schritt 1: Direkt mit gespeicherten TP/SL-IDs stornieren via ib.client.cancelOrder().
+            # Dieser Low-Level-Aufruf sendet den Cancel direkt an IB ohne ib_insync Trade-Lookup —
+            # funktioniert auch nach Neustart wenn ib.trades() orderId=0 zeigt.
+            for label, stored_oid in [('TP', info.get('tp_order_id', 0)),
+                                       ('SL', info.get('sl_order_id', 0))]:
+                if not stored_oid or stored_oid <= 0:
                     continue
-                for t in ib.openTrades():
-                    if t.order.orderId == oid:
-                        _expected_cancels.add(oid)
-                        ib.cancelOrder(t.order)
-                        log(f"  🗑  [{symbol}] {label}-Order #{oid} storniert (vor Exit)")
-                        break
+                try:
+                    _expected_cancels.add(stored_oid)
+                    ib.client.cancelOrder(stored_oid, '')
+                    cancelled_ids.add(stored_oid)
+                    log(f"  🗑  [{symbol}] {label}-Order #{stored_oid} storniert (direkt)")
+                except Exception as e:
+                    log(f"  ⚠️  [{symbol}] {label}-Cancel #{stored_oid} fehlgeschlagen: {e}")
 
-            # Schritt 2: Alle weiteren aktiven Orders mit gültiger orderId (z.B. Entry-Order)
-            seen_ids = {info.get('tp_order_id', 0), info.get('sl_order_id', 0)}
+            # Schritt 2: Sweep — weitere aktive Orders mit bekannter orderId stornieren
             for t in ib.trades():
                 if t.contract.symbol != symbol:
                     continue
                 if t.orderStatus.status not in active_statuses:
                     continue
                 oid = t.order.orderId or 0
-                if oid == 0:
-                    # orderId=0: Order aus alter Session — cancelOrder nicht möglich (Error 10147)
-                    log(f"  ⚠️  [{symbol}] Order permId={t.order.permId or '?'} hat orderId=0 "
-                        f"— bitte manuell in IBKR/TWS prüfen und ggf. stornieren")
+                if oid <= 0 or oid in cancelled_ids:
                     continue
-                if oid in seen_ids:
-                    continue  # bereits oben behandelt
-                seen_ids.add(oid)
                 _expected_cancels.add(oid)
-                ib.cancelOrder(t.order)
-                log(f"  🗑  [{symbol}] Order #{oid} storniert (vor Exit)")
+                ib.client.cancelOrder(oid, '')
+                cancelled_ids.add(oid)
+                log(f"  🗑  [{symbol}] Order #{oid} storniert (Sweep)")
 
-            # Warten bis IB Stornierungen bestätigt (asyncio.sleep — nicht ib.sleep, da im async-Kontext)
-            await asyncio.sleep(1.0)
+            if cancelled_ids:
+                await asyncio.sleep(1.0)
 
-            # Sicherheits-Check: nur cancellierbare Orders (orderId > 0) prüfen
+            # Sicherheits-Check: aktive Orders mit bekannter orderId
             remaining = [
                 t for t in ib.trades()
                 if t.contract.symbol == symbol
@@ -925,7 +923,7 @@ async def close_spread(ib, symbol, info, reason):
             if remaining:
                 ids = [t.order.orderId for t in remaining]
                 log(f"  ❌ [{symbol}] Exit abgebrochen — {len(remaining)} Order(s) noch aktiv "
-                    f"nach Stornierung: {ids}. Bitte manuell prüfen!")
+                    f"nach Stornierung: {ids}. Bitte manuell in IBKR/TWS stornieren!")
                 info['status'] = 'open'
                 return
 
