@@ -976,7 +976,12 @@ async def monitor_exits(ib=None):
         if current is None:
             continue
 
-        entry      = info['entry_per_share']
+        entry = info['entry_per_share']
+        if not entry or entry <= 0:
+            log(f"  ⚠️  [{symbol}] Einstiegspreis nicht bekannt — P&L-Anzeige deaktiviert "
+                f"(Bot-Neustart während offener Position?)")
+            continue
+
         pnl_share  = entry - current
         pnl_dollar = pnl_share * 100
         pnl_pct    = (pnl_share / entry * 100) if entry > 0 else 0
@@ -1394,11 +1399,16 @@ async def run_bot(stop_event: threading.Event = None):
             put_by_sym.setdefault(sym, []).append(p)
 
         for sym, legs in put_by_sym.items():
-            if sym in _bot_trades:
+            existing = _bot_trades.get(sym, {})
+            # Überspringen nur wenn bereits ein valider Einstiegspreis bekannt ist
+            if existing.get('entry_per_share', 0) > 0:
                 continue
             short_legs = [p for p in legs if p.position < 0]
             long_legs  = [p for p in legs if p.position > 0]
-            entry: dict = {'status': 'open', 'at_breakeven': False, 'entry_per_share': 0}
+            # Vorhandene State-Daten (strikes, conids, tp/sl-IDs) erhalten, nur Preis ergänzen
+            entry: dict = {**existing, 'status': existing.get('status', 'open'),
+                           'at_breakeven': existing.get('at_breakeven', False),
+                           'entry_per_share': 0}
 
             if short_legs:
                 sl = max(short_legs, key=lambda x: x.contract.strike)
@@ -1406,7 +1416,9 @@ async def run_bot(stop_event: threading.Event = None):
                 entry['short_conid']  = sl.contract.conId
                 raw = abs(sl.avgCost)
                 # IB gibt avgCost per-Kontrakt (×100) zurück → pro Share umrechnen
-                entry['entry_per_share'] = raw / 100 if raw > 10 else raw
+                recovered = raw / 100 if raw > 10 else raw
+                if recovered > 0:
+                    entry['entry_per_share'] = recovered
                 exp = sl.contract.lastTradeDateOrContractMonth
                 try:
                     entry['expiry_yf'] = datetime.strptime(exp[:8], '%Y%m%d').strftime('%Y-%m-%d')
@@ -1419,10 +1431,26 @@ async def run_bot(stop_event: threading.Event = None):
                 entry['long_conid']  = ll.contract.conId
                 raw_paid = abs(ll.avgCost)
                 paid = raw_paid / 100 if raw_paid > 10 else raw_paid
-                entry['entry_per_share'] = max(0, entry.get('entry_per_share', 0) - paid)
+                if entry['entry_per_share'] > 0:
+                    entry['entry_per_share'] = max(0, entry['entry_per_share'] - paid)
 
+            # avgCost=0 im Demo-Konto: Fallback auf Limit-Preis der offenen Entry-Order
+            if entry['entry_per_share'] <= 0:
+                for ot in ib.openTrades():
+                    if ot.contract.symbol == sym and abs(ot.order.lmtPrice or 0) > 0:
+                        fallback = abs(ot.order.lmtPrice)
+                        entry['entry_per_share'] = fallback
+                        log(f"  ⚠️  [{sym}] avgCost=0 (Demo) — Einstiegspreis von Limit-Order: ${fallback:.2f}")
+                        break
+
+            if entry['entry_per_share'] <= 0:
+                log(f"  ⚠️  [{sym}] Einstiegspreis konnte nicht rekonstruiert werden — "
+                    f"P&L-Anzeige deaktiviert bis zur nächsten Füllung")
+
+            was_known = sym in _bot_trades
             _bot_trades[sym] = entry
-            pre_loaded += 1
+            if not was_known:
+                pre_loaded += 1
 
         if pre_loaded:
             log(f"   {pre_loaded} bestehende Order(s)/Position(en) aus IB geladen — werden nicht dupliziert")
