@@ -140,9 +140,9 @@ MIN_CREDIT_ABS     = 15    # Absolutes Minimum als Sicherheitsboden ($)
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
-MAX_PROBABILITY  = 0.85    # nur noch für Display-Hinweis (kein Hard-Block)
-MAX_LOSS_PROB    = 0.20    # nur noch für Score-Penalty (kein Hard-Block)
-MIN_EV_RATIO     = 0.005   # nur noch für Score-Penalty
+MAX_PROBABILITY  = 0.85    # Hard-Block: P(Win) > 85% → Credit zu klein
+MAX_LOSS_PROB    = 0.20    # Hard-Block: P(MaxVerlust) > 20% → Totalverlustrisiko zu hoch
+MIN_EV_RATIO     = 0.005   # Hard-Block: EV < 0.5% des Credits → statistisch kein Vorteil
 
 # Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
 ENTRY_THRESHOLD  = 0.60    # Score ≥ 0.60: Trade-Kandidat (war 0.70)
@@ -1202,6 +1202,23 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         ev        = (prob_otm * eff_credit) - (prob_max_loss * max_risk)
         ev_raw    = (prob_otm * credit)     - (prob_max_loss * max_risk)   # ohne Slippage (Info)
         ev_ratio  = ev / eff_credit if eff_credit > 0 else 0.0
+
+        # ── Hard-Gates (vor Score, kein Penalty-Ausgleich möglich) ──────
+        if prob_otm > MAX_PROBABILITY:
+            log(f"   [{symbol}] ✗ P(Win)={prob_otm:.1%} > {MAX_PROBABILITY:.0%} — Credit zu klein, überspringe")
+            _shadow_partial(symbol, preis, iv, 'prob_otm', f"P(Win)={prob_otm:.1%}>{MAX_PROBABILITY:.0%}",
+                            short_strike=short_strike)
+            return None
+        if prob_max_loss > MAX_LOSS_PROB:
+            log(f"   [{symbol}] ✗ P(MaxVerlust)={prob_max_loss:.1%} > {MAX_LOSS_PROB:.0%} — Totalverlustrisiko zu hoch")
+            _shadow_partial(symbol, preis, iv, 'prob_max_loss', f"P(MaxL)={prob_max_loss:.1%}>{MAX_LOSS_PROB:.0%}",
+                            short_strike=short_strike)
+            return None
+        if ev_ratio < MIN_EV_RATIO:
+            log(f"   [{symbol}] ✗ EV-Ratio={ev_ratio:.3f} < {MIN_EV_RATIO} — kein statistischer Vorteil")
+            _shadow_partial(symbol, preis, iv, 'ev_ratio', f"EV-Ratio={ev_ratio:.3f}<{MIN_EV_RATIO}",
+                            short_strike=short_strike)
+            return None
 
         # ── Deterministischer 4-Komponenten Score ────────────────────────
         _iv_penalty  = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
