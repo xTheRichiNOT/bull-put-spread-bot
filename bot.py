@@ -880,15 +880,46 @@ async def close_spread(ib, symbol, info, reason):
             log(f"  🧹 [{symbol}] Bereinige offene Orders vor Exit ...")
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
+
+            active_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel'}
             cancelled_count = 0
-            for t in ib.openTrades():
-                if t.contract.symbol == symbol:
-                    _expected_cancels.add(t.order.orderId)
+            for t in ib.trades():
+                if t.contract.symbol != symbol:
+                    continue
+                if t.orderStatus.status not in active_statuses:
+                    continue
+                oid = t.order.orderId or 0
+                if oid > 0:
+                    _expected_cancels.add(oid)
                     ib.cancelOrder(t.order)
-                    cancelled_count += 1
-                    log(f"  🗑  [{symbol}] Order #{t.order.orderId} storniert (vor Exit)")
+                    log(f"  🗑  [{symbol}] Order #{oid} storniert (vor Exit)")
+                elif t.order.permId:
+                    # orderId=0 bei Bracket-Legs möglich — permId als Fallback
+                    _expected_cancels.add(t.order.permId)
+                    ib.cancelOrder(t.order)
+                    log(f"  🗑  [{symbol}] Order permId={t.order.permId} storniert (vor Exit)")
+                else:
+                    log(f"  ⚠️  [{symbol}] Order ohne gültige ID — Stornierung übersprungen")
+                    continue
+                cancelled_count += 1
+
             if cancelled_count > 0:
-                await asyncio.sleep(1.5)  # warten bis IB Stornierung bestätigt
+                # ib.sleep pumpt den Event-Loop — IB bestätigt Cancelled-Status synchron
+                await ib.reqAllOpenOrdersAsync()
+                ib.sleep(1)
+
+                # Sicherheits-Check: Falls noch aktive Orders vorhanden → Exit abbrechen
+                remaining = [
+                    t for t in ib.trades()
+                    if t.contract.symbol == symbol
+                    and t.orderStatus.status in active_statuses
+                ]
+                if remaining:
+                    ids = [t.order.orderId or t.order.permId for t in remaining]
+                    log(f"  ❌ [{symbol}] Exit abgebrochen — {len(remaining)} Order(s) noch aktiv "
+                        f"nach Stornierung: {ids}. Bitte manuell prüfen!")
+                    info['status'] = 'open'  # Status zurücksetzen
+                    return
 
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
