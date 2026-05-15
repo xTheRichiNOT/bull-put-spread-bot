@@ -7,6 +7,9 @@ import queue
 import random
 import logging
 import threading
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="ib_insync")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="eventkit")
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -1342,7 +1345,8 @@ async def close_spread(ib, symbol, info, reason):
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
 
-            active_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel'}
+            blocking_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit'}
+            active_statuses   = blocking_statuses | {'PendingCancel'}
             cancelled_ids: set = set()
 
             # Schritt 1: Direkt mit gespeicherten TP/SL-IDs stornieren via ib.client.cancelOrder().
@@ -1379,13 +1383,13 @@ async def close_spread(ib, symbol, info, reason):
             # orderId=0-Orders (aus alter Session) werden EINGESCHLOSSEN — kein Filter.
             cancel_confirmed = False
             still_active: list = []
-            for _attempt in range(20):          # 20 × 0.5s = 10s Timeout (User-Anforderung)
+            for _attempt in range(40):          # 40 × 0.5s = 20s Timeout
                 await asyncio.sleep(0.5)
                 fresh = await ib.reqAllOpenOrdersAsync()
                 still_active = [
                     t for t in (fresh if fresh else ib.openTrades())
                     if t.contract.symbol == symbol
-                    and t.orderStatus.status in active_statuses
+                    and t.orderStatus.status in blocking_statuses
                 ]
                 if not still_active:
                     cancel_confirmed = True
@@ -1408,15 +1412,32 @@ async def close_spread(ib, symbol, info, reason):
                 # Reconciliation: lokaler Cache kann veraltet sein — IB-Server-Wahrheit prüfen.
                 # Manchmal bestätigt IB serversseitig einen Cancel, aber ib_insync hat es noch
                 # nicht verarbeitet. 2s extra warten und nochmals frisch abfragen.
-                log(f"  🔄 [{symbol}] Timeout (10s) — Reconciliation-Check (2s Extra-Puffer) ...")
+                log(f"  🔄 [{symbol}] Timeout (20s) — Reconciliation-Check (5s Extra-Puffer) ...")
                 info['status'] = 'recovery_pending'
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0)
                 fresh_recon = await ib.reqAllOpenOrdersAsync()
                 recon_active = [
                     t for t in (fresh_recon if fresh_recon else ib.openTrades())
                     if t.contract.symbol == symbol
-                    and t.orderStatus.status in active_statuses
+                    and t.orderStatus.status in blocking_statuses
                 ]
+                # Position-Check: Nettoposition = 0 → nur verwaiste Orders, kein echtes Risiko mehr
+                if recon_active:
+                    _sym_opts = [p for p in ib.portfolio()
+                                 if p.contract.symbol == symbol
+                                 and p.contract.secType == 'OPT'
+                                 and p.position != 0]
+                    if not _sym_opts:
+                        log(f"  ✅ [{symbol}] Nettoposition = 0 — verwaiste Orders werden bereinigt")
+                        for _t in recon_active:
+                            _oid = _t.order.orderId or 0
+                            if _oid > 0:
+                                try:
+                                    ib.client.cancelOrder(_oid, '')
+                                except Exception:
+                                    pass
+                        cancel_confirmed = True
+                        recon_active = []
                 if recon_active:
                     remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
                                      for t in recon_active]
@@ -1445,7 +1466,7 @@ async def close_spread(ib, symbol, info, reason):
                     final_active = [
                         t for t in (final_check if final_check else ib.openTrades())
                         if t.contract.symbol == symbol
-                        and t.orderStatus.status in active_statuses
+                        and t.orderStatus.status in blocking_statuses
                     ]
                     if final_active:
                         final_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
@@ -2497,6 +2518,13 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"  🔒 EVENT-LOCK ({_ev_reason}) — {len(selected)} Trade(s) blockiert")
                 for _s in selected:
                     _shadow_from_sig(_s, 'blocked', 'event_lock', _ev_reason)
+                selected = []
+            # Exit-Reconciliation: keine neuen Entries solange EXIT_RETRY aktiv
+            _retry_syms = [s for s, v in _bot_trades.items() if v.get('status') == 'exit_retry']
+            if _retry_syms and selected:
+                log(f"  ⏸️  Neue Entries pausiert — EXIT_RETRY aktiv: {_retry_syms}")
+                for _s in selected:
+                    _shadow_from_sig(_s, 'blocked', 'exit_retry', f"EXIT_RETRY: {_retry_syms}")
                 selected = []
 
             for sig in selected:
