@@ -14,5 +14,10 @@
   "take_profit_pct": 0.5,
   "stop_loss_mult": 2.0,
   "dte_exit": 21,
-  "min_available_funds": 2000
+  "min_available_funds": 2000,
+  "max_daily_loss": 500,
+  "max_weekly_loss": 0,
+  "max_risk_per_trade_pct": 0.02,
+  "max_total_risk_pct": 0.15,
+  "earnings_buffer_days": 14
 }

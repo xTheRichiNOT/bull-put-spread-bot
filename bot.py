@@ -45,6 +45,11 @@ _cfg_defaults = {
     "max_per_sector": 2, "scan_intervall": 60, "auto_trade": True,
     "take_profit_pct": 0.50, "stop_loss_mult": 2.0, "dte_exit": 21,
     "min_available_funds": 2000,
+    "max_daily_loss": 500,          # Kill-Switch: max Tagesverlust in $ (0 = disabled)
+    "max_weekly_loss": 0,           # Kill-Switch: max Wochenverlust in $ (0 = disabled)
+    "max_risk_per_trade_pct": 0.02, # max 2 % NetLiq-Risiko pro Trade
+    "max_total_risk_pct": 0.15,     # max 15 % NetLiq-Risiko gesamt offen
+    "earnings_buffer_days": 14,     # kein Trade wenn Earnings < X Tage entfernt oder vor Expiry
 }
 if os.path.exists(_cfg_path):
     try:
@@ -155,6 +160,25 @@ PRICE_CONFIDENCE: dict[str, float] = {
 }
 MIN_CONFIDENCE_LIVE  = 0.9   # Live: mindestens echtes Bid/Ask erforderlich
 MIN_CONFIDENCE_PAPER = 0.3   # Demo: BS erlaubt, aber IV>25% und Kurs valid
+
+# Kill-Switch
+MAX_DAILY_LOSS         = float(_cfg.get('max_daily_loss', 500))    # 0 = disabled
+MAX_WEEKLY_LOSS        = float(_cfg.get('max_weekly_loss', 0))      # 0 = disabled
+
+# Account-Risk Limits
+MAX_RISK_PER_TRADE_PCT = float(_cfg.get('max_risk_per_trade_pct', 0.02))
+MAX_TOTAL_RISK_PCT     = float(_cfg.get('max_total_risk_pct', 0.15))
+
+# Earnings-Filter
+EARNINGS_BUFFER_DAYS   = int(_cfg.get('earnings_buffer_days', 14))
+
+# Position-Sizing je nach Preis-Confidence (REAL_BID_ASK=3, MIDPRICE=2, sonst=1)
+CONTRACTS_BY_CONFIDENCE = {
+    'REAL_BID_ASK': 3,
+    'MIDPRICE':     2,
+    'LAST_PRICE':   1,
+    'BS_ESTIMATE':  1,
+}
 
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
@@ -279,6 +303,10 @@ def _sym_lock(symbol: str) -> asyncio.Lock:
 # Demo/Live-Modus — wird beim Start via Kontonummer gesetzt
 IS_DEMO_MODE: bool = False
 ACCOUNT_ID:   str  = ''
+
+# Kill-Switch: True wenn Tages-/Wochenverlust-Limit überschritten
+_kill_switch_active: bool  = False
+_kill_switch_reason: str   = ''
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -765,6 +793,77 @@ async def check_news_trigger(symbol):
     except (asyncio.TimeoutError, Exception):
         return False, None
 
+async def check_earnings_conflict(symbol: str, expiry_str: str) -> tuple:
+    """Prüft ob Earnings vor Expiry oder innerhalb EARNINGS_BUFFER_DAYS liegen.
+    Gibt (True, reason) wenn blockiert, sonst (False, '')."""
+    def _fetch():
+        import yfinance as yf
+        from datetime import date as date_t
+        today = date_t.today()
+        expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
+        cal = yf.Ticker(symbol).calendar
+        if cal is None:
+            return False, ''
+        if isinstance(cal, dict):
+            raw_dates = cal.get('Earnings Date', [])
+        else:
+            try:
+                raw_dates = cal.loc['Earnings Date'].tolist()
+            except Exception:
+                return False, ''
+        for d in (raw_dates or []):
+            try:
+                ed = d.date() if hasattr(d, 'date') else datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
+                if ed < today:
+                    continue
+                if ed <= expiry_date:
+                    return True, f"Earnings {ed} vor Expiry {expiry_str}"
+                if (ed - today).days <= EARNINGS_BUFFER_DAYS:
+                    return True, f"Earnings {ed} in {(ed - today).days}d (Buffer={EARNINGS_BUFFER_DAYS}d)"
+            except Exception:
+                continue
+        return False, ''
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15)
+    except Exception:
+        return False, ''
+
+
+async def check_kill_switch(ib) -> bool:
+    """Liest Tages-P&L aus IBKR; setzt _kill_switch_active wenn Limit überschritten.
+    Gibt True zurück wenn Trading gestoppt werden soll."""
+    global _kill_switch_active, _kill_switch_reason
+    if _kill_switch_active:
+        return True
+    if MAX_DAILY_LOSS <= 0 and MAX_WEEKLY_LOSS <= 0:
+        return False
+    if not ib or not ib.isConnected():
+        return False
+    try:
+        acct_vals = ib.accountValues()
+        def _val(tag):
+            for v in acct_vals:
+                if v.tag == tag and v.currency in ('USD', '') and v.value not in ('', '-'):
+                    try:
+                        return float(v.value)
+                    except Exception:
+                        pass
+            return None
+        day_pnl = _val('DayPnL')
+        if day_pnl is None:
+            realized   = _val('RealizedPnL') or 0.0
+            unrealized = _val('UnrealizedPnL') or 0.0
+            day_pnl = realized + unrealized
+        if MAX_DAILY_LOSS > 0 and day_pnl < -MAX_DAILY_LOSS:
+            _kill_switch_reason = f"Tages-P&L ${day_pnl:+.0f} < -${MAX_DAILY_LOSS:.0f}"
+            _kill_switch_active = True
+            log(f"  🛑 KILL-SWITCH aktiv: {_kill_switch_reason} — kein neuer Trade bis Neustart")
+            return True
+    except Exception as e:
+        log(f"  ⚠️  Kill-Switch-Check fehlgeschlagen: {e}")
+    return False
+
+
 async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
     """
     Berechnet den Bull-Put-Spread für ein Symbol.
@@ -792,6 +891,12 @@ async def fetch_signal(symbol, preis, iv, ib=None, news_hit: bool = False):
     try:
         expiry_yf, puts, dte = await asyncio.wait_for(asyncio.to_thread(_fetch_chain), timeout=30)
         if puts is None or puts.empty:
+            return None
+
+        # Earnings-Filter: kein Trade wenn Earnings vor Expiry oder innerhalb Buffer
+        conflict, conflict_reason = await check_earnings_conflict(symbol, expiry_yf)
+        if conflict:
+            log(f"   [{symbol}] 🚫 Earnings-Konflikt: {conflict_reason} — überspringe")
             return None
 
         # Short Strike: nächster echter Strike ~OTM unter Kurs
@@ -1476,6 +1581,47 @@ async def place_order(ib, sig):
 
             expiry_yf = sig['expiry_ib'][:4] + '-' + sig['expiry_ib'][4:6] + '-' + sig['expiry_ib'][6:]
 
+            # ── Account-Risk-Check + Position Sizing ──────────────────────────
+            spread_risk_usd = sig['breite'] * 100   # max. Verlust pro Kontrakt
+            net_liq = 0.0
+            try:
+                _av = {v.tag: v.value for v in ib.accountValues() if v.currency == 'USD'}
+                raw_nl = (_av.get('NetLiquidation') or _av.get('NetLiquidation-S') or '0')
+                net_liq = float(raw_nl) if raw_nl else 0.0
+            except Exception:
+                pass
+
+            if net_liq > 0:
+                per_trade_pct = spread_risk_usd / net_liq
+                if per_trade_pct > MAX_RISK_PER_TRADE_PCT:
+                    log(f"  ✗ [{sym}] Risiko {per_trade_pct:.1%} > {MAX_RISK_PER_TRADE_PCT:.1%} "
+                        f"(${spread_risk_usd:.0f} / ${net_liq:,.0f} NetLiq) — Trade abgebrochen")
+                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                    return
+                open_risk = sum(
+                    (info.get('short_strike', 0) - info.get('long_strike', 0)) * 100
+                    for s, info in _bot_trades.items()
+                    if s != sym and info.get('status') in ('open', 'closing', 'exit_retry')
+                    and info.get('short_conid')
+                )
+                total_pct = (open_risk + spread_risk_usd) / net_liq
+                if total_pct > MAX_TOTAL_RISK_PCT:
+                    log(f"  ✗ [{sym}] Gesamt-Risiko {total_pct:.1%} > {MAX_TOTAL_RISK_PCT:.1%} "
+                        f"(offen ${open_risk:.0f} + neu ${spread_risk_usd:.0f}) — Trade abgebrochen")
+                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                    return
+
+            # Position Sizing: Anzahl Kontrakte aus Confidence (max durch Risk-Limit begrenzt)
+            n_contracts_conf = CONTRACTS_BY_CONFIDENCE.get(price_src, 1)
+            if net_liq > 0 and MAX_RISK_PER_TRADE_PCT > 0 and spread_risk_usd > 0:
+                max_by_risk = max(1, int(net_liq * MAX_RISK_PER_TRADE_PCT / spread_risk_usd))
+                n_contracts = min(n_contracts_conf, max_by_risk)
+            else:
+                n_contracts = 1
+            if n_contracts > 1:
+                log(f"  📏 [{sym}] Position Sizing: {n_contracts} Kontrakte "
+                    f"[{price_src}, NetLiq=${net_liq:,.0f}, RiskLimit={MAX_RISK_PER_TRADE_PCT:.0%}]")
+
             _bot_trades[sym] = {
                 'entry_per_share': limit_price,
                 'expiry_yf':       expiry_yf,
@@ -1493,21 +1639,21 @@ async def place_order(ib, sig):
             tp_close = max(round(limit_price * (1 - TAKE_PROFIT_PCT), 2), 0.01)
             sl_close = round(limit_price * STOP_LOSS_MULT, 2)
 
-            entry_order = LimitOrder('BUY', 1, -limit_price, tif='GTC')
+            entry_order = LimitOrder('BUY', n_contracts, -limit_price, tif='GTC')
             entry_order.transmit = False
             entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
             entry_order.account = _cfg.get('ib_account', '')
             entry_trade = ib.placeOrder(bag, entry_order)
             parent_id = entry_trade.order.orderId
 
-            tp_order = LimitOrder('BUY', 1, tp_close, tif='GTC')
+            tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
             tp_order.parentId = parent_id
             tp_order.transmit = False
             tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
             tp_order.account = _cfg.get('ib_account', '')
             tp_trade = ib.placeOrder(bag, tp_order)
 
-            sl_order = LimitOrder('BUY', 1, sl_close, tif='GTC')
+            sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
             sl_order.parentId = parent_id
             sl_order.transmit = True
             sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
@@ -1519,10 +1665,10 @@ async def place_order(ib, sig):
             _save_state()
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
-            log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC)")
-            log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit:.0f})  R/R: {market_rr:.2f}x")
-            log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100:.0f})")
-            log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100:.0f})")
+            log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
+            log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+            log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
+            log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
     except Exception as e:
         import traceback
         log(f"  ❌ [{sym}] Order-Fehler: {e}\n{traceback.format_exc()}")
@@ -1756,6 +1902,16 @@ async def run_bot(stop_event: threading.Event = None):
                     chunk = min(30, wait_sec - slept)
                     await asyncio.sleep(chunk)
                     slept += chunk
+                continue
+
+            # ── Kill-Switch-Check ─────────────────────────────────────────────
+            if await check_kill_switch(ib):
+                log(f"  🛑 KILL-SWITCH aktiv ({_kill_switch_reason}) — Scan übersprungen, nur Exit-Monitoring läuft")
+                log(f"  Pause {SCAN_INTERVALL}s ...")
+                for _ in range(SCAN_INTERVALL):
+                    if stop_event and stop_event.is_set():
+                        break
+                    await asyncio.sleep(1)
                 continue
 
             # ── Phase 1a: IB-Batch-Scan (8 Symbole pro Batch) ───────────────
