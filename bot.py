@@ -254,6 +254,9 @@ _strike_map: dict = {}
 _expected_cancels: set = set()
 # Begrenzt gleichzeitige IB reqMktData-Aufrufe — verhindert Error 101 (Max Tickers)
 _sem_ib_mktdata: asyncio.Semaphore | None = None
+# Demo/Live-Modus — wird beim Start via Kontonummer gesetzt
+IS_DEMO_MODE: bool = False
+ACCOUNT_ID:   str  = ''
 
 _STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
@@ -1090,7 +1093,10 @@ async def place_order(ib, sig):
         has_real_bid = t_short.bid and t_short.bid > 0
         has_model    = not has_real_bid and (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
         discount     = 0.75 if (has_real_bid or has_model) else 0.65
-        limit_price  = round(max(ibkr_net * discount, 0.01), 2)
+        # Demo: 2 Cents toleranter → höhere Ausführungswahrscheinlichkeit mit Delayed-Daten
+        # Live: exakter Mid-Point ohne Anpassung
+        demo_adj    = -0.02 if IS_DEMO_MODE else 0.0
+        limit_price = round(max(ibkr_net * discount + demo_adj, 0.01), 2)
         quelle = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
         # Bei theoretischen Preisen (kein echtes Bid) strengeres R/R-Minimum:
         # modelGreeks kann bei illiquiden Options stark vom Markt abweichen (KLAC: 10× daneben)
@@ -1208,6 +1214,33 @@ def print_ranking(signals, selected):
             log(f"       ↳ {triggers}")
     log(f"{'─'*108}")
 
+async def configure_environment(ib) -> bool:
+    """Erkennt Demo/Live-Modus anhand der Kontonummer und konfiguriert IB entsprechend.
+    Demo-Konten bei IBKR beginnen mit 'D' (z.B. DU123456).
+    Gibt True zurück wenn Demo-Modus aktiv, sonst False."""
+    global IS_DEMO_MODE, ACCOUNT_ID
+    accounts = ib.managedAccounts()
+    ACCOUNT_ID = accounts[0] if accounts else _cfg.get('ib_account', '')
+    IS_DEMO_MODE = ACCOUNT_ID.upper().startswith('D')
+
+    if IS_DEMO_MODE:
+        ib.reqMarketDataType(3)   # Delayed data
+        log("=" * 60)
+        log("  MODUS: DEMO / PAPER-TRADING  (Konto: " + ACCOUNT_ID + ")")
+        log("  Delayed-Daten aktiv — BS-Schätzungen erlaubt")
+        log("  Orders werden mit Toleranz +/-$0.02 platziert")
+        log("=" * 60)
+    else:
+        ib.reqMarketDataType(1)   # Live Echtzeit-Daten
+        log("=" * 60)
+        log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
+        log("  Echtzeit-Daten aktiv — nur echtes Bid/Ask erlaubt")
+        log("  Strikte Limit-Orders am exakten Mid-Point")
+        log("=" * 60)
+
+    return IS_DEMO_MODE
+
+
 async def run_bot(stop_event: threading.Event = None):
     ib = IB()
     log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7497)})")
@@ -1221,8 +1254,8 @@ async def run_bot(stop_event: threading.Event = None):
         )
         log("✅ Verbunden mit IB (nur für Order-Placement)")
 
-        # Verzögerte Marktdaten aktivieren (Typ 3) — kein Echtzeit-Abo nötig
-        ib.reqMarketDataType(3)
+        # Demo/Live erkennen und Marktdaten-Typ + Modus-Banner konfigurieren
+        await configure_environment(ib)
 
         # Event-Handler: gecancelte Orders in Echtzeit tracken
         ib.orderStatusEvent += _on_order_status
@@ -1429,12 +1462,14 @@ async def run_bot(stop_event: threading.Event = None):
             results     = [r for r in results if not isinstance(r, BaseException)]
             all_signals = [s for s in results if s is not None]
             elapsed = (datetime.now() - t0).seconds
-            log(f"\n   Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
+            modus_str = "[DEMO]" if IS_DEMO_MODE else "[LIVE]"
+            log(f"\n   {modus_str} Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
 
             # ── Phase 2: Signale filtern und ranken ───────────────────────────
+            # Im Demo-Modus: BS-Schätzungen erlaubt (kein Echtzeit-Feed verfügbar)
             qualified = [
                 s for s in all_signals
-                if s['praemie_quelle'] != "Black-Scholes (geschätzt)"
+                if (IS_DEMO_MODE or s['praemie_quelle'] != "Black-Scholes (geschätzt)")
                 and _check_credit(s['credit'], s['breite'], s.get('prob_otm', 0))[0]
                 and s['risk_reward']            >= MIN_RISK_REWARD
                 and s['prob_otm']               <= MAX_PROBABILITY
@@ -1509,8 +1544,8 @@ async def run_bot(stop_event: threading.Event = None):
                 blocked = [s for s in all_signals if s not in tradeable]
                 for s in blocked:
                     reasons = []
-                    if s['praemie_quelle'] == "Black-Scholes (geschätzt)":
-                        reasons.append("kein echtes Bid (BS-Schätzung)")
+                    if s['praemie_quelle'] == "Black-Scholes (geschätzt)" and not IS_DEMO_MODE:
+                        reasons.append("kein echtes Bid (BS-Schätzung) — Live-Modus erfordert echtes Bid")
                     _c, _p, _b = s['credit'], s.get('prob_otm', 0), s['breite']
                     _credit_ok, _req, _req_pwin = _check_credit(_c, _b, _p)
                     if not _credit_ok:
