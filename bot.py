@@ -1206,9 +1206,16 @@ async def place_order(ib, sig):
                         long_ask  = long_last
                         log(f"  ⚠️  [{sym}] Kein Bid/Ask, kein Greek — Last-Preis: Short ${short_last:.2f}  Long ${long_last:.2f}")
                     else:
-                        log(f"  ✗ [{sym}] Keine Preisdaten verfügbar — Trade abgebrochen")
-                        _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                        return
+                        if IS_DEMO_MODE and sig.get('praemie', 0) > 0:
+                            # PAPER MODE: Alle IB-Fallbacks erschöpft → BS/yfinance-Schätzung aus Scan-Phase
+                            short_bid = sig['praemie']
+                            long_ask  = 0.0
+                            log(f"  ⚠️  [{sym}] PAPER MODE: Keine IB-Marktdaten — "
+                                f"Scan-Schätzung ${sig['praemie']:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                        else:
+                            log(f"  ✗ [{sym}] Keine Preisdaten verfügbar — Trade abgebrochen")
+                            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                            return
 
         has_real_bid = t_short.bid and t_short.bid > 0
         has_real_ask = t_long.ask  and t_long.ask  > 0
@@ -1225,6 +1232,11 @@ async def place_order(ib, sig):
             short_val = _mid(t_short, short_bid)
             long_val  = _mid(t_long,  long_ask)
             ibkr_net  = round(short_val - long_val, 2)
+            # Wenn Mid-Point negativ/null → Scan-Schätzung als Fallback (Demo-Daten oft verzerrt)
+            if ibkr_net <= 0 and sig.get('praemie', 0) > 0:
+                ibkr_net = sig['praemie']
+                log(f"  ⚠️  [{sym}] PAPER MODE: Mid-Point ≤0 — "
+                    f"Scan-Schätzung ${ibkr_net:.2f}/Share ({sig.get('praemie_quelle','?')})")
             limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
             quelle = "Mid-Point (Demo)"
         else:
