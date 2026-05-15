@@ -130,8 +130,8 @@ MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
-MIN_CREDIT_PERCENT = 0.12   # 12 % der Spread-Breite als Mindest-Credit
-MIN_CREDIT_ABS     = 45    # Absolutes Minimum unabhängig von der Breite ($)
+MIN_CREDIT_PERCENT = 0.18   # 18 % der Spread-Breite als Mindest-Credit (relativ)
+MIN_CREDIT_ABS     = 15    # Absolutes Minimum als Sicherheitsboden ($)
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
@@ -140,8 +140,8 @@ MAX_LOSS_PROB    = 0.20    # nur noch für Score-Penalty (kein Hard-Block)
 MIN_EV_RATIO     = 0.005   # nur noch für Score-Penalty
 
 # Decision Engine — ein einziger gewichteter Score entscheidet
-ENTRY_THRESHOLD  = 0.72    # Score >= 0.72: Trade
-WATCH_THRESHOLD  = 0.60    # Score 0.60–0.72: Watch (sichtbar, kein Trade)
+ENTRY_THRESHOLD  = 0.70    # Score >= 0.70: Trade
+WATCH_THRESHOLD  = 0.62    # Score 0.62–0.70: Watch (sichtbar, kein Trade)
 RATIO_TOLERANCE  = 0.20
 MIN_DTE          = 45
 MAX_DTE          = 60
@@ -585,10 +585,10 @@ class DecisionEngine:
               + 0.20 * s.dte_risk)
 
     def _quality(self, s: TradeContext) -> float:
-        return (0.10 * s.iv_expansion_confirmed
-              + 0.10 * s.tight_spread_bonus
-              + 0.10 * s.liquidity_bonus
-              + 0.10 * s.no_event_conflict)
+        return (0.07 * s.iv_expansion_confirmed
+              + 0.07 * s.tight_spread_bonus
+              + 0.07 * s.liquidity_bonus
+              + 0.07 * s.no_event_conflict)
 
     def compute_score(self, s: TradeContext) -> float:
         return self._edge(s) + self._quality(s) - self._risk(s)
@@ -1229,10 +1229,42 @@ async def close_spread(ib, symbol, info, reason):
                 if recon_active:
                     remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
                                      for t in recon_active]
-                    log(f"  ❌ [{symbol}] Reconciliation: {len(recon_active)} Order(s) auf IB-Server noch aktiv: "
-                        f"{remaining_ids} — Exit abgebrochen. Bitte manuell in IBKR/TWS stornieren!")
-                    info['status'] = 'open'
-                    return
+                    log(f"  🔁 [{symbol}] Reconciliation: {len(recon_active)} Order(s) noch aktiv {remaining_ids}"
+                        f" — Hard-Sweep + 5s Extra-Wartezeit ...")
+                    # Hard-Sweep: ALLE aktiven Orders für dieses Symbol nochmals korrekt stornieren
+                    for t in recon_active:
+                        oid = t.order.orderId or 0
+                        if oid > 0:
+                            _expected_cancels.add(oid)
+                            try:
+                                ib.client.cancelOrder(oid, '')
+                            except Exception:
+                                pass
+                    # Gespeicherte TP/SL nochmals direkt
+                    for _, stored_oid in [('TP', info.get('tp_order_id', 0)),
+                                          ('SL', info.get('sl_order_id', 0))]:
+                        if stored_oid and stored_oid > 0:
+                            _expected_cancels.add(stored_oid)
+                            try:
+                                ib.client.cancelOrder(stored_oid, '')
+                            except Exception:
+                                pass
+                    await asyncio.sleep(5.0)
+                    final_check = await ib.reqAllOpenOrdersAsync()
+                    final_active = [
+                        t for t in (final_check if final_check else ib.openTrades())
+                        if t.contract.symbol == symbol
+                        and t.orderStatus.status in active_statuses
+                    ]
+                    if final_active:
+                        final_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
+                                     for t in final_active]
+                        log(f"  ❌ [{symbol}] Hard-Sweep fehlgeschlagen: {len(final_active)} Orders "
+                            f"noch aktiv {final_ids} — EXIT_RETRY in 60s. Bitte ggf. in TWS prüfen!")
+                        retry_ts = (datetime.now() + timedelta(seconds=60)).timestamp()
+                        info['status']   = 'exit_retry'
+                        info['retry_at'] = retry_ts
+                        return
                 log(f"  ✅ [{symbol}] Reconciliation: Orders serversseitig bestätigt (lokaler Cache war veraltet)")
                 cancel_confirmed = True
 
@@ -1309,6 +1341,7 @@ async def monitor_exits(ib=None):
         )
         if current is None:
             continue
+        current = max(0.0, current)   # IB/yfinance kann negative Werte liefern wenn long > short
 
         entry = info['entry_per_share']
         if not entry or entry <= 0:
