@@ -587,7 +587,7 @@ async def fetch_signal(symbol, preis, iv, ib=None):
 
         # ── Strike-Snapping: yfinance-Strikes auf IB-valide Werte anpassen ──────
         # Verhindert "Qualifizierung fehlgeschlagen" für Strikes die IB nicht kennt
-        expiry_ib_str = expiry_str.replace('-', '')
+        expiry_ib_str = expiry_yf.replace('-', '')
         if symbol in _strike_map and _strike_map[symbol]['strikes']:
             ib_strikes = _strike_map[symbol]['strikes']
             # Short Strike: nächster IB-Strike unter Kurs, nahe am Ziel
