@@ -139,6 +139,7 @@ SCAN_INTERVALL   = int(_cfg['scan_intervall'])
 MAX_POSITIONS    = int(_cfg['max_positions'])
 MAX_PER_SECTOR   = int(_cfg['max_per_sector'])
 AUTO_TRADE       = bool(_cfg['auto_trade'])
+IB_SCAN_BATCH    = 20   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
 
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
@@ -526,6 +527,38 @@ async def _get_market_data_yf(symbol):
     except Exception as e:
         log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
+
+async def _batch_ib_price_scan(batch: list, ib) -> dict:
+    """Abonniert bis zu IB_SCAN_BATCH Symbole gleichzeitig, wartet 2s, cancelt alle.
+    Gibt {symbol: (price, iv)} zurück — nur Symbole mit mindestens einem Preis."""
+    import math as _math
+    from ib_insync import Stock as _Stock
+    tickers = {}
+    for sym in batch:
+        try:
+            tickers[sym] = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '106', False, False)
+        except Exception:
+            pass
+    await asyncio.sleep(2)
+    results = {}
+    for sym, t in tickers.items():
+        try:
+            ib.cancelMktData(t)
+        except Exception:
+            pass
+        price = None
+        for v in (t.last, t.close, t.bid):
+            if v and v > 0 and not _math.isnan(v):
+                price = float(v)
+                break
+        iv = None
+        if (t.impliedVolatility and not _math.isnan(t.impliedVolatility)
+                and t.impliedVolatility > 0):
+            iv = float(t.impliedVolatility)
+        if price is not None:
+            results[sym] = (price, iv)
+    return results
+
 
 async def check_news_trigger(symbol):
     """Sucht in yfinance-News nach Gewinnwarnung-Keywords.
@@ -1248,15 +1281,54 @@ async def run_bot(stop_event: threading.Event = None):
                     slept += chunk
                 continue
 
-            # ── Phase 1: Alle Symbole parallel scannen ───────────────────────
-            _sem = asyncio.Semaphore(10)  # max 10 gleichzeitige yfinance-Requests
+            # ── Phase 1a: IB-Batch-Scan (20 Symbole gleichzeitig) ────────────
+            # Jeder Batch: subscribe → 2s warten → Preise lesen → alle canceln.
+            # Verhindert Error 101 durch kontrollierte sequenzielle Batches.
+            t0 = datetime.now()
+            ib_price_data: dict = {}
+            if ib and ib.isConnected():
+                batches = [WATCHLIST[i:i + IB_SCAN_BATCH]
+                           for i in range(0, len(WATCHLIST), IB_SCAN_BATCH)]
+                for batch in batches:
+                    batch_result = await _batch_ib_price_scan(batch, ib)
+                    ib_price_data.update(batch_result)
+
+            # ── Phase 1b: yfinance-Fallback für fehlende Symbole ─────────────
+            missing = [s for s in WATCHLIST if s not in ib_price_data]
+            if missing:
+                _sem_yf = asyncio.Semaphore(10)
+                async def _yf_fill(sym):
+                    async with _sem_yf:
+                        p, v = await _get_market_data_yf(sym)
+                    if p is not None:
+                        ib_price_data[sym] = (p, v)
+                await asyncio.gather(*[_yf_fill(s) for s in missing],
+                                     return_exceptions=True)
+
+            # ── Phase 1c: IV-Fallback via yfinance für Symbole ohne IB-IV ───
+            # IB liefert bei Delayed Data oft keinen IV → yfinance nachladen
+            no_iv = [s for s, (_, v) in ib_price_data.items() if v is None]
+            if no_iv:
+                _sem_iv = asyncio.Semaphore(10)
+                async def _iv_fill(sym):
+                    async with _sem_iv:
+                        _, yf_iv = await _get_market_data_yf(sym)
+                    if yf_iv is not None:
+                        p, _ = ib_price_data[sym]
+                        ib_price_data[sym] = (p, yf_iv)
+                await asyncio.gather(*[_iv_fill(s) for s in no_iv],
+                                     return_exceptions=True)
+
+            # ── Phase 1d: News-Check und Signal-Berechnung für Trigger ───────
+            _sem_news = asyncio.Semaphore(10)
+            _sem_sig  = asyncio.Semaphore(5)
 
             async def scan_symbol(symbol):
-                async with _sem:
-                    preis, iv = await get_market_data(symbol, ib)
-                if preis is None:
+                entry = ib_price_data.get(symbol)
+                if entry is None:
                     log(f"   [{symbol}] ⏳ Keine Preisdaten")
                     return None
+                preis, iv = entry
                 if iv is None:
                     log(f"   [{symbol}] ⏳ Kein IV — überspringe")
                     return None
@@ -1266,7 +1338,7 @@ async def run_bot(stop_event: threading.Event = None):
                 iv_spike   = not first_scan and (iv - prev_iv) >= MIN_IV_SPIKE
                 _iv_memory[symbol] = iv
 
-                async with _sem:
+                async with _sem_news:
                     news_hit, headline = await check_news_trigger(symbol)
 
                 if iv <= MIN_VOLA:
@@ -1288,14 +1360,13 @@ async def run_bot(stop_event: threading.Event = None):
 
                 log(f"   [{symbol}] 🔔 TRIGGER: {' | '.join(trigger_reasons)} | IV={iv:.1%} ${preis:.2f}")
 
-                async with _sem:
+                async with _sem_sig:
                     sig = await fetch_signal(symbol, preis, iv, ib)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig
                 return None
 
-            t0 = datetime.now()
             try:
                 results = await asyncio.wait_for(
                     asyncio.gather(*[scan_symbol(s) for s in WATCHLIST],
