@@ -140,7 +140,7 @@ SCAN_INTERVALL   = int(_cfg['scan_intervall'])
 MAX_POSITIONS    = int(_cfg['max_positions'])
 MAX_PER_SECTOR   = int(_cfg['max_per_sector'])
 AUTO_TRADE       = bool(_cfg['auto_trade'])
-IB_SCAN_BATCH    = 15   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
+IB_SCAN_BATCH    = 10   # Symbole pro IB-reqMktData-Batch (verhindert Error 101)
 
 # Sektor-Zuordnung für Diversifikations-Check
 SECTOR_MAP = {
@@ -505,7 +505,7 @@ async def get_market_data(symbol, ib=None):
         try:
             global _sem_ib_mktdata
             if _sem_ib_mktdata is None:
-                _sem_ib_mktdata = asyncio.Semaphore(5)
+                _sem_ib_mktdata = asyncio.Semaphore(2)
             from ib_insync import Stock as _Stock
             async with _sem_ib_mktdata:
                 t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
@@ -721,7 +721,7 @@ async def fetch_signal(symbol, preis, iv, ib=None):
                     )
                     global _sem_ib_mktdata
                     if _sem_ib_mktdata is None:
-                        _sem_ib_mktdata = asyncio.Semaphore(5)
+                        _sem_ib_mktdata = asyncio.Semaphore(2)
                     async with _sem_ib_mktdata:
                         t_combo = ib.reqMktData(combo_bag, '', False, False)
                         await asyncio.sleep(5)
@@ -827,7 +827,7 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             await ib.qualifyContractsAsync(s_contract, l_contract)
             global _sem_ib_mktdata
             if _sem_ib_mktdata is None:
-                _sem_ib_mktdata = asyncio.Semaphore(5)
+                _sem_ib_mktdata = asyncio.Semaphore(2)
             async with _sem_ib_mktdata:
                 t_s = ib.reqMktData(s_contract, '', False, False)
                 t_l = ib.reqMktData(l_contract,  '', False, False)
@@ -1034,7 +1034,7 @@ async def place_order(ib, sig):
         # (reqMktData auf Bag erfordert Combo-Abo — Legs sind mit Standard-Options-Abo verfügbar)
         global _sem_ib_mktdata
         if _sem_ib_mktdata is None:
-            _sem_ib_mktdata = asyncio.Semaphore(5)
+            _sem_ib_mktdata = asyncio.Semaphore(2)
         async with _sem_ib_mktdata:
             t_short = ib.reqMktData(short_contract, '', False, False)
             t_long  = ib.reqMktData(long_contract,  '', False, False)
@@ -1089,18 +1089,33 @@ async def place_order(ib, sig):
                         _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                         return
 
-        ibkr_net = round(short_bid - long_ask, 2)
         has_real_bid = t_short.bid and t_short.bid > 0
-        has_model    = not has_real_bid and (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
-        discount     = 0.75 if (has_real_bid or has_model) else 0.65
-        # Demo: 2 Cents toleranter → höhere Ausführungswahrscheinlichkeit mit Delayed-Daten
-        # Live: exakter Mid-Point ohne Anpassung
-        demo_adj    = -0.02 if IS_DEMO_MODE else 0.0
-        limit_price = round(max(ibkr_net * discount + demo_adj, 0.01), 2)
-        quelle = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
-        # Bei theoretischen Preisen (kein echtes Bid) strengeres R/R-Minimum:
-        # modelGreeks kann bei illiquiden Options stark vom Markt abweichen (KLAC: 10× daneben)
-        rr_minimum = MIN_RISK_REWARD if has_real_bid else MIN_RISK_REWARD * 1.5
+        has_real_ask = t_long.ask  and t_long.ask  > 0
+
+        if IS_DEMO_MODE:
+            # Demo: Mid-Point-Pricing — weite Delayed-Spreads werden gemittelt
+            # (Short-Bid ist oft zu klein, Long-Ask zu groß → Netto negativ)
+            def _mid(t, fallback):
+                b = t.bid if (t.bid and t.bid > 0) else None
+                a = t.ask if (t.ask and t.ask > 0) else None
+                if b and a:
+                    return (b + a) / 2
+                return b or a or fallback
+            short_val = _mid(t_short, short_bid)
+            long_val  = _mid(t_long,  long_ask)
+            ibkr_net  = round(short_val - long_val, 2)
+            limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
+            quelle = "Mid-Point (Demo)"
+        else:
+            ibkr_net = round(short_bid - long_ask, 2)
+            has_model = not has_real_bid and (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
+            discount  = 0.75 if (has_real_bid or has_model) else 0.65
+            limit_price = round(max(ibkr_net * discount, 0.01), 2)
+            quelle = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
+
+        has_model = (t_short.modelGreeks and t_short.modelGreeks.optPrice and t_short.modelGreeks.optPrice > 0)
+        # Bei theoretischen Preisen (kein echtes Bid) strengeres R/R-Minimum im Live-Modus
+        rr_minimum = MIN_RISK_REWARD if (IS_DEMO_MODE or has_real_bid) else MIN_RISK_REWARD * 1.5
 
         # Delta-Check: IBKR modelGreeks liefert das zuverlässigste Delta
         short_delta = None
@@ -1108,7 +1123,7 @@ async def place_order(ib, sig):
             short_delta = abs(t_short.modelGreeks.delta)
         delta_str = f"Δ={short_delta:.3f}" if short_delta is not None else "Δ=n/a"
         log(f"  📡 [{sym}] {quelle}: Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
-              f"Netto: ${ibkr_net:.2f} → Limit ×{discount}: ${limit_price:.2f}  {delta_str}")
+              f"Netto: ${ibkr_net:.2f} → Limit: ${limit_price:.2f}  {delta_str}")
 
         if short_delta is not None and short_delta > MAX_DELTA:
             log(f"  ✗ [{sym}] Delta {short_delta:.3f} > {MAX_DELTA} — Short-Put zu nah am Kurs, Trade abgebrochen")
@@ -1265,23 +1280,33 @@ async def run_bot(stop_event: threading.Event = None):
             2104, 2106, 2107,       # Market-Data-Farm OK
             2108, 2158, 2157,       # Hist./SecDef-Farm OK
             504,                    # Not connected (transient)
+            101,                    # Max Tickers — Demo-typisch, wird via Fallback behandelt
         }
         _IB_SUPPRESS_PHRASES = (
             'cancelMktData: No reqId found',   # Cancel auf bereits bereinigter Subscription
             'Es sind verzögerte Marktdaten',   # Duplicate des 10091-Textes
+            'Maximale Anzahl an Tickern',       # Error 101 Langtext
         )
 
         class _IBNoiseFilter(_logging.Filter):
             def filter(self, record):
                 msg = record.getMessage()
                 for code in _IB_SUPPRESS_CODES:
-                    if f'Error {code}' in msg or f'error {code},' in msg.lower():
+                    if f'Error {code},' in msg or f'error {code},' in msg.lower():
                         return False
                 return not any(p in msg for p in _IB_SUPPRESS_PHRASES)
 
         _ib_filter = _IBNoiseFilter()
-        for _logger_name in ('ib_insync.wrapper', 'ib_insync.client', 'ib_insync'):
-            _logging.getLogger(_logger_name).addFilter(_ib_filter)
+        # Filter auf alle ib_insync-Logger UND deren Handler anwenden
+        for _logger_name in ('ib_insync', 'ib_insync.ib', 'ib_insync.wrapper',
+                             'ib_insync.client', 'ib_insync.util'):
+            _lg = _logging.getLogger(_logger_name)
+            _lg.addFilter(_ib_filter)
+            for _h in _lg.handlers:
+                _h.addFilter(_ib_filter)
+        # Fallback: Root-Handler abdecken (falls ib_insync dorthin propagiert)
+        for _h in _logging.root.handlers:
+            _h.addFilter(_ib_filter)
 
         # Event-Handler: gecancelte Orders in Echtzeit tracken
         ib.orderStatusEvent += _on_order_status
