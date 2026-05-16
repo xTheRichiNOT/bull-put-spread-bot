@@ -2225,6 +2225,22 @@ async def run_bot(stop_event: threading.Event = None):
 
         if pre_loaded:
             log(f"   {pre_loaded} bestehende Order(s)/Position(en) aus IB geladen — werden nicht dupliziert")
+
+        # State-Abgleich: Einträge aus State-File entfernen die kein echtes IB-Pendant haben.
+        # Verhindert Ghost-Positionen nach Account-Wechsel oder manuellem Schließen in TWS.
+        ib_position_syms  = set(put_by_sym.keys())
+        ib_order_syms     = {o.contract.symbol for o in open_orders if o.contract.secType == 'OPT'}
+        ghost_syms = [
+            sym for sym, info in list(_bot_trades.items())
+            if info.get('status') in ('open', 'closing', 'exit_retry')
+            and sym not in ib_position_syms
+            and sym not in ib_order_syms
+        ]
+        for sym in ghost_syms:
+            del _bot_trades[sym]
+            log(f"  🧹 [{sym}] Ghost-Position aus State entfernt — kein echtes IB-Pendant gefunden")
+        if ghost_syms:
+            _save_state()
         log("")
     except TimeoutError:
         port = _cfg.get('ib_port', 7497)
