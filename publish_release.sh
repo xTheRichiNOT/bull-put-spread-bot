@@ -46,7 +46,7 @@ else
 fi
 
 echo "📋  Kopiere Dateien..."
-for FILE in bot.py launcher.py requirements.txt version.txt; do
+for FILE in bot.py launcher.py backtest.py shadow_analyze.py requirements.txt version.txt; do
     cp "$DEV_DIR/$FILE" "$RELEASES_DIR/$FILE"
     echo "    ✓ $FILE"
 done
