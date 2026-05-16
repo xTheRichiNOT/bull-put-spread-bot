@@ -3,3 +3,4 @@ yfinance
 customtkinter
 certifi
 tzdata
+fpdf2

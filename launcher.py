@@ -2299,10 +2299,10 @@ class BotLauncher(ctk.CTk):
         self._bt_status_lbl.pack(side="left")
 
         self._bt_export_btn = ctk.CTkButton(
-            ctrl, text="⤓  HTML-Report", width=150, height=36,
+            ctrl, text="⤓  PDF exportieren", width=160, height=36,
             fg_color=C["surface2"], hover_color=C["border"],
             text_color=C["muted"], font=ctk.CTkFont(size=12),
-            state="disabled", command=self._bt_open_html)
+            state="disabled", command=self._bt_export_pdf)
         self._bt_export_btn.pack(side="right")
 
         # Ergebnis-Rahmen (wird nach Lauf eingeblendet)
@@ -2616,14 +2616,51 @@ class BotLauncher(ctk.CTk):
         self._bt_log.insert("end", f"\n❌ FEHLER:\n{err}")
         self._bt_log.configure(state="disabled")
 
-    def _bt_open_html(self):
+    def _bt_export_pdf(self):
         if not self._bt_results_data:
             return
         results, log_text, start_date, end_date = self._bt_results_data
-        import webbrowser, tempfile, html as _hl
+        try:
+            from fpdf import FPDF
+        except ImportError:
+            self._bt_status_lbl.configure(
+                text="fpdf2 fehlt: pip install fpdf2", text_color=C["amber"])
+            return
+        import tempfile, subprocess as _sp
+
         m_a, m_b = results[0]["m"], results[1]["m"]
         p_a, p_b = results[0]["params"], results[1]["params"]
 
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_margins(15, 20, 15)
+        pdf.add_page()
+        W = 180
+
+        # Titel
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(0, 160, 120)
+        pdf.multi_cell(W, 12, "Backtest Report", align="L")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(100, 120, 140)
+        pdf.multi_cell(W, 6, f"Zeitraum: {start_date}  bis  {end_date}", align="L")
+        pdf.multi_cell(W, 6, f"Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="L")
+        pdf.ln(4)
+        pdf.set_draw_color(0, 160, 120)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(8)
+
+        # Parameter-Tabelle
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(0, 160, 120)
+        pdf.multi_cell(W, 8, "Parameter", align="L")
+        pdf.ln(2)
+        pdf.set_fill_color(26, 47, 80)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 9)
+        for txt, w in [("Parameter", 80), ("Szenario A", 50), ("Szenario B", 50)]:
+            pdf.cell(w, 7, txt, border=1, fill=True, align="C")
+        pdf.ln()
         param_keys = [
             ("Take Profit %",   "take_profit"),
             ("DTE-Exit (Tage)", "dte_exit"),
@@ -2632,61 +2669,102 @@ class BotLauncher(ctk.CTk):
             ("Stop Loss Mult",  "stop_loss_mult"),
             ("Min Risk/Reward", "min_risk_reward"),
         ]
-        par_rows = "".join(
-            f"<tr><td>{lbl}</td><td>{p_a[k]}</td><td>{p_b[k]}</td></tr>"
-            for lbl, k in param_keys)
+        for i, (label, key) in enumerate(param_keys):
+            r, g, b = (243, 248, 255) if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(r, g, b)
+            pdf.set_text_color(30, 41, 59)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(80, 6, label, border=1, fill=True, align="L")
+            pdf.cell(50, 6, str(p_a.get(key, "")), border=1, fill=True, align="C")
+            pdf.cell(50, 6, str(p_b.get(key, "")), border=1, fill=True, align="C")
+            pdf.ln()
+        pdf.ln(8)
 
+        # Ergebnis-Tabelle
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(0, 160, 120)
+        pdf.multi_cell(W, 8, "Ergebnisse", align="L")
+        pdf.ln(2)
+        pdf.set_fill_color(26, 47, 80)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 9)
+        for txt, w in [("Kennzahl", 70), ("Szenario A", 40), ("Szenario B", 40), ("Gewinner", 30)]:
+            pdf.cell(w, 7, txt, border=1, fill=True, align="C")
+        pdf.ln()
         ROWS = [
             ("Gesamt P&L",    lambda m: f"${m['total']:+,.0f}", "max", "total"),
             ("Win-Rate",      lambda m: f"{m['wr']:.1%}",       "max", "wr"),
             ("Trades",        lambda m: str(m['n']),             None,  None),
-            ("Profit-Faktor", lambda m: f"{m['pf']:.2f}×",      "max", "pf"),
+            ("Profit-Faktor", lambda m: f"{m['pf']:.2f}x",      "max", "pf"),
             ("Max Drawdown",  lambda m: f"${m['max_dd']:,.0f}",  "min", "max_dd"),
-            ("Ø Haltedauer",  lambda m: f"{m['avg_hold']:.0f}d", None,  None),
+            ("Haltedauer",    lambda m: f"{m['avg_hold']:.0f}d", None,  None),
         ]
-        res_rows = ""
-        for label, fmt, compare, key in ROWS:
-            va = fmt(m_a) if m_a else "—"
-            vb = fmt(m_b) if m_b else "—"
-            win = ""
+        for i, (label, fmt, compare, key) in enumerate(ROWS):
+            va = fmt(m_a) if m_a else "-"
+            vb = fmt(m_b) if m_b else "-"
+            winner = ""
+            ca = cb = (30, 41, 59)
+            cw = (160, 160, 160)
             if m_a and m_b and compare and key:
                 ra, rb = m_a.get(key, 0), m_b.get(key, 0)
                 if compare == "max":
-                    win = "A ✓" if ra > rb else ("B ✓" if rb > ra else "")
+                    if ra > rb:   winner, ca, cw = "A", (22, 163, 74), (22, 163, 74)
+                    elif rb > ra: winner, cb, cw = "B", (22, 163, 74), (22, 163, 74)
                 else:
-                    win = "A ✓" if ra < rb else ("B ✓" if rb < ra else "")
-            wc = ' class="win"' if win else ""
-            res_rows += f"<tr><td>{label}</td><td>{va}</td><td>{vb}</td><td{wc}>{win}</td></tr>"
+                    if ra < rb:   winner, ca, cw = "A", (22, 163, 74), (22, 163, 74)
+                    elif rb < ra: winner, cb, cw = "B", (22, 163, 74), (22, 163, 74)
+            r, g, b = (243, 248, 255) if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(r, g, b)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(30, 41, 59)
+            pdf.cell(70, 6, label, border=1, fill=True, align="L")
+            pdf.set_text_color(*ca)
+            pdf.set_font("Helvetica", "B" if winner == "A" else "", 9)
+            pdf.cell(40, 6, va, border=1, fill=True, align="C")
+            pdf.set_text_color(*cb)
+            pdf.set_font("Helvetica", "B" if winner == "B" else "", 9)
+            pdf.cell(40, 6, vb, border=1, fill=True, align="C")
+            pdf.set_text_color(*cw)
+            pdf.set_font("Helvetica", "B" if winner else "", 9)
+            pdf.cell(30, 6, winner, border=1, fill=True, align="C")
+            pdf.ln()
+        pdf.ln(8)
 
-        doc = f"""<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8">
-<title>Backtest {start_date} – {end_date}</title>
-<style>
-body{{font-family:-apple-system,sans-serif;background:#080d1a;color:#e2e8f0;margin:0;padding:32px}}
-h1{{color:#00c896;font-size:22px;margin-bottom:4px}}
-h2{{color:#0ea5e9;font-size:15px;margin:24px 0 8px}}
-p.sub{{color:#4a6080;font-size:13px;margin:4px 0 16px}}
-table{{border-collapse:collapse;width:100%;margin-bottom:16px}}
-th{{background:#111e33;color:#00c896;padding:8px 14px;text-align:left;font-size:12px}}
-td{{padding:7px 14px;border-bottom:1px solid #1a2f50;font-size:13px}}
-.win{{color:#22c55e;font-weight:bold}}
-pre{{background:#060b17;color:#94a3b8;padding:16px;border-radius:6px;font-size:11px;overflow-x:auto;line-height:1.5}}
-</style></head><body>
-<h1>🧪 Backtest Report</h1>
-<p class="sub">Zeitraum: {start_date} – {end_date} &nbsp;|&nbsp; Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
-<h2>Parameter</h2>
-<table><tr><th>Parameter</th><th>Szenario A</th><th>Szenario B</th></tr>{par_rows}</table>
-<h2>Ergebnisse</h2>
-<table><tr><th>Kennzahl</th><th>Szenario A</th><th>Szenario B</th><th>Gewinner</th></tr>{res_rows}</table>
-<h2>Vollständiger Log</h2>
-<pre>{_hl.escape(log_text)}</pre>
-</body></html>"""
-        f = tempfile.NamedTemporaryFile(suffix=".html", delete=False,
-                                        mode="w", encoding="utf-8")
-        f.write(doc)
-        f.close()
-        import webbrowser as _wb
-        _wb.open(f"file://{f.name}")
+        # Log
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(0, 160, 120)
+        pdf.multi_cell(W, 8, "Log-Ausgabe", align="L")
+        pdf.ln(2)
+        pdf.set_draw_color(0, 160, 120)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(4)
+        pdf.set_font("Courier", "", 7)
+        pdf.set_text_color(60, 80, 100)
+        pdf.multi_cell(W, 3.8, BotLauncher._sanitize_for_pdf(log_text))
+
+        path = tempfile.mktemp(suffix=".pdf")
+        pdf.output(path)
+        if sys.platform == "darwin":
+            _sp.Popen(["open", path])
+        elif sys.platform == "win32":
+            os.startfile(path)
+        else:
+            _sp.Popen(["xdg-open", path])
+
+    @staticmethod
+    def _sanitize_for_pdf(text: str) -> str:
+        ch = {
+            '═': '=', '─': '-', '│': '|', '└': '+', '┌': '+',
+            '┐': '+', '┘': '+', '├': '+', '┤': '+', '┬': '+',
+            '┴': '+', '┼': '+', '→': '->', '←': '<-',
+            '✓': 'OK', '✗': 'X', '⚠': '(!)', '✅': '[OK]',
+            '❌': '[ERR]', '⏳': '...', '🔁': '[->]', '📥': '[DL]',
+            '📄': '[DOC]', '🔬': '[BT]', '▶': '>', '◀': '<',
+            '≥': '>=', '≤': '<=',
+        }
+        for old, new in ch.items():
+            text = text.replace(old, new)
+        return text.encode('latin-1', errors='replace').decode('latin-1')
 
     # ══════════════════════════════════════════════════════════════════════════
     # ANALYSE TAB
@@ -2741,10 +2819,10 @@ pre{{background:#060b17;color:#94a3b8;padding:16px;border-radius:6px;font-size:1
         self._an_status_lbl.pack(side="left")
 
         self._an_export_btn = ctk.CTkButton(
-            ctrl, text="⤓  HTML-Report", width=150, height=36,
+            ctrl, text="⤓  PDF exportieren", width=160, height=36,
             fg_color=C["surface2"], hover_color=C["border"],
             text_color=C["muted"], font=ctk.CTkFont(size=12),
-            state="disabled", command=self._an_open_html)
+            state="disabled", command=self._an_export_pdf)
         self._an_export_btn.pack(side="right")
 
         # Output
@@ -2808,29 +2886,48 @@ pre{{background:#060b17;color:#94a3b8;padding:16px;border-radius:6px;font-size:1
         self._an_run_btn.configure(state="normal", text="▶  Analyse starten")
         self._an_status_lbl.configure(text="❌ Fehler aufgetreten", text_color=C["red"])
 
-    def _an_open_html(self):
+    def _an_export_pdf(self):
         if not self._an_output_text:
             return
-        import webbrowser, tempfile, html as _hl
-        txt = _hl.escape(self._an_output_text)
-        doc = f"""<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8">
-<title>Shadow Trade Analyse {datetime.now().strftime('%Y-%m-%d')}</title>
-<style>
-body{{font-family:-apple-system,sans-serif;background:#080d1a;color:#e2e8f0;margin:0;padding:32px}}
-h1{{color:#00c896;font-size:22px;margin-bottom:4px}}
-p.sub{{color:#4a6080;font-size:13px;margin:4px 0 24px}}
-pre{{background:#060b17;color:#94a3b8;padding:20px;border-radius:6px;font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre}}
-</style></head><body>
-<h1>📈 Shadow Trade Analyse</h1>
-<p class="sub">Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
-<pre>{txt}</pre>
-</body></html>"""
-        f = tempfile.NamedTemporaryFile(suffix=".html", delete=False,
-                                        mode="w", encoding="utf-8")
-        f.write(doc)
-        f.close()
-        webbrowser.open(f"file://{f.name}")
+        try:
+            from fpdf import FPDF
+        except ImportError:
+            self._an_status_lbl.configure(
+                text="fpdf2 fehlt: pip install fpdf2", text_color=C["amber"])
+            return
+        import tempfile, subprocess as _sp
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_margins(15, 20, 15)
+        pdf.add_page()
+        W = 180
+
+        # Titel
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(0, 160, 120)
+        pdf.multi_cell(W, 12, "Shadow Trade Analyse", align="L")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(100, 120, 140)
+        pdf.multi_cell(W, 6, f"Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}", align="L")
+        pdf.ln(4)
+        pdf.set_draw_color(0, 160, 120)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(8)
+
+        # Analyse-Ausgabe
+        pdf.set_font("Courier", "", 7.5)
+        pdf.set_text_color(30, 41, 59)
+        pdf.multi_cell(W, 4, BotLauncher._sanitize_for_pdf(self._an_output_text))
+
+        path = tempfile.mktemp(suffix=".pdf")
+        pdf.output(path)
+        if sys.platform == "darwin":
+            _sp.Popen(["open", path])
+        elif sys.platform == "win32":
+            os.startfile(path)
+        else:
+            _sp.Popen(["xdg-open", path])
 
     def on_closing(self):
         if self._running:
