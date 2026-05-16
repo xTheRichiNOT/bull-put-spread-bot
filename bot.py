@@ -53,6 +53,7 @@ _cfg_defaults = {
     "max_risk_per_trade_pct": 0.02, # max 2 % NetLiq-Risiko pro Trade
     "max_total_risk_pct": 0.15,     # max 15 % NetLiq-Risiko gesamt offen
     "earnings_buffer_days": 14,     # kein Trade wenn Earnings < X Tage entfernt oder vor Expiry
+    "live_market_data": False,      # True = Echtzeit-Daten auch für Paper-Konten (wenn Abo vorhanden)
 }
 if os.path.exists(_cfg_path):
     try:
@@ -1983,20 +1984,24 @@ async def configure_environment(ib) -> bool:
     ACCOUNT_ID = accounts[0] if accounts else _cfg.get('ib_account', '')
     IS_DEMO_MODE = ACCOUNT_ID.upper().startswith('D')
 
+    # Datenqualität: unabhängig vom Account-Typ konfigurierbar.
+    # Paper-Konten mit Live-Daten-Abo → live_market_data: true in config.json
+    use_live_data = not IS_DEMO_MODE or bool(_cfg.get('live_market_data', False))
+    ib.reqMarketDataType(1 if use_live_data else 3)
+
+    log("=" * 60)
     if IS_DEMO_MODE:
-        ib.reqMarketDataType(3)   # Delayed data
-        log("=" * 60)
         log("  MODUS: DEMO / PAPER-TRADING  (Konto: " + ACCOUNT_ID + ")")
-        log("  Delayed-Daten aktiv — BS-Schätzungen erlaubt")
+        if use_live_data:
+            log("  Echtzeit-Daten aktiv (live_market_data: true)")
+        else:
+            log("  Delayed-Daten aktiv — BS-Schätzungen erlaubt")
         log("  Orders werden mit Toleranz +/-$0.02 platziert")
-        log("=" * 60)
     else:
-        ib.reqMarketDataType(1)   # Live Echtzeit-Daten
-        log("=" * 60)
         log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
         log("  Echtzeit-Daten aktiv — nur echtes Bid/Ask erlaubt")
         log("  Strikte Limit-Orders am exakten Mid-Point")
-        log("=" * 60)
+    log("=" * 60)
 
     return IS_DEMO_MODE
 

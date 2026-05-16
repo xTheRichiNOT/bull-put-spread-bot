@@ -251,6 +251,7 @@ DEFAULT_CONFIG = {
     "max_per_sector":      2,
     "scan_intervall":      60,
     "auto_trade":          True,
+    "live_market_data":    False,
     "take_profit_pct":     0.70,
     "stop_loss_mult":      2.0,
     "dte_exit":            0,
@@ -1736,6 +1737,7 @@ class BotLauncher(ctk.CTk):
 
         section("Automation")
         toggle_field("Auto-Trade — Orders automatisch platzieren", "auto_trade")
+        toggle_field("Echtzeit-Daten für Paper-Account (live_market_data)", "live_market_data")
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
