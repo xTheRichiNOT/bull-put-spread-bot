@@ -50,6 +50,8 @@ for FILE in bot.py launcher.py backtest.py shadow_analyze.py requirements.txt ve
     cp "$DEV_DIR/$FILE" "$RELEASES_DIR/$FILE"
     echo "    ✓ $FILE"
 done
+cp -r "$DEV_DIR/icons" "$RELEASES_DIR/"
+echo "    ✓ icons/"
 
 cd "$RELEASES_DIR"
 git add .

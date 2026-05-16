@@ -87,7 +87,8 @@ VERSION         = open(VERSION_FILE).read().strip() if os.path.exists(VERSION_FI
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot/main"
 
 # Alle Dateien die beim Auto-Update heruntergeladen werden (inkl. launcher.py)
-UPDATE_FILES = ["bot.py", "launcher.py", "version.txt", "requirements.txt"]
+UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
+                "version.txt", "requirements.txt"]
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
