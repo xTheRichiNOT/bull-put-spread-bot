@@ -128,15 +128,15 @@ WATCHLIST        = [
     # Travel & Leisure (3)
     'ABNB', 'BKNG', 'MAR',
 ]  # gesamt: 120
-MIN_VOLA         = float(_cfg.get('min_vola', 0.18))   # Hard-Floor IV (war 0.28)
-MIN_VOLA_SOFT    = 0.25    # Score-Penalty Zone: IV 18–25 % → -0.10
+MIN_VOLA         = float(_cfg.get('min_vola', 0.28))   # Hard-Floor IV (PDF: >28%)
+MIN_VOLA_SOFT    = 0.35    # Score-Penalty Zone: IV 28–35 % → -0.10
 IV_SOFT_PENALTY  = 0.10
 MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
 MIN_CREDIT_PERCENT = 0.18   # 18 % der Spread-Breite als Mindest-Credit (relativ)
-MIN_CREDIT_ABS     = 15    # Absolutes Minimum als Sicherheitsboden ($)
+MIN_CREDIT_ABS     = float(_cfg.get('min_credit_abs', 80))  # Absolutes Minimum pro Kontrakt (PDF: $80)
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
@@ -145,7 +145,7 @@ MAX_LOSS_PROB    = 0.20    # Hard-Block: P(MaxVerlust) > 20% → Totalverlustris
 MIN_EV_RATIO     = 0.005   # Hard-Block: EV < 0.5% des Credits → statistisch kein Vorteil
 
 # Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
-ENTRY_THRESHOLD  = 0.60    # Score ≥ 0.60: Trade-Kandidat (war 0.70)
+ENTRY_THRESHOLD  = 0.70    # Score ≥ 0.70: Trade-Kandidat (PDF-konform)
 WATCH_THRESHOLD  = 0.50    # Score 0.50–0.60: Watch (war 0.62)
 MAX_TRADES_PER_DAY = int(_cfg.get('max_trades_per_day', 10))  # Daily Budget
 RATIO_TOLERANCE  = 0.20

@@ -14,6 +14,11 @@ __pycache__/
 trades.log
 *.log
 
+# Laufzeit-Daten (generiert / privat)
+positions.json
+shadow_trades.jsonl
+backtest_trades.csv
+
 # macOS
 .DS_Store
 .AppleDouble

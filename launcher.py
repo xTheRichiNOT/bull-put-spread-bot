@@ -250,9 +250,9 @@ DEFAULT_CONFIG = {
     "max_per_sector":      2,
     "scan_intervall":      60,
     "auto_trade":          True,
-    "take_profit_pct":     0.50,
+    "take_profit_pct":     0.70,
     "stop_loss_mult":      2.0,
-    "dte_exit":            21,
+    "dte_exit":            0,
     "min_available_funds": 2000,
 }
 
@@ -1053,6 +1053,8 @@ class BotLauncher(ctk.CTk):
             ("  📁   Portfolio",  "history"),
             ("  ⚙️   Einstellungen", "settings"),
             ("  📖   IB-Setup",   "guide"),
+            ("  🧪   Backtest",   "backtest"),
+            ("  📈   Analyse",    "analyse"),
         ]
         for label, key in nav_items:
             btn = ctk.CTkButton(
@@ -1073,7 +1075,7 @@ class BotLauncher(ctk.CTk):
         content = ctk.CTkFrame(main, fg_color=C["bg"], corner_radius=0)
         content.pack(side="left", fill="both", expand=True)
 
-        for key in ["dashboard", "history", "settings", "guide"]:
+        for key in ["dashboard", "history", "settings", "guide", "backtest", "analyse"]:
             f = ctk.CTkFrame(content, fg_color=C["surface"], corner_radius=0)
             self._pages[key] = f
 
@@ -1081,6 +1083,8 @@ class BotLauncher(ctk.CTk):
         self._build_history(self._pages["history"])
         self._build_settings(self._pages["settings"])
         self._build_guide(self._pages["guide"])
+        self._build_backtest(self._pages["backtest"])
+        self._build_analyse(self._pages["analyse"])
 
         # Status-dot Compat (bleibt für interne Logik)
         self._status_dot = self._sb_bot_lbl
@@ -2178,6 +2182,655 @@ class BotLauncher(ctk.CTk):
             except Exception:
                 pass
             self.destroy()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BACKTEST TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_backtest(self, parent):
+        parent.configure(fg_color=C["surface"])
+
+        hdr = ctk.CTkFrame(parent, fg_color=C["header"], corner_radius=0, height=52)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="🧪  Backtest — Szenario-Vergleich",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=C["accent"]).pack(side="left", padx=16)
+
+        sc = ctk.CTkScrollableFrame(parent, fg_color=C["surface"])
+        sc.pack(fill="both", expand=True)
+
+        # ── Zeitraum ──────────────────────────────────────────────────────────
+        zr = ctk.CTkFrame(sc, fg_color=C["surface2"], corner_radius=8)
+        zr.pack(fill="x", padx=12, pady=(10, 0))
+        ctk.CTkLabel(zr, text="Zeitraum:", font=ctk.CTkFont(size=12),
+                     text_color=C["muted"]).pack(side="left", padx=(12, 6), pady=8)
+        ctk.CTkLabel(zr, text="Von", text_color=C["text"],
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        self._bt_start = ctk.CTkEntry(zr, width=108,
+                                      font=ctk.CTkFont(family="Courier", size=12),
+                                      fg_color=C["bg"], border_color=C["border"],
+                                      text_color=C["text"])
+        self._bt_start.insert(0, "2024-10-01")
+        self._bt_start.pack(side="left", padx=6)
+        ctk.CTkLabel(zr, text="bis", text_color=C["text"],
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        self._bt_end = ctk.CTkEntry(zr, width=108,
+                                    font=ctk.CTkFont(family="Courier", size=12),
+                                    fg_color=C["bg"], border_color=C["border"],
+                                    text_color=C["text"])
+        self._bt_end.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self._bt_end.pack(side="left", padx=6)
+
+        # ── Parameter-Spalten ─────────────────────────────────────────────────
+        BT_DEFS = [
+            ("Take Profit %",    "take_profit",    "take_profit_pct",  0.70),
+            ("DTE-Exit (Tage)",  "dte_exit",       "dte_exit",         0),
+            ("Min IV (HV×1.3)", "min_vola",        "min_vola",         0.28),
+            ("Min Credit $",     "min_credit_abs", "min_credit_abs",   80),
+            ("Stop Loss Mult",   "stop_loss_mult", "stop_loss_mult",   2.0),
+            ("Min Risk/Reward",  "min_risk_reward","min_risk_reward",  0.22),
+        ]
+        self._bt_vals_a = {
+            bt_key: self.cfg.get(cfg_key, default)
+            for _, bt_key, cfg_key, default in BT_DEFS
+        }
+        self._bt_fields_b: dict = {}
+
+        po = ctk.CTkFrame(sc, fg_color="transparent")
+        po.pack(fill="x", padx=12, pady=8)
+        po.columnconfigure(0, weight=1)
+        po.columnconfigure(1, weight=1)
+
+        for ci, (title, badge) in enumerate([
+            ("Szenario A", "Aus Einstellungen"),
+            ("Szenario B", "Frei editierbar"),
+        ]):
+            col = ctk.CTkFrame(po, fg_color=C["surface2"], corner_radius=8)
+            col.grid(row=0, column=ci, sticky="nsew",
+                     padx=(0, 6) if ci == 0 else (6, 0))
+
+            col_hf = ctk.CTkFrame(col, fg_color=C["border"], corner_radius=6, height=36)
+            col_hf.pack(fill="x", padx=8, pady=(8, 4))
+            col_hf.pack_propagate(False)
+            ctk.CTkLabel(col_hf, text=title,
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=C["accent"]).pack(side="left", padx=10)
+            ctk.CTkLabel(col_hf, text=badge,
+                         font=ctk.CTkFont(size=10),
+                         text_color=C["muted"]).pack(side="right", padx=10)
+
+            for label, bt_key, cfg_key, default in BT_DEFS:
+                rf = ctk.CTkFrame(col, fg_color="transparent")
+                rf.pack(fill="x", padx=10, pady=2)
+                ctk.CTkLabel(rf, text=label, anchor="w", width=130,
+                             font=ctk.CTkFont(size=12),
+                             text_color=C["text"]).pack(side="left")
+                val = str(self.cfg.get(cfg_key, default))
+                if ci == 0:
+                    ctk.CTkLabel(rf, text=val, anchor="w", width=90,
+                                 font=ctk.CTkFont(family="Courier", size=12),
+                                 fg_color=C["bg"], corner_radius=4,
+                                 text_color=C["muted"]).pack(side="left", padx=(6, 0),
+                                                              ipady=3, ipadx=4)
+                else:
+                    e = ctk.CTkEntry(rf, width=90,
+                                     font=ctk.CTkFont(family="Courier", size=12),
+                                     fg_color=C["bg"], border_color=C["border"],
+                                     text_color=C["text"])
+                    e.insert(0, val)
+                    e.pack(side="left", padx=(6, 0))
+                    self._bt_fields_b[bt_key] = e
+
+        # ── Kontroll-Zeile ────────────────────────────────────────────────────
+        ctrl = ctk.CTkFrame(sc, fg_color="transparent")
+        ctrl.pack(fill="x", padx=12, pady=(4, 0))
+
+        self._bt_run_btn = ctk.CTkButton(
+            ctrl, text="▶  Backtest starten", width=185, height=36,
+            fg_color=C["accent"], hover_color="#009e78", text_color="#000000",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._bt_start_run)
+        self._bt_run_btn.pack(side="left", padx=(0, 12))
+
+        self._bt_status_lbl = ctk.CTkLabel(
+            ctrl, text="Bereit — Parameter setzen und starten.",
+            font=ctk.CTkFont(size=11), text_color=C["muted"])
+        self._bt_status_lbl.pack(side="left")
+
+        self._bt_export_btn = ctk.CTkButton(
+            ctrl, text="⤓  HTML-Report", width=150, height=36,
+            fg_color=C["surface2"], hover_color=C["border"],
+            text_color=C["muted"], font=ctk.CTkFont(size=12),
+            state="disabled", command=self._bt_open_html)
+        self._bt_export_btn.pack(side="right")
+
+        # Ergebnis-Rahmen (wird nach Lauf eingeblendet)
+        self._bt_result_frame = ctk.CTkFrame(sc, fg_color=C["surface2"], corner_radius=8)
+        self._bt_results_data = None
+
+        # Log
+        ctk.CTkLabel(sc, text="  Log-Ausgabe", anchor="w",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=C["muted"]).pack(fill="x", padx=12, pady=(12, 2))
+        self._bt_log = ctk.CTkTextbox(
+            sc, height=200,
+            font=ctk.CTkFont(family="Courier", size=10),
+            fg_color=C["bg"], text_color=C["text"],
+            border_color=C["border"], border_width=1)
+        self._bt_log.pack(fill="x", padx=12, pady=(0, 16))
+        self._bt_log.configure(state="disabled")
+
+    def _bt_start_run(self):
+        try:
+            params_b = {k: float(e.get()) for k, e in self._bt_fields_b.items()}
+        except ValueError as ve:
+            self._bt_status_lbl.configure(
+                text=f"❌ Ungültige Eingabe: {ve}", text_color=C["red"])
+            return
+        start = self._bt_start.get().strip()
+        end   = self._bt_end.get().strip()
+        if not (start and end):
+            self._bt_status_lbl.configure(text="❌ Zeitraum fehlt", text_color=C["red"])
+            return
+        self._bt_run_btn.configure(state="disabled", text="⏳  Läuft...")
+        self._bt_export_btn.configure(state="disabled")
+        self._bt_result_frame.pack_forget()
+        self._bt_log.configure(state="normal")
+        self._bt_log.delete("1.0", "end")
+        self._bt_log.configure(state="disabled")
+        self._bt_status_lbl.configure(
+            text="📥 Marktdaten laden (30–60s)...", text_color=C["muted"])
+        threading.Thread(
+            target=self._bt_run_thread,
+            args=(dict(self._bt_vals_a), params_b, start, end),
+            daemon=True
+        ).start()
+
+    def _bt_run_thread(self, params_a, params_b, start_date, end_date):
+        import importlib.util, io
+        from contextlib import redirect_stdout
+
+        def upd(msg, col=C["muted"]):
+            self.after(0, lambda m=msg, c=col:
+                       self._bt_status_lbl.configure(text=m, text_color=c))
+        try:
+            bt_path = None
+            for base in [_BASE, _BUNDLE_BASE]:
+                p = os.path.join(base, "backtest.py")
+                if os.path.exists(p):
+                    bt_path = p
+                    break
+            if not bt_path:
+                raise FileNotFoundError("backtest.py nicht gefunden")
+
+            spec = importlib.util.spec_from_file_location("_bt_run", bt_path)
+            bt   = importlib.util.module_from_spec(spec)
+            with redirect_stdout(io.StringIO()):
+                spec.loader.exec_module(bt)
+
+            upd("📥 Marktdaten laden...")
+            with redirect_stdout(io.StringIO()):
+                sym_data = bt.load_data(start_date, end_date)
+
+            from datetime import datetime as _dt
+            start_dt = _dt.strptime(start_date, "%Y-%m-%d").date()
+            end_dt   = _dt.strptime(end_date,   "%Y-%m-%d").date()
+            all_ds = set()
+            for d in sym_data.values():
+                all_ds |= set(d.keys())
+            all_dates = sorted(d for d in all_ds if start_dt <= d <= end_dt)
+
+            results, log_parts = [], []
+            for label, params in [("A", params_a), ("B", params_b)]:
+                upd(f"🔁 Szenario {label} simuliert...")
+                bt.MIN_VOLA        = float(params["min_vola"])
+                bt.MIN_CREDIT_ABS  = float(params["min_credit_abs"])
+                bt.STOP_LOSS_MULT  = float(params["stop_loss_mult"])
+                bt.MIN_RISK_REWARD = float(params["min_risk_reward"])
+                tp     = float(params["take_profit"])
+                dte_on = int(float(params["dte_exit"])) > 0
+                trades, daily_pnl = BotLauncher._bt_run_scenario(
+                    bt, sym_data, all_dates, start_dt, end_dt, tp, dte_on)
+                m = BotLauncher._bt_compute_metrics(trades, daily_pnl)
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    bt.print_results(trades, daily_pnl, {}, start_date, end_date)
+                log_parts.append(
+                    f"{'═'*58}\n  SZENARIO {label}\n{'═'*58}\n{buf.getvalue()}")
+                results.append({"label": label, "params": params, "m": m})
+
+            full_log = "\n".join(log_parts)
+            self.after(0, lambda r=results, lg=full_log:
+                       self._bt_show_results(r, lg, start_date, end_date))
+        except Exception:
+            import traceback
+            err = traceback.format_exc()
+            self.after(0, lambda e=err: self._bt_on_error(e))
+
+    @staticmethod
+    def _bt_run_scenario(bt, sym_data, all_dates, start_dt, end_dt,
+                         take_profit_pct, dte_exit_on):
+        from collections import defaultdict
+        from datetime import timedelta
+        open_pos, sec_cnt, trades, daily_pnl = {}, defaultdict(int), [], {}
+        for day in all_dates:
+            day_pnl, to_close = 0.0, []
+            for sym, pos in list(open_pos.items()):
+                sig, de = pos["sig"], sym_data[sym].get(day)
+                if de is None:
+                    continue
+                price    = de[0]
+                dte_left = max(0, (pos["expiry_date"] - day).days)
+                sv       = bt.spread_value(price, sig["short_strike"],
+                                           sig["long_strike"], sig["iv"], dte_left)
+                tp_thr = sig["credit_ps"] * (1 - take_profit_pct)
+                sl_thr = sig["credit_ps"] * bt.STOP_LOSS_MULT
+                if dte_left <= 0:
+                    reason = "EXPIRY"
+                elif sv <= tp_thr:
+                    reason = "TAKE_PROFIT"
+                elif sv >= sl_thr:
+                    reason = "STOP_LOSS"
+                elif (dte_exit_on and dte_left <= bt.DTE_EXIT
+                      and (price - sig["short_strike"]) / price < bt.BUFFER_MIN_PCT):
+                    reason = "DTE_EXIT"
+                else:
+                    reason = None
+                if reason:
+                    to_close.append((sym, pos, (sig["credit_ps"] - sv) * 100, reason))
+            for sym, pos, pnl, reason in to_close:
+                sec = bt.SECTOR_MAP.get(sym, "?")
+                sec_cnt[sec] = max(0, sec_cnt[sec] - 1)
+                del open_pos[sym]
+                day_pnl += pnl
+                trades.append({
+                    "symbol": sym, "sector": sec,
+                    "entry_date": pos["entry_date"].isoformat(),
+                    "exit_date": day.isoformat(),
+                    "dte_held": (day - pos["entry_date"]).days,
+                    "credit": round(pos["sig"]["credit"], 2),
+                    "pnl": round(pnl, 2), "exit_reason": reason,
+                })
+            daily_pnl[day] = round(day_pnl, 2)
+            slots = bt.MAX_POSITIONS - len(open_pos)
+            if slots <= 0:
+                continue
+            candidates = []
+            for sym in bt.WATCHLIST:
+                if sym in open_pos or sym not in sym_data:
+                    continue
+                de = sym_data[sym].get(day)
+                if de is None:
+                    continue
+                price, iv = de
+                sig = bt.evaluate_signal(price, iv)
+                if sig is None:
+                    continue
+                sec = bt.SECTOR_MAP.get(sym, "?")
+                if sec_cnt[sec] >= bt.MAX_PER_SECTOR:
+                    continue
+                candidates.append((sym, sig, sec))
+            candidates.sort(key=lambda x: x[1]["score"], reverse=True)
+            for sym, sig, sec in candidates:
+                if len(open_pos) >= bt.MAX_POSITIONS or sym in open_pos:
+                    break
+                from datetime import timedelta as _td
+                open_pos[sym] = {
+                    "entry_date": day,
+                    "expiry_date": day + _td(days=bt.FIXED_DTE),
+                    "sig": sig,
+                }
+                sec_cnt[sec] += 1
+        if all_dates:
+            last = all_dates[-1]
+            for sym, pos in list(open_pos.items()):
+                sig = pos["sig"]
+                de  = sym_data[sym].get(last)
+                price    = de[0] if de else sig.get("entry_price", sig["short_strike"])
+                dte_left = max(0, (pos["expiry_date"] - last).days)
+                sv       = bt.spread_value(price, sig["short_strike"],
+                                           sig["long_strike"], sig["iv"], dte_left)
+                trades.append({
+                    "symbol": sym, "sector": bt.SECTOR_MAP.get(sym, "?"),
+                    "entry_date": pos["entry_date"].isoformat(),
+                    "exit_date": last.isoformat(),
+                    "dte_held": (last - pos["entry_date"]).days,
+                    "credit": round(sig["credit"], 2),
+                    "pnl": round((sig["credit_ps"] - sv) * 100, 2),
+                    "exit_reason": "END_OF_BACKTEST",
+                })
+        return trades, daily_pnl
+
+    @staticmethod
+    def _bt_compute_metrics(trades, daily_pnl):
+        from collections import defaultdict
+        if not trades:
+            return None
+        wins   = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] <= 0]
+        n      = len(trades)
+        total  = sum(t["pnl"] for t in trades)
+        gw     = sum(t["pnl"] for t in wins)
+        gl     = abs(sum(t["pnl"] for t in losses))
+        pf     = gw / gl if gl > 0 else float("inf")
+        cum, peak, max_dd = 0.0, 0.0, 0.0
+        for d in sorted(daily_pnl):
+            cum += daily_pnl[d]
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+        exits = defaultdict(int)
+        for t in trades:
+            exits[t["exit_reason"]] += 1
+        return {
+            "n": n, "total": total,
+            "wr": len(wins) / n,
+            "pf": pf, "max_dd": max_dd,
+            "wins": len(wins), "losses": len(losses),
+            "avg_hold": sum(t["dte_held"] for t in trades) / n,
+            "exits": dict(exits),
+        }
+
+    def _bt_show_results(self, results, log_text, start_date, end_date):
+        for w in self._bt_result_frame.winfo_children():
+            w.destroy()
+
+        m_a, m_b = results[0]["m"], results[1]["m"]
+
+        rfhdr = ctk.CTkFrame(self._bt_result_frame,
+                             fg_color=C["border"], corner_radius=6, height=34)
+        rfhdr.pack(fill="x", padx=8, pady=(8, 4))
+        rfhdr.pack_propagate(False)
+        ctk.CTkLabel(rfhdr, text="  Ergebnisse",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["accent"]).pack(side="left", padx=4)
+        ctk.CTkLabel(rfhdr, text=f"{start_date} – {end_date}",
+                     font=ctk.CTkFont(size=11), text_color=C["muted"]).pack(side="right", padx=12)
+
+        table = ctk.CTkFrame(self._bt_result_frame, fg_color="transparent")
+        table.pack(fill="x", padx=8, pady=(0, 8))
+
+        hrow = ctk.CTkFrame(table, fg_color=C["border"], corner_radius=4)
+        hrow.pack(fill="x", pady=(0, 2))
+        for text, w, anch in [("Kennzahl", 160, "w"), ("Szenario A", 130, "e"),
+                               ("Szenario B", 130, "e"), ("Gewinner", 80, "w")]:
+            ctk.CTkLabel(hrow, text=text, width=w, anchor=anch,
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=C["muted"]).pack(side="left", padx=6, pady=5)
+
+        ROWS = [
+            ("Gesamt P&L",    lambda m: f"${m['total']:+,.0f}", "max", "total"),
+            ("Win-Rate",      lambda m: f"{m['wr']:.1%}",       "max", "wr"),
+            ("Trades",        lambda m: str(m['n']),             None,  None),
+            ("Profit-Faktor", lambda m: f"{m['pf']:.2f}×",      "max", "pf"),
+            ("Max Drawdown",  lambda m: f"${m['max_dd']:,.0f}",  "min", "max_dd"),
+            ("Ø Haltedauer",  lambda m: f"{m['avg_hold']:.0f}d", None,  None),
+        ]
+        for ri, (label, fmt, compare, key) in enumerate(ROWS):
+            va = fmt(m_a) if m_a else "—"
+            vb = fmt(m_b) if m_b else "—"
+            ca, cb, winner = C["text"], C["text"], ""
+            if m_a and m_b and compare and key:
+                ra, rb = m_a.get(key, 0), m_b.get(key, 0)
+                if compare == "max":
+                    if ra > rb:
+                        ca, winner, cb = C["green"], "A  ✓", C["muted"]
+                    elif rb > ra:
+                        cb, winner, ca = C["green"], "B  ✓", C["muted"]
+                else:
+                    if ra < rb:
+                        ca, winner, cb = C["green"], "A  ✓", C["muted"]
+                    elif rb < ra:
+                        cb, winner, ca = C["green"], "B  ✓", C["muted"]
+            bg = C["surface2"] if ri % 2 == 0 else "transparent"
+            drow = ctk.CTkFrame(table, fg_color=bg, corner_radius=4)
+            drow.pack(fill="x", pady=1)
+            ctk.CTkLabel(drow, text=label, width=160, anchor="w",
+                         font=ctk.CTkFont(size=12), text_color=C["text"]).pack(
+                         side="left", padx=6, pady=4)
+            ctk.CTkLabel(drow, text=va, width=130, anchor="e",
+                         font=ctk.CTkFont(family="Courier", size=12, weight="bold"),
+                         text_color=ca).pack(side="left", padx=6)
+            ctk.CTkLabel(drow, text=vb, width=130, anchor="e",
+                         font=ctk.CTkFont(family="Courier", size=12, weight="bold"),
+                         text_color=cb).pack(side="left", padx=6)
+            ctk.CTkLabel(drow, text=winner, width=80, anchor="w",
+                         font=ctk.CTkFont(size=11),
+                         text_color=C["green"] if winner else C["muted"]).pack(
+                         side="left", padx=6)
+
+        self._bt_result_frame.pack(fill="x", padx=12, pady=(8, 0))
+        self._bt_run_btn.configure(state="normal", text="▶  Backtest starten")
+        self._bt_export_btn.configure(state="normal", text_color=C["text"])
+        self._bt_status_lbl.configure(text="✅ Fertig!", text_color=C["green"])
+        self._bt_log.configure(state="normal")
+        self._bt_log.delete("1.0", "end")
+        self._bt_log.insert("1.0", log_text)
+        self._bt_log.configure(state="disabled")
+        self._bt_results_data = (results, log_text, start_date, end_date)
+
+    def _bt_on_error(self, err):
+        self._bt_run_btn.configure(state="normal", text="▶  Backtest starten")
+        self._bt_status_lbl.configure(text="❌ Fehler — siehe Log", text_color=C["red"])
+        self._bt_log.configure(state="normal")
+        self._bt_log.insert("end", f"\n❌ FEHLER:\n{err}")
+        self._bt_log.configure(state="disabled")
+
+    def _bt_open_html(self):
+        if not self._bt_results_data:
+            return
+        results, log_text, start_date, end_date = self._bt_results_data
+        import webbrowser, tempfile, html as _hl
+        m_a, m_b = results[0]["m"], results[1]["m"]
+        p_a, p_b = results[0]["params"], results[1]["params"]
+
+        param_keys = [
+            ("Take Profit %",   "take_profit"),
+            ("DTE-Exit (Tage)", "dte_exit"),
+            ("Min IV",          "min_vola"),
+            ("Min Credit $",    "min_credit_abs"),
+            ("Stop Loss Mult",  "stop_loss_mult"),
+            ("Min Risk/Reward", "min_risk_reward"),
+        ]
+        par_rows = "".join(
+            f"<tr><td>{lbl}</td><td>{p_a[k]}</td><td>{p_b[k]}</td></tr>"
+            for lbl, k in param_keys)
+
+        ROWS = [
+            ("Gesamt P&L",    lambda m: f"${m['total']:+,.0f}", "max", "total"),
+            ("Win-Rate",      lambda m: f"{m['wr']:.1%}",       "max", "wr"),
+            ("Trades",        lambda m: str(m['n']),             None,  None),
+            ("Profit-Faktor", lambda m: f"{m['pf']:.2f}×",      "max", "pf"),
+            ("Max Drawdown",  lambda m: f"${m['max_dd']:,.0f}",  "min", "max_dd"),
+            ("Ø Haltedauer",  lambda m: f"{m['avg_hold']:.0f}d", None,  None),
+        ]
+        res_rows = ""
+        for label, fmt, compare, key in ROWS:
+            va = fmt(m_a) if m_a else "—"
+            vb = fmt(m_b) if m_b else "—"
+            win = ""
+            if m_a and m_b and compare and key:
+                ra, rb = m_a.get(key, 0), m_b.get(key, 0)
+                if compare == "max":
+                    win = "A ✓" if ra > rb else ("B ✓" if rb > ra else "")
+                else:
+                    win = "A ✓" if ra < rb else ("B ✓" if rb < ra else "")
+            wc = ' class="win"' if win else ""
+            res_rows += f"<tr><td>{label}</td><td>{va}</td><td>{vb}</td><td{wc}>{win}</td></tr>"
+
+        doc = f"""<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Backtest {start_date} – {end_date}</title>
+<style>
+body{{font-family:-apple-system,sans-serif;background:#080d1a;color:#e2e8f0;margin:0;padding:32px}}
+h1{{color:#00c896;font-size:22px;margin-bottom:4px}}
+h2{{color:#0ea5e9;font-size:15px;margin:24px 0 8px}}
+p.sub{{color:#4a6080;font-size:13px;margin:4px 0 16px}}
+table{{border-collapse:collapse;width:100%;margin-bottom:16px}}
+th{{background:#111e33;color:#00c896;padding:8px 14px;text-align:left;font-size:12px}}
+td{{padding:7px 14px;border-bottom:1px solid #1a2f50;font-size:13px}}
+.win{{color:#22c55e;font-weight:bold}}
+pre{{background:#060b17;color:#94a3b8;padding:16px;border-radius:6px;font-size:11px;overflow-x:auto;line-height:1.5}}
+</style></head><body>
+<h1>🧪 Backtest Report</h1>
+<p class="sub">Zeitraum: {start_date} – {end_date} &nbsp;|&nbsp; Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+<h2>Parameter</h2>
+<table><tr><th>Parameter</th><th>Szenario A</th><th>Szenario B</th></tr>{par_rows}</table>
+<h2>Ergebnisse</h2>
+<table><tr><th>Kennzahl</th><th>Szenario A</th><th>Szenario B</th><th>Gewinner</th></tr>{res_rows}</table>
+<h2>Vollständiger Log</h2>
+<pre>{_hl.escape(log_text)}</pre>
+</body></html>"""
+        f = tempfile.NamedTemporaryFile(suffix=".html", delete=False,
+                                        mode="w", encoding="utf-8")
+        f.write(doc)
+        f.close()
+        import webbrowser as _wb
+        _wb.open(f"file://{f.name}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ANALYSE TAB
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_analyse(self, parent):
+        parent.configure(fg_color=C["surface"])
+
+        hdr = ctk.CTkFrame(parent, fg_color=C["header"], corner_radius=0, height=52)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text="📈  Shadow Trade Analyse",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=C["accent"]).pack(side="left", padx=16)
+
+        sc = ctk.CTkScrollableFrame(parent, fg_color=C["surface"])
+        sc.pack(fill="both", expand=True)
+
+        # Datei-Info
+        shadow_path = os.path.join(_BASE, "shadow_trades.jsonl")
+        fi = ctk.CTkFrame(sc, fg_color=C["surface2"], corner_radius=8)
+        fi.pack(fill="x", padx=12, pady=(10, 0))
+        ctk.CTkLabel(fi, text="Datei:", font=ctk.CTkFont(size=12),
+                     text_color=C["muted"]).pack(side="left", padx=(12, 6), pady=8)
+        ctk.CTkLabel(fi, text=shadow_path,
+                     font=ctk.CTkFont(family="Courier", size=11),
+                     text_color=C["text"]).pack(side="left")
+        self._an_count_lbl = ctk.CTkLabel(fi, text="",
+                                          font=ctk.CTkFont(size=11),
+                                          text_color=C["muted"])
+        self._an_count_lbl.pack(side="right", padx=12)
+        try:
+            with open(shadow_path) as _f:
+                self._an_count_lbl.configure(text=f"{sum(1 for _ in _f)} Einträge")
+        except Exception:
+            pass
+
+        # Kontroll-Leiste
+        ctrl = ctk.CTkFrame(sc, fg_color="transparent")
+        ctrl.pack(fill="x", padx=12, pady=(8, 0))
+
+        self._an_run_btn = ctk.CTkButton(
+            ctrl, text="▶  Analyse starten", width=170, height=36,
+            fg_color=C["accent"], hover_color="#009e78", text_color="#000000",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._an_start_run)
+        self._an_run_btn.pack(side="left", padx=(0, 12))
+
+        self._an_status_lbl = ctk.CTkLabel(
+            ctrl, text="Bereit — Klick zum Start.",
+            font=ctk.CTkFont(size=11), text_color=C["muted"])
+        self._an_status_lbl.pack(side="left")
+
+        self._an_export_btn = ctk.CTkButton(
+            ctrl, text="⤓  HTML-Report", width=150, height=36,
+            fg_color=C["surface2"], hover_color=C["border"],
+            text_color=C["muted"], font=ctk.CTkFont(size=12),
+            state="disabled", command=self._an_open_html)
+        self._an_export_btn.pack(side="right")
+
+        # Output
+        ctk.CTkLabel(sc, text="  Analyse-Ausgabe", anchor="w",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=C["muted"]).pack(fill="x", padx=12, pady=(12, 2))
+        self._an_output = ctk.CTkTextbox(
+            sc, height=520,
+            font=ctk.CTkFont(family="Courier", size=10),
+            fg_color=C["bg"], text_color=C["text"],
+            border_color=C["border"], border_width=1)
+        self._an_output.pack(fill="both", expand=True, padx=12, pady=(0, 16))
+        self._an_output.configure(state="disabled")
+        self._an_output_text = None
+
+    def _an_start_run(self):
+        self._an_run_btn.configure(state="disabled", text="⏳  Läuft...")
+        self._an_export_btn.configure(state="disabled")
+        self._an_status_lbl.configure(text="Analyse läuft...", text_color=C["muted"])
+        self._an_output.configure(state="normal")
+        self._an_output.delete("1.0", "end")
+        self._an_output.configure(state="disabled")
+        threading.Thread(target=self._an_run_thread, daemon=True).start()
+
+    def _an_run_thread(self):
+        try:
+            an_path = None
+            for base in [_BASE, _BUNDLE_BASE]:
+                p = os.path.join(base, "shadow_analyze.py")
+                if os.path.exists(p):
+                    an_path = p
+                    break
+            if not an_path:
+                raise FileNotFoundError("shadow_analyze.py nicht gefunden")
+            result = subprocess.run(
+                [sys.executable, an_path],
+                capture_output=True, text=True, timeout=60,
+                cwd=os.path.dirname(an_path))
+            out = result.stdout
+            if result.returncode != 0 and result.stderr:
+                out += f"\n\n⚠️  STDERR:\n{result.stderr}"
+            self.after(0, lambda o=out: self._an_show_output(o))
+        except Exception:
+            import traceback
+            self.after(0, lambda e=traceback.format_exc(): self._an_on_error(e))
+
+    def _an_show_output(self, text):
+        self._an_output.configure(state="normal")
+        self._an_output.delete("1.0", "end")
+        self._an_output.insert("1.0", text)
+        self._an_output.configure(state="disabled")
+        self._an_output_text = text
+        self._an_run_btn.configure(state="normal", text="▶  Analyse starten")
+        self._an_export_btn.configure(state="normal", text_color=C["text"])
+        self._an_status_lbl.configure(text="✅ Fertig!", text_color=C["green"])
+
+    def _an_on_error(self, err):
+        self._an_output.configure(state="normal")
+        self._an_output.insert("end", f"\n❌ FEHLER:\n{err}")
+        self._an_output.configure(state="disabled")
+        self._an_run_btn.configure(state="normal", text="▶  Analyse starten")
+        self._an_status_lbl.configure(text="❌ Fehler aufgetreten", text_color=C["red"])
+
+    def _an_open_html(self):
+        if not self._an_output_text:
+            return
+        import webbrowser, tempfile, html as _hl
+        txt = _hl.escape(self._an_output_text)
+        doc = f"""<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Shadow Trade Analyse {datetime.now().strftime('%Y-%m-%d')}</title>
+<style>
+body{{font-family:-apple-system,sans-serif;background:#080d1a;color:#e2e8f0;margin:0;padding:32px}}
+h1{{color:#00c896;font-size:22px;margin-bottom:4px}}
+p.sub{{color:#4a6080;font-size:13px;margin:4px 0 24px}}
+pre{{background:#060b17;color:#94a3b8;padding:20px;border-radius:6px;font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre}}
+</style></head><body>
+<h1>📈 Shadow Trade Analyse</h1>
+<p class="sub">Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+<pre>{txt}</pre>
+</body></html>"""
+        f = tempfile.NamedTemporaryFile(suffix=".html", delete=False,
+                                        mode="w", encoding="utf-8")
+        f.write(doc)
+        f.close()
+        webbrowser.open(f"file://{f.name}")
 
     def on_closing(self):
         if self._running:
