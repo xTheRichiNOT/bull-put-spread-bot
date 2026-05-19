@@ -729,37 +729,7 @@ async def build_strike_map(ib):
 
 
 async def get_market_data(symbol, ib=None):
-    """Hole Kurs und ATM-IV. IB reqMktData zuerst, Fallback auf yfinance."""
-    import math as _math
-    from ib_insync import Stock as _Stock
-
-    if ib and ib.isConnected():
-        try:
-            global _sem_ib_mktdata
-            if _sem_ib_mktdata is None:
-                _sem_ib_mktdata = asyncio.Semaphore(2)
-            async with _sem_ib_mktdata:
-                t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
-                await asyncio.sleep(4)
-            ib_price = None
-            for v in (t.last, t.close, t.bid):
-                if v and v > 0 and not _math.isnan(v):
-                    ib_price = float(v)
-                    break
-            try:
-                ib.cancelMktData(t)
-            except Exception:
-                pass
-            ib_iv = getattr(t, 'impliedVolatility', None)
-            ib_iv = float(ib_iv) if (ib_iv and not _math.isnan(ib_iv) and ib_iv > 0) else None
-            if ib_price:
-                if ib_iv:
-                    return ib_price, ib_iv
-                _, yf_iv = await _get_market_data_yf(symbol)
-                return ib_price, yf_iv
-        except Exception:
-            pass
-
+    """Hole Kurs und ATM-IV via yfinance (Stocks nie via IB reqMktData — Subscription-Limit)."""
     return await _get_market_data_yf(symbol)
 
 
@@ -811,33 +781,21 @@ async def _get_market_data_yf(symbol):
         log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
 
-async def _ib_price_scan(symbols: list, ib) -> dict:
-    """Concurrent reqMktData für alle Symbole — max 70 gleichzeitig (< IB-Limit 100).
-    Alle Symbole starten parallel, Semaphore hält Slot für die volle Subscription-Dauer.
-    Zwei Wellen à ~4s statt 15 sequentielle Batches à ~4s = ~8s statt ~60s."""
-    import math as _math
-    from ib_insync import Stock as _Stock
-
-    _sem = asyncio.Semaphore(70)
+async def _yf_stock_scan(symbols: list) -> dict:
+    """Aktienkurse via yfinance fast_info — kein IB reqMktData, kein Subscription-Limit."""
+    _sem = asyncio.Semaphore(5)
 
     async def _fetch_one(sym):
         async with _sem:
             try:
-                t = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '', False, False)
-                await asyncio.sleep(4)
-                price = None
-                for v in (t.last, t.close, t.bid):
-                    if v and v > 0 and not _math.isnan(v):
-                        price = float(v)
-                        break
-                iv = getattr(t, 'impliedVolatility', None)
-                iv = float(iv) if (iv and not _math.isnan(iv) and iv > 0) else None
-                try:
-                    ib.cancelMktData(t)
-                except Exception:
-                    pass
-                if price is not None:
-                    return sym, (price, iv)
+                def _get():
+                    import yfinance as yf
+                    fi = yf.Ticker(sym).fast_info
+                    price = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
+                    return float(price) if price and price > 0 else None
+                price = await asyncio.wait_for(asyncio.to_thread(_get), timeout=10)
+                if price:
+                    return sym, (price, None)
             except Exception:
                 pass
             return sym, None
@@ -1111,12 +1069,12 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
                 if _con.conId:
                     short_strike = _candidate
                     async with _sem_ib_mktdata:
-                        t_scan = ib.reqMktData(_con, '', False, False)
-                        await asyncio.sleep(6)
-                    try:
-                        ib.cancelMktData(t_scan)
-                    except Exception:
-                        pass
+                        t_scan = ib.reqMktData(_con, '13', False, False)
+                        await asyncio.sleep(8)
+                        try:
+                            ib.cancelMktData(t_scan)
+                        except Exception:
+                            pass
                     break
             except Exception:
                 continue
@@ -2330,34 +2288,13 @@ async def run_bot(stop_event: threading.Event = None):
                     await asyncio.sleep(1)
                 continue
 
-            # ── Phase 1a: IB concurrent reqMktData (alle Symbole, max 70 gleichzeitig) ─
+            # ── Phase 1a: yfinance Stock-Scan (primär, kein IB-Subscription-Limit) ─
             t0 = datetime.now()
-            ib_price_data: dict = {}
-            if ib and ib.isConnected():
-                log(f"   Scanne {len(WATCHLIST)} Symbole via IB ...")
-                ib_price_data = await _ib_price_scan(WATCHLIST, ib)
-                elapsed = (datetime.now() - t0).total_seconds()
-                log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
-
-            # ── Phase 1b: yfinance-Fallback für fehlende Symbole ─────────────
-            missing = [s for s in WATCHLIST if s not in ib_price_data]
-            if missing:
-                _sem_yf = asyncio.Semaphore(3)
-                async def _yf_fill(sym):
-                    async with _sem_yf:
-                        p, v = await _get_market_data_yf(sym)
-                    if p is not None:
-                        # IV aus Cache nehmen falls yfinance keinen liefert
-                        if v is None:
-                            cached = _iv_cache.get(sym)
-                            if cached and _time.time() - cached[1] < _IV_CACHE_TTL:
-                                v = cached[0]
-                        if v is not None:
-                            _iv_cache[sym] = (v, _time.time())
-                        ib_price_data[sym] = (p, v)
-                import time as _time
-                await asyncio.gather(*[_yf_fill(s) for s in missing],
-                                     return_exceptions=True)
+            import time as _time
+            log(f"   Scanne {len(WATCHLIST)} Symbole via yfinance ...")
+            ib_price_data: dict = await _yf_stock_scan(WATCHLIST)
+            elapsed = (datetime.now() - t0).total_seconds()
+            log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
 
             # ── Phase 1c: IV via Cache + yfinance-Fallback (TTL 5min) ──────────
             # IV ändert sich langsam → Cache verhindert yfinance-Spam jeden Scan-Zyklus
