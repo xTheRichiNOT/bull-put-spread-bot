@@ -1101,7 +1101,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
                 if _con.conId:
                     short_strike = _candidate
                     async with _sem_ib_mktdata:
-                        t_scan = ib.reqMktData(_con, '13', False, False)
+                        t_scan = ib.reqMktData(_con, '', False, False)
                         await asyncio.sleep(8)
                         try:
                             ib.cancelMktData(t_scan)
@@ -2104,6 +2104,7 @@ async def run_bot(stop_event: threading.Event = None):
             101,                    # Max Tickers — Demo-typisch, wird via Fallback behandelt
             200,                    # Kein Contract gefunden — wird im Code abgefangen (conId=0)
             10147,                  # Cancel für orderId=0 — wird im Code übersprungen
+            321,                    # Invalid genTickList (sollte nicht mehr vorkommen, Sicherheitsnetz)
         }
         _IB_SUPPRESS_PHRASES = (
             'cancelMktData: No reqId found',   # Cancel auf bereits bereinigter Subscription
