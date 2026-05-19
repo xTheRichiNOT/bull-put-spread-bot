@@ -1190,8 +1190,8 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
                     t_combo = ib.reqMktData(combo_bag, '', False, False)
                     await asyncio.sleep(5)
                     combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
-                try: ib.cancelMktData(t_combo)
-                except Exception: pass
+                    try: ib.cancelMktData(t_combo)
+                    except Exception: pass
                 if combo_bid is not None and combo_bid > 0:
                     praemie        = combo_bid
                     praemie_quelle = "IB (Combo)"
@@ -2107,6 +2107,7 @@ async def run_bot(stop_event: threading.Event = None):
 
         _IB_SUPPRESS_CODES = {
             10089, 10090, 10091,    # Kein Abo / Subscription nötig — yfinance-Fallback greift
+            10197,                  # Keine Combo-Daten bei konkurrierender Live-Sitzung — Fallback auf Einzel-Bid
             2104, 2106, 2107,       # Market-Data-Farm OK
             2108, 2158, 2157,       # Hist./SecDef-Farm OK
             504,                    # Not connected (transient)
