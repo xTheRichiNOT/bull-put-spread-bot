@@ -159,7 +159,7 @@ MAX_LOSS_PROB    = 0.22    # Hard-Block: P(MaxVerlust) > 22% → Totalverlustris
 MIN_EV_RATIO     = 0.005   # Hard-Block: EV < 0.5% des Credits → statistisch kein Vorteil
 
 # Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
-ENTRY_THRESHOLD  = 0.70    # Score ≥ 0.70: Trade-Kandidat (PDF-konform)
+ENTRY_THRESHOLD  = 0.60    # Score ≥ 0.60: Trade-Kandidat
 WATCH_THRESHOLD  = 0.50    # Score 0.50–0.60: Watch (war 0.62)
 MAX_TRADES_PER_DAY = int(_cfg.get('max_trades_per_day', 10))  # Daily Budget
 RATIO_TOLERANCE  = 0.20
