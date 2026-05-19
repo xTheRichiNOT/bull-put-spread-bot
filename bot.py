@@ -775,11 +775,10 @@ async def _get_market_data_yf(symbol, ib=None):
                             if iv_ib and iv_ib > 0:
                                 return None, iv_ib   # Preis kommt aus ib_price_data, IV ist das Ziel
                         finally:
-                            if t_opt is not None:
-                                try:
-                                    ib.cancelMktData(t_opt)
-                                except Exception:
-                                    pass
+                            try:
+                                ib.cancelMktData(opt_con)  # Contract, nicht Ticker
+                            except Exception:
+                                pass
         except Exception:
             pass
 
@@ -879,17 +878,16 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
 
     missing = [s for s in symbols if s not in results]
     log(f"   📡 IB-Streaming für {len(missing)} Symbole (Schlusskurs) ...")
-    sem_ib = asyncio.Semaphore(15)
+    sem_ib = asyncio.Semaphore(8)  # max 8 gleichzeitig — weit unter 100er-Limit
 
     async def _fetch_ib(sym):
         async with sem_ib:
-            t = None
+            con = Stock(sym, 'SMART', 'USD')
             try:
-                con = Stock(sym, 'SMART', 'USD')
                 await ib.qualifyContractsAsync(con)
                 if not con.conId:
                     return
-                t = ib.reqMktData(con, '', False, False)  # Streaming, kein Snapshot
+                t = ib.reqMktData(con, '', False, False)
                 for _ in range(4):                         # max 0.8s warten
                     await asyncio.sleep(0.2)
                     price = (t.close if (t.close and t.close > 0) else
@@ -900,11 +898,10 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
             except Exception:
                 pass
             finally:
-                if t is not None:
-                    try:
-                        ib.cancelMktData(t)
-                    except Exception:
-                        pass
+                try:
+                    ib.cancelMktData(con)  # Contract übergeben, nicht Ticker!
+                except Exception:
+                    pass
 
     await asyncio.gather(*[_fetch_ib(s) for s in missing], return_exceptions=True)
     return results
@@ -1015,11 +1012,10 @@ async def get_vix(ib=None) -> float:
         except Exception:
             pass
         finally:
-            if t_vix is not None:
-                try:
-                    ib.cancelMktData(t_vix)
-                except Exception:
-                    pass
+            try:
+                ib.cancelMktData(vix_con)  # Contract, nicht Ticker
+            except Exception:
+                pass
 
     # ── Versuch 2: yfinance (Fallback wenn IB nichts liefert) ───────────────
     if val <= 0:
