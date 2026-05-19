@@ -240,7 +240,7 @@ def _save_prefs(prefs: dict):
 
 DEFAULT_CONFIG = {
     "ib_host":             "127.0.0.1",
-    "ib_port":             7497,
+    "ib_port":             7496,
     "ib_account":          "",
     "min_vola":            0.28,
     "abstand_y":           0.10,
@@ -251,7 +251,6 @@ DEFAULT_CONFIG = {
     "max_per_sector":      2,
     "scan_intervall":      60,
     "auto_trade":          True,
-    "live_market_data":    False,
     "take_profit_pct":     0.70,
     "stop_loss_mult":      2.0,
     "dte_exit":            0,
@@ -322,19 +321,15 @@ IB_SETUP_TEXT = """
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SCHRITT 2 — Konto erstellen (Paper Trading = kostenlos)
+ SCHRITT 2 — Live-Konto bei Interactive Brokers
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Paper Trading:  Kostenloses Demokonto mit $1.000.000 Testkapital
-                  → Kein echtes Geld, ideal zum Testen des Bots
-                  → Konto-Nummer beginnt mit "DU"  (z.B. DU1234567)
+  Live Trading:   Echtes Brokerkonto mit echtem Kapital
+                  → Konto-Nummer beginnt mit "U"  (z.B. U1234567)
 
-  Live Trading:   Echtes Brokerkonto
-                  → Konto-Nummer beginnt mit "U"   (z.B. U1234567)
-
-  So erstellst du ein Paper Trading Konto:
+  Konto eröffnen:
   1. Einloggen auf interactivebrokers.com
-  2. Konto → Paper Trading Konto → Paper Trading Konto beantragen
+  2. Konto → Konto eröffnen → Live-Konto
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -342,8 +337,7 @@ IB_SETUP_TEXT = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   1. Starte TWS
-  2. Wähle beim Login "Paper Trading" (für Tests)
-     ODER  "Live Trading"  (für echten Handel)
+  2. Wähle beim Login "Live Trading"
   3. Gib deine IB-Zugangsdaten ein
 
 
@@ -362,9 +356,7 @@ IB_SETUP_TEXT = """
 
   Socket Port:
   ┌───────────────────────────────────────────────────────────┐
-  │  TWS Paper Trading          →  Port 7497  (Standard)      │
-  │  TWS Live Trading           →  Port 7496                  │
-  │  IB Gateway Paper           →  Port 4002                  │
+  │  TWS Live Trading           →  Port 7496  (Standard)      │
   │  IB Gateway Live            →  Port 4001                  │
   └───────────────────────────────────────────────────────────┘
 
@@ -381,7 +373,7 @@ IB_SETUP_TEXT = """
   • ODER:  Konto → Kontoauszug → Account-Nummer oben links
 
   Diese Nummer trägst du in den Einstellungen unter
-  "Account-Nummer" ein  (z.B. DU1234567 oder U1234567)
+  "Account-Nummer" ein  (z.B. U1234567)
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -394,7 +386,7 @@ IB_SETUP_TEXT = """
   In TWS:  Konto → Konto-Management → Handelsberechtigungen
            → Options → Stufe 2 (oder höher) beantragen
 
-  ℹ  Paper Trading Konten haben Options standardmäßig freigeschaltet
+  ℹ  Bei manchen Konten muss Options-Handel separat beantragt werden (Stufe 2+)
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -406,7 +398,7 @@ IB_SETUP_TEXT = """
   ☐  TWS läuft und du bist eingeloggt
   ☐  API ist aktiviert  (Schritt 4)
   ☐  Account-Nummer in Einstellungen eingetragen
-  ☐  Richtiger Port in Einstellungen  (7497 für Paper)
+  ☐  Richtiger Port in Einstellungen  (7496 für TWS Live)
   ☐  "Auto-Trade" in Einstellungen nach Wunsch gesetzt
      (Aus = nur Signale anzeigen,  An = automatisch Orders platzieren)
 
@@ -417,10 +409,10 @@ IB_SETUP_TEXT = """
  HÄUFIGE FEHLER & LÖSUNGEN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ❌  "Connection refused" / "Timeout auf Port 7497"
+  ❌  "Connection refused" / "Timeout auf Port 7496"
       → TWS ist nicht geöffnet oder nicht eingeloggt
       → API nicht aktiviert  (Schritt 4 nochmal prüfen)
-      → Falscher Port  (Paper=7497, Live=7496)
+      → Falscher Port  (TWS Live=7496, Gateway Live=4001)
 
   ❌  "Error 201: Order rejected"
       → "Read-Only API" ist noch aktiviert → deaktivieren!
@@ -579,12 +571,10 @@ class UpdateDialog(ctk.CTkToplevel):
 class SetupWizard(ctk.CTkToplevel):
     """Erststart-Wizard: führt den Kunden durch Platform / Software / Modus / Account."""
 
-    # Port-Matrix: (software, trading_mode) → port
+    # Port-Matrix: software → port (Live only)
     _PORTS = {
-        ("TWS",     "Paper"): 7497,
-        ("TWS",     "Live"):  7496,
-        ("Gateway", "Paper"): 4002,
-        ("Gateway", "Live"):  4001,
+        "TWS":     7496,
+        "Gateway": 4001,
     }
 
     def __init__(self, parent: ctk.CTk, cfg: dict, on_done):
@@ -603,7 +593,6 @@ class SetupWizard(ctk.CTkToplevel):
         # Wizard-State
         self._platform  = ctk.StringVar(value="Desktop")
         self._software  = ctk.StringVar(value="TWS")
-        self._mode      = ctk.StringVar(value="Paper")
         self._account   = ctk.StringVar(value=cfg.get("ib_account", ""))
         self._host      = ctk.StringVar(value=cfg.get("ib_host", "127.0.0.1"))
 
@@ -649,12 +638,11 @@ class SetupWizard(ctk.CTkToplevel):
 
     def _show_step(self):
         self._clear_content()
-        self._step_lbl.configure(text=f"Schritt {self._step + 1} / 4")
+        self._step_lbl.configure(text=f"Schritt {self._step + 1} / 3")
         self._back_btn.configure(state="normal" if self._step > 0 else "disabled")
-        self._next_btn.configure(text="Fertig  ✓" if self._step == 3 else "Weiter →")
+        self._next_btn.configure(text="Fertig  ✓" if self._step == 2 else "Weiter →")
 
-        steps = [self._step_platform, self._step_software,
-                 self._step_mode,     self._step_account]
+        steps = [self._step_platform, self._step_software, self._step_account]
         steps[self._step]()
 
     # ── Step 1: Platform ──────────────────────────────────────────────────────
@@ -720,51 +708,17 @@ class SetupWizard(ctk.CTkToplevel):
             ctk.CTkLabel(f, text=desc, text_color="#64748b",
                          font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
 
-    # ── Step 3: Trading Mode ──────────────────────────────────────────────────
-    def _step_mode(self):
-        sw  = self._software.get()
-        ctk.CTkLabel(self._content,
-                     text="Paper Trading oder Live Trading?",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
-        ctk.CTkLabel(self._content,
-                     text="Paper Trading empfohlen zum Testen — kein echtes Geld.",
-                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 16))
-
-        for val, title, desc, color in [
-            ("Paper",
-             "Paper Trading  (Demokonto)",
-             "Kostenloses Testkonto mit $1.000.000 Spielgeld.\n"
-             f"Port: {self._PORTS[(sw, 'Paper')]}",
-             "#166534"),
-            ("Live",
-             "Live Trading  (echtes Geld)",
-             "Echte Orders mit echtem Kapital.\n"
-             f"Port: {self._PORTS[(sw, 'Live')]}  ⚠️  Nur wenn du weißt was du tust!",
-             "#7f1d1d"),
-        ]:
-            f = ctk.CTkFrame(self._content,
-                             fg_color=("#1e293b", "#1e293b"),
-                             corner_radius=8)
-            f.pack(fill="x", pady=4)
-            rb = ctk.CTkRadioButton(f, text=title, variable=self._mode, value=val,
-                                    font=ctk.CTkFont(size=13, weight="bold"),
-                                    fg_color=color)
-            rb.pack(anchor="w", padx=14, pady=(10, 2))
-            ctk.CTkLabel(f, text=desc, text_color="#64748b",
-                         font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
-
-    # ── Step 4: Account ───────────────────────────────────────────────────────
+    # ── Step 3: Account ───────────────────────────────────────────────────────
     def _step_account(self):
-        sw, mode = self._software.get(), self._mode.get()
-        port = self._PORTS[(sw, mode)]
-        prefix = "DU" if mode == "Paper" else "U"
+        sw   = self._software.get()
+        port = self._PORTS[sw]
 
         ctk.CTkLabel(self._content,
                      text="Deine IB Account-Nummer",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
 
         # Summary box
-        summary = (f"  Software:  {sw}   |   Modus: {mode} Trading   |   Port: {port}\n"
+        summary = (f"  Software:  {sw}   |   Modus: Live Trading   |   Port: {port}\n"
                    f"  Host:  {self._host.get()}")
         sf = ctk.CTkFrame(self._content, fg_color=("#0f172a", "#0f172a"), corner_radius=6)
         sf.pack(fill="x", pady=(0, 16))
@@ -772,11 +726,11 @@ class SetupWizard(ctk.CTkToplevel):
                      text_color="#38bdf8", justify="left").pack(padx=12, pady=8)
 
         ctk.CTkLabel(self._content,
-                     text=f"Account-Nummer  ({prefix}xxxxxxx):",
+                     text="Account-Nummer  (Uxxxxxxx):",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(4, 2))
         e = ctk.CTkEntry(self._content, textvariable=self._account,
                          width=200, font=ctk.CTkFont(size=13),
-                         placeholder_text=f"{prefix}1234567")
+                         placeholder_text="U1234567")
         e.pack(anchor="w")
         e.focus()
 
@@ -795,7 +749,7 @@ class SetupWizard(ctk.CTkToplevel):
             self._show_step()
 
     def _next(self):
-        if self._step == 3:
+        if self._step == 2:
             self._finish()
         else:
             self._step += 1
@@ -807,10 +761,10 @@ class SetupWizard(ctk.CTkToplevel):
             self._err_lbl.configure(text="⚠  Bitte Account-Nummer eingeben.")
             return
 
-        sw, mode = self._software.get(), self._mode.get()
+        sw = self._software.get()
         self._cfg["ib_account"] = acct
         self._cfg["ib_host"]    = self._host.get().strip() or "127.0.0.1"
-        self._cfg["ib_port"]    = self._PORTS[(sw, mode)]
+        self._cfg["ib_port"]    = self._PORTS[sw]
         save_config(self._cfg)
 
         self._done()
@@ -1684,12 +1638,10 @@ class BotLauncher(ctk.CTk):
                          font=ctk.CTkFont(size=12)).grid(
                 row=self._row, column=0, sticky="w", padx=(6, 16), pady=3)
             options = [
-                "7497  (TWS Paper Trading)",
                 "7496  (TWS Live Trading)",
-                "4002  (IB Gateway Paper)",
                 "4001  (IB Gateway Live)",
             ]
-            cur = str(self.cfg.get(key, 7497))
+            cur = str(self.cfg.get(key, 7496))
             default = next((o for o in options if o.startswith(cur)), options[0])
             var = ctk.StringVar(value=default)
             m = ctk.CTkOptionMenu(scroll, values=options, variable=var, width=230,
@@ -1715,7 +1667,7 @@ class BotLauncher(ctk.CTk):
         field("Host",           "ib_host",    tip="Normalerweise 127.0.0.1 — nicht ändern")
         port_field("Port",      "ib_port")
         field("Account-Nummer", "ib_account", width=160,
-              tip="z.B. DU1234567 (Paper) oder U1234567 (Live)")
+              tip="z.B. U1234567")
 
         section("Risiko-Management")
         field("Max. gleichzeitige Positionen",  "max_positions",       tip="Empfohlen: 6–10")
@@ -1737,7 +1689,6 @@ class BotLauncher(ctk.CTk):
 
         section("Automation")
         toggle_field("Auto-Trade — Orders automatisch platzieren", "auto_trade")
-        toggle_field("Echtzeit-Daten für Paper-Account (live_market_data)", "live_market_data")
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -1967,9 +1918,7 @@ class BotLauncher(ctk.CTk):
     def _reset_to_defaults(self):
         """Füllt alle Einstellungsfelder mit Standardwerten (ohne Speichern)."""
         _port_options = [
-            "7497  (TWS Paper Trading)",
             "7496  (TWS Live Trading)",
-            "4002  (IB Gateway Paper)",
             "4001  (IB Gateway Live)",
         ]
         for key, widget in self._fields.items():
@@ -1994,7 +1943,7 @@ class BotLauncher(ctk.CTk):
     def _check_tws(self) -> bool:
         """Prüft ob TWS / IB Gateway auf dem konfigurierten Port erreichbar ist."""
         host = self.cfg.get("ib_host", "127.0.0.1")
-        port = int(self.cfg.get("ib_port", 7497))
+        port = int(self.cfg.get("ib_port", 7496))
         try:
             with socket.create_connection((host, port), timeout=2):
                 return True
@@ -2009,7 +1958,7 @@ class BotLauncher(ctk.CTk):
                 "⚠  Bitte zuerst die Account-Nummer in den Einstellungen eintragen!\n"
                 "   (Tab 'Einstellungen' → Account-Nummer → Speichern)\n\n")
             return
-        port = self.cfg.get("ib_port", 7497)
+        port = self.cfg.get("ib_port", 7496)
         host = self.cfg.get("ib_host", "127.0.0.1")
         if not self._check_tws():
             self._log_append(

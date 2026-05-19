@@ -66,7 +66,6 @@ _cfg_defaults = {
     "max_risk_per_trade_pct": 0.02, # max 2 % NetLiq-Risiko pro Trade
     "max_total_risk_pct": 0.15,     # max 15 % NetLiq-Risiko gesamt offen
     "earnings_buffer_days": 14,     # kein Trade wenn Earnings < X Tage entfernt oder vor Expiry
-    "live_market_data": False,      # True = Echtzeit-Daten auch für Paper-Konten (wenn Abo vorhanden)
 }
 if os.path.exists(_cfg_path):
     try:
@@ -173,12 +172,11 @@ AUTO_TRADE       = bool(_cfg['auto_trade'])
 # Confidence-Score je nach Preis-Datenquelle
 PRICE_CONFIDENCE: dict[str, float] = {
     'REAL_BID_ASK': 1.0,   # Live NBBO — breitester Markt
-    'MIDPRICE':     0.9,   # Mid-Point aus echten Bid+Ask (Demo)
+    'MIDPRICE':     0.9,   # Mid-Point aus echten Bid+Ask
     'LAST_PRICE':   0.7,   # Greeks / letzter Handelspreis
     'BS_ESTIMATE':  0.4,   # Black-Scholes / yfinance-Schätzung
 }
-MIN_CONFIDENCE_LIVE  = 0.9   # Live: mindestens echtes Bid/Ask erforderlich
-MIN_CONFIDENCE_PAPER = 0.3   # Demo: BS erlaubt, aber IV>25% und Kurs valid
+MIN_CONFIDENCE_LIVE = 0.9   # Mindestens echtes Bid/Ask erforderlich
 
 # Kill-Switch
 MAX_DAILY_LOSS         = float(_cfg.get('max_daily_loss', 500))    # 0 = disabled
@@ -331,10 +329,7 @@ def _now_et() -> datetime:
         return datetime.now(edt)
 
 def is_market_open() -> bool:
-    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ).
-    test_mode: true in config.json überspringt diese Prüfung komplett."""
-    if _cfg.get('test_mode', False):
-        return True
+    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ)."""
     now_et = _now_et()
     if now_et.weekday() >= 5:
         return False
@@ -380,10 +375,7 @@ def _sym_lock(symbol: str) -> asyncio.Lock:
     """Gibt einen asyncio.Lock pro Symbol zurück — immer nur EIN Order-Vorgang gleichzeitig."""
     return _contract_locks.setdefault(symbol, asyncio.Lock())
 
-# Demo/Live-Modus — wird beim Start via Kontonummer gesetzt
-IS_DEMO_MODE:   bool = False
-USE_LIVE_DATA:  bool = False   # True wenn live_market_data:true oder echtes Live-Konto
-ACCOUNT_ID:     str  = ''
+ACCOUNT_ID: str = ''
 
 # Kill-Switch: True wenn Tages-/Wochenverlust-Limit überschritten
 _kill_switch_active: bool  = False
@@ -654,10 +646,8 @@ def _bs_put(S, K, T, sigma, r=0.045):
     d2 = d1 - sigma * math.sqrt(T)
     return K * math.exp(-r * T) * ncdf(-d2) - S * ncdf(-d1)
 
-def _yf_net_credit(puts, short_strike, long_strike, short_bid_yf, demo_mode: bool):
-    """Berechnet den Netto-Credit aus yfinance-Daten.
-    Demo-Modus:  Mid-Point pro Leg: (Short-Bid+Ask)/2 − (Long-Bid+Ask)/2
-    Live-Modus:  Konservativ: Short-Bid − Long-Ask
+def _yf_net_credit(puts, short_strike, long_strike, short_bid_yf):
+    """Berechnet den Netto-Credit aus yfinance-Daten (konservativ: Short-Bid − Long-Ask).
     Gibt (praemie, quelle) zurück oder None wenn Daten fehlen."""
     import math as _m
     def _safe(v):
@@ -672,16 +662,8 @@ def _yf_net_credit(puts, short_strike, long_strike, short_bid_yf, demo_mode: boo
         if sr.empty or lr.empty:
             return None
         s_bid = _safe(sr.iloc[0]['bid'])
-        s_ask = _safe(sr.iloc[0]['ask'])
-        l_bid = _safe(lr.iloc[0]['bid'])
         l_ask = _safe(lr.iloc[0]['ask'])
-        if demo_mode and s_bid and s_ask:
-            s_mid = (s_bid + s_ask) / 2
-            l_mid = ((l_bid + l_ask) / 2) if l_bid and l_ask else (l_ask or 0)
-            net = round(s_mid - l_mid, 2)
-            if net > 0:
-                return net, "yfinance (Mid-Point)"
-        elif s_bid and l_ask:
+        if s_bid and l_ask:
             net = round(max(s_bid - l_ask, 0.01), 2)
             return net, "yfinance (Net Bid-Ask)"
     except Exception:
@@ -1941,64 +1923,29 @@ async def place_order(ib, sig):
             has_real_bid = bool(t_short.bid and t_short.bid > 0)
             has_real_ask = bool(t_long.ask  and t_long.ask  > 0)
 
-            if USE_LIVE_DATA:
-                # Live-Pfad: echtes Bid/Ask oder modelGreeks — striktere Preisfindung
-                ibkr_net = round(short_bid - long_ask, 2) if (short_bid and long_ask) else 0.0
-                has_model = not has_real_bid and bool(
-                    t_short.modelGreeks and t_short.modelGreeks.optPrice
-                    and t_short.modelGreeks.optPrice > 0)
-                discount    = 0.75 if (has_real_bid or has_model) else 0.65
-                limit_price = round(max(ibkr_net * discount, 0.01), 2)
-                quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
-                if has_real_bid:
-                    price_src = 'REAL_BID_ASK'
-                elif price_src == 'BS_ESTIMATE':
-                    price_src = 'LAST_PRICE'
-            else:
-                # Delayed-Daten / Paper ohne Abo: Mid-Point-Fallback mit Toleranz
-                def _mid(t, fallback):
-                    b = t.bid if (t.bid and t.bid > 0) else None
-                    a = t.ask if (t.ask and t.ask > 0) else None
-                    if b and a:
-                        return (b + a) / 2
-                    return b or a or fallback
-                short_val = _mid(t_short, short_bid)
-                long_val  = _mid(t_long,  long_ask)
-                ibkr_net  = round(short_val - long_val, 2)
-                if ibkr_net <= 0:
-                    log(f"  ✗ [{sym}] PAPER MODE: IB Mid-Point ≤0 — keine verwertbaren Marktdaten, Trade abgebrochen")
-                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                    return
-                elif price_src == 'BS_ESTIMATE' and (has_real_bid or has_real_ask):
-                    price_src = 'MIDPRICE'
-                elif has_real_bid and has_real_ask:
-                    price_src = 'MIDPRICE'
-                limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
-                quelle = "Mid-Point (Delayed)"
+            ibkr_net = round(short_bid - long_ask, 2) if (short_bid and long_ask) else 0.0
+            has_model = not has_real_bid and bool(
+                t_short.modelGreeks and t_short.modelGreeks.optPrice
+                and t_short.modelGreeks.optPrice > 0)
+            discount    = 0.75 if (has_real_bid or has_model) else 0.65
+            limit_price = round(max(ibkr_net * discount, 0.01), 2)
+            quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
+            if has_real_bid:
+                price_src = 'REAL_BID_ASK'
+            elif price_src == 'BS_ESTIMATE':
+                price_src = 'LAST_PRICE'
 
             # ── Confidence-Gate ─────────────────────────────────────────────
             confidence = PRICE_CONFIDENCE[price_src]
-            min_conf   = MIN_CONFIDENCE_LIVE if USE_LIVE_DATA else MIN_CONFIDENCE_PAPER
+            min_conf   = MIN_CONFIDENCE_LIVE
             if confidence < min_conf:
-                sig_iv    = sig.get('iv', 0)
-                sig_preis = sig.get('preis', 0)
-                # BS im Delayed-Modus: erlaubt wenn IV>25% und Underlying-Preis valide
-                if not USE_LIVE_DATA and price_src == 'BS_ESTIMATE' and sig_iv > 0.25 and sig_preis > 0:
-                    log(f"  ⚠️  [{sym}] [{price_src}] Conf={confidence:.2f} — erlaubt (Delayed): "
-                        f"IV={sig_iv:.1%}>25%, Kurs=${sig_preis:.2f} valid")
-                else:
-                    reasons = []
-                    if not USE_LIVE_DATA and price_src == 'BS_ESTIMATE':
-                        if sig_iv <= 0.25:  reasons.append(f"IV={sig_iv:.1%} ≤ 25%")
-                        if not sig_preis:   reasons.append("Kurs ungültig")
-                    log(f"  ✗ [{sym}] Confidence {confidence:.2f} [{price_src}] < {min_conf:.2f} min"
-                        + (f" — {', '.join(reasons)}" if reasons else "") + " — Trade abgebrochen")
-                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                    return
+                log(f"  ✗ [{sym}] Confidence {confidence:.2f} [{price_src}] < {min_conf:.2f} min — Trade abgebrochen")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
 
             has_model  = bool(t_short.modelGreeks and t_short.modelGreeks.optPrice
                               and t_short.modelGreeks.optPrice > 0)
-            rr_minimum = MIN_RISK_REWARD if (not USE_LIVE_DATA or has_real_bid) else MIN_RISK_REWARD * 1.5
+            rr_minimum = MIN_RISK_REWARD if has_real_bid else MIN_RISK_REWARD * 1.5
 
             short_delta = None
             if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
@@ -2152,35 +2099,17 @@ def print_ranking(signals, selected):
                 f" liq={s.get('liquidity_score',0):.3f} earn_pen={s.get('earnings_penalty',0):.3f}")
     log(f"{'─'*100}")
 
-async def configure_environment(ib) -> bool:
-    """Erkennt Demo/Live-Modus anhand der Kontonummer und konfiguriert IB entsprechend.
-    Demo-Konten bei IBKR beginnen mit 'D' (z.B. DU123456).
-    Gibt True zurück wenn Demo-Modus aktiv, sonst False."""
-    global IS_DEMO_MODE, USE_LIVE_DATA, ACCOUNT_ID
+async def configure_environment(ib) -> None:
+    """Verbindet mit Live-Konto, setzt Echtzeit-Marktdaten."""
+    global ACCOUNT_ID
     accounts = ib.managedAccounts()
     ACCOUNT_ID = accounts[0] if accounts else _cfg.get('ib_account', '')
-    IS_DEMO_MODE = ACCOUNT_ID.upper().startswith('D')
-
-    # Datenqualität: unabhängig vom Account-Typ konfigurierbar.
-    # Paper-Konten mit Live-Daten-Abo → live_market_data: true in config.json
-    USE_LIVE_DATA = not IS_DEMO_MODE or bool(_cfg.get('live_market_data', False))
-    ib.reqMarketDataType(1 if USE_LIVE_DATA else 3)
-
+    ib.reqMarketDataType(1)  # Immer Echtzeit-Daten (Live-Konto)
     log("=" * 60)
-    if IS_DEMO_MODE:
-        log("  MODUS: DEMO / PAPER-TRADING  (Konto: " + ACCOUNT_ID + ")")
-        if USE_LIVE_DATA:
-            log("  Echtzeit-Daten aktiv (live_market_data: true)")
-        else:
-            log("  Delayed-Daten aktiv — nur echte IB/yfinance-Daten erlaubt")
-        log("  Orders werden mit Toleranz +/-$0.02 platziert")
-    else:
-        log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
-        log("  Echtzeit-Daten aktiv — nur echtes Bid/Ask erlaubt")
-        log("  Strikte Limit-Orders am exakten Mid-Point")
+    log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
+    log("  Echtzeit-Daten aktiv — nur echtes Bid/Ask akzeptiert")
+    log("  Empfehlungs-Modus — kein Auto-Trade")
     log("=" * 60)
-
-    return IS_DEMO_MODE
 
 
 def _print_shadow_summary(days: int = 30) -> None:
@@ -2257,19 +2186,18 @@ async def _reconnect_ib(ib: 'IB', host: str, port: int,
 
 async def run_bot(stop_event: threading.Event = None):
     ib = IB()
-    log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7497)})")
+    log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7496)})")
     _print_shadow_summary(days=30)
 
     try:
         client_id = random.randint(10, 999)
         await ib.connectAsync(
             _cfg.get('ib_host', '127.0.0.1'),
-            int(_cfg.get('ib_port', 7497)),
+            int(_cfg.get('ib_port', 7496)),
             clientId=client_id,
         )
         log("✅ Verbunden mit IB (nur für Order-Placement)")
 
-        # Demo/Live erkennen und Marktdaten-Typ + Modus-Banner konfigurieren
         await configure_environment(ib)
 
         # ib_insync-Logger filtern: informative Codes und bekannte Nicht-Fehler unterdrücken
@@ -2429,11 +2357,11 @@ async def run_bot(stop_event: threading.Event = None):
             _save_state()
         log("")
     except TimeoutError:
-        port = _cfg.get('ib_port', 7497)
+        port = _cfg.get('ib_port', 7496)
         log(f"❌ Verbindung fehlgeschlagen (Timeout auf Port {port}).")
         log("   → TWS/IB Gateway läuft?")
         log("   → API aktiviert? (Edit → Global Configuration → API → Enable Socket Clients)")
-        log("   → Port korrekt? Paper=7497, Live=7496, Gateway-Paper=4002, Gateway-Live=4001")
+        log("   → Port korrekt? TWS Live=7496, Gateway Live=4001")
         ib.disconnect()
         return
 
@@ -2470,7 +2398,7 @@ async def run_bot(stop_event: threading.Event = None):
             if ib and not ib.isConnected():
                 log("  ⚠️  IB nicht verbunden — Auto-Reconnect ...")
                 _host = _cfg.get('ib_host', '127.0.0.1')
-                _port = int(_cfg.get('ib_port', 7497))
+                _port = int(_cfg.get('ib_port', 7496))
                 reconnected = await _reconnect_ib(ib, _host, _port, stop_event)
                 if reconnected:
                     ib.orderStatusEvent += _on_order_status
@@ -2587,14 +2515,12 @@ async def run_bot(stop_event: threading.Event = None):
             results     = [r for r in results if not isinstance(r, BaseException)]
             all_signals = [s for s in results if s is not None]
             elapsed = (datetime.now() - t0).seconds
-            modus_str = "[DEMO]" if IS_DEMO_MODE else "[LIVE]"
-            log(f"\n   {modus_str} Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
+            log(f"\n   [LIVE] Scan abgeschlossen in {elapsed}s | {len(WATCHLIST)} Symbole gescannt | {len(all_signals)} Signale über IV-Filter")
 
             # ── Phase 2: Signale filtern und ranken ───────────────────────────
-            # Im Demo-Modus: BS-Schätzungen erlaubt (kein Echtzeit-Feed verfügbar)
             qualified = [
                 s for s in all_signals
-                if (IS_DEMO_MODE or s['praemie_quelle'] != "Black-Scholes (geschätzt)")
+                if s['praemie_quelle'] != "Black-Scholes (geschätzt)"
                 and s.get('credit_ok_hard', True)
                 and s.get('decision') == 'TRADE'
             ]
@@ -2620,7 +2546,7 @@ async def run_bot(stop_event: threading.Event = None):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
-                # Margin-Check: reqAccountSummaryAsync → accountValues()-Cache → Demo-Fallback
+                # Margin-Check: reqAccountSummaryAsync → accountValues()-Cache als Fallback
                 try:
                     summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
                     av = {v.tag: v.value for v in summary
@@ -2629,8 +2555,6 @@ async def run_bot(stop_event: threading.Event = None):
                            or av.get('NetLiquidation') or '0')
                     available = float(raw)
 
-                    # Wenn reqAccountSummaryAsync 0 liefert (Demo-API-Verzögerung),
-                    # versuche den IB-internen Cache (accountValues) als zweite Quelle
                     if available <= 0:
                         cached_vals = {v.tag: v.value for v in ib.accountValues()
                                        if v.account == ACCOUNT_ID and v.currency in ('USD', '')}
@@ -2639,11 +2563,8 @@ async def run_bot(stop_event: threading.Event = None):
                         available = float(raw2)
                         if available > 0:
                             log(f"  💰 Verfügbare Mittel (Cache): ${available:,.0f}")
-                        elif IS_DEMO_MODE:
-                            log(f"  ⚠️  IBKR liefert $0 im Demo-Modus (API-Verzögerung) — Margin-Check übersprungen")
-                            available = MIN_AVAILABLE_FUNDS  # Kein Block, aber kein fake Kapital
                         else:
-                            log(f"  ⚠️  Kapital $0 — Live-Konto, Margin-Check wird ausgeführt")
+                            log(f"  ⚠️  Kapital $0 — Margin-Check wird ausgeführt")
                     else:
                         log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
 
@@ -2694,7 +2615,7 @@ async def run_bot(stop_event: threading.Event = None):
                 blocked = [s for s in all_signals if s not in tradeable]
                 for s in blocked:
                     reasons = []
-                    if s['praemie_quelle'] == "Black-Scholes (geschätzt)" and not IS_DEMO_MODE:
+                    if s['praemie_quelle'] == "Black-Scholes (geschätzt)":
                         reasons.append("kein echtes Bid (BS-Schätzung) — Live-Modus erfordert echtes Bid")
                     if not s.get('credit_ok_hard', True):
                         _c, _b = s['credit'], s['breite']

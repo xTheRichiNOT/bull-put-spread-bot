@@ -293,9 +293,8 @@ print(f"""
   (Ziel: 5–15% — bei zu viel Ablehnung Filter lockern, bei zu wenig strenger werden)
 
   A) LIQUIDITÄTSPROBLEM (74% aller Ablehnungen):
-     → Liegt an verzögerten Demo-Daten (IBKR Paper).
-     → Mit Captrade Live-Daten wird Open Interest realistischer — erst dann
-       entscheiden welche Symbole dauerhaft entfernt werden sollten.""")
+     → Open Interest zu gering — prüfen ob Symbol dauerhaft entfernt werden sollte.
+     → Kandidaten unten auflisten und nach weiteren Scan-Zyklen entscheiden.""")
 
 if liq_always:
     print(f"\n     Kandidaten für Entfernung NACH Live-Test:")
@@ -318,10 +317,8 @@ else:
 
 print(f"""
   D) NÄCHSTE SCHRITTE:
-     1. Captrade Live-Daten aktivieren → Liquiditätsprobleme sollten abnehmen
-     2. Bot 4 Wochen im Demo-Modus laufen lassen → technischen Betrieb prüfen
-     3. Nach 30 geschlossenen Trades: Score-Korrelation hier auswerten (Punkt 6)
-     4. Nach 60+ Trades: Watchlist-Bereinigung und Parameter-Feintuning
+     1. Nach 30 geschlossenen Trades: Score-Korrelation hier auswerten (Punkt 6)
+     2. Nach 60+ Trades: Watchlist-Bereinigung und Parameter-Feintuning
 """)
 
 print("═" * W)

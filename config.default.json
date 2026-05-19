@@ -1,6 +1,6 @@
 {
   "ib_host": "127.0.0.1",
-  "ib_port": 4002,
+  "ib_port": 7496,
   "ib_account": "",
   "min_vola": 0.28,
   "abstand_y": 0.1,
