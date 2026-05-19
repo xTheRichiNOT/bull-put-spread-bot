@@ -364,6 +364,10 @@ _strike_map: dict = {}
 # IV-Cache: {symbol: (iv, timestamp)} — verhindert yfinance-Spam bei jedem Scan-Zyklus
 _iv_cache: dict = {}
 _IV_CACHE_TTL = 300  # Sekunden (5 Minuten)
+
+# yfinance Rate-Limit Cooldown — wenn gesperrt, 10 Min direkt zu IB springen
+_yf_blocked_until: float = 0.0
+_YF_COOLDOWN = 600  # Sekunden
 # Order-IDs die absichtlich storniert werden (TP/SL-Rotation → kein falsches 'cancelled')
 _expected_cancels: set = set()
 # Begrenzt gleichzeitige IB reqMktData-Aufrufe — verhindert Error 101 (Max Tickers)
@@ -830,44 +834,53 @@ async def _get_market_data_yf(symbol, ib=None):
         return None, None
 
 async def _yf_stock_scan(symbols: list, ib=None) -> dict:
-    """Aktienpreise: yfinance Bulk-Download primär, IB-Snapshot als Fallback.
-    IB-Snapshot nutzt snapshot=True → keine dauerhafte Subscription, kein Error 101."""
+    """Aktienpreise: yfinance Bulk-Download primär, IB-Streaming als Fallback.
+    Bei Rate-Limit: 10-Minuten-Cooldown → sofort zu IB, kein 27s-Timeout."""
+    import time as _t
+    global _yf_blocked_until
 
-    # ── Versuch 1: yfinance Bulk-Download ────────────────────────────────────
-    def _fetch_yf():
-        import yfinance as yf
-        import pandas as pd
-        df = yf.download(
-            tickers=' '.join(symbols),
-            period='1d', interval='1m',
-            progress=False, auto_adjust=True,
-        )
-        if df is None or df.empty:
-            return {}
-        results = {}
-        close = df.get('Close', df.get('close'))
-        if close is None:
-            return {}
-        if isinstance(close, pd.Series):
-            last = close.dropna()
-            if len(last) > 0 and len(symbols) == 1:
-                results[symbols[0]] = (float(last.iloc[-1]), None)
-        else:
-            for sym in symbols:
-                if sym in close.columns:
-                    last = close[sym].dropna()
-                    if len(last) > 0:
-                        results[sym] = (float(last.iloc[-1]), None)
-        return results
+    results = {}
 
-    try:
-        results = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=30)
-        if len(results) >= len(symbols) * 0.5:   # ≥50% erfolgreich → yfinance reicht
-            return results
-        log(f"   ⚠️  yfinance: nur {len(results)}/{len(symbols)} Preise — wechsle zu IB-Snapshot")
-    except Exception:
-        results = {}
-        log(f"   ⚠️  yfinance Rate-Limit / Timeout — wechsle zu IB-Snapshot")
+    # ── Versuch 1: yfinance Bulk-Download (übersprungen wenn Cooldown aktiv) ──
+    if _t.time() < _yf_blocked_until:
+        remaining = int(_yf_blocked_until - _t.time())
+        log(f"   ⏭️  yfinance Cooldown noch {remaining}s — direkt zu IB")
+    else:
+        def _fetch_yf():
+            import yfinance as yf
+            import pandas as pd
+            df = yf.download(
+                tickers=' '.join(symbols),
+                period='1d', interval='1m',
+                progress=False, auto_adjust=True,
+            )
+            if df is None or df.empty:
+                return {}
+            out = {}
+            close = df.get('Close', df.get('close'))
+            if close is None:
+                return {}
+            if isinstance(close, pd.Series):
+                last = close.dropna()
+                if len(last) > 0 and len(symbols) == 1:
+                    out[symbols[0]] = (float(last.iloc[-1]), None)
+            else:
+                for sym in symbols:
+                    if sym in close.columns:
+                        last = close[sym].dropna()
+                        if len(last) > 0:
+                            out[sym] = (float(last.iloc[-1]), None)
+            return out
+
+        try:
+            results = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=30)
+            if len(results) >= len(symbols) * 0.5:
+                return results
+            log(f"   ⚠️  yfinance: nur {len(results)}/{len(symbols)} Preise — wechsle zu IB")
+        except Exception:
+            results = {}
+            _yf_blocked_until = _t.time() + _YF_COOLDOWN
+            log(f"   ⚠️  yfinance Rate-Limit — Cooldown {_YF_COOLDOWN//60}min, wechsle zu IB")
 
     # ── Fallback: IB-Streaming + sofort Cancel (kein snapshot=True → kein Error 10213) ─
     # Semaphore(15): max 15 offene Subscriptions gleichzeitig — weit unter dem 100er-Limit.
