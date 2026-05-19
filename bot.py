@@ -786,7 +786,11 @@ async def _get_market_data_yf(symbol, ib=None):
         except Exception:
             pass
 
-    # ── Versuch 2: yfinance (Fallback wenn IB keine Greeks liefert) ──────────
+    # ── Versuch 2: yfinance (Fallback — übersprungen wenn Cooldown aktiv) ──────
+    import time as _t2
+    if _t2.time() < _yf_blocked_until:
+        return None, None   # Cooldown aktiv → kein yfinance-Versuch
+
     def _fetch():
         import yfinance as yf
         import time as _time
@@ -827,10 +831,13 @@ async def _get_market_data_yf(symbol, ib=None):
     try:
         return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25)
     except asyncio.TimeoutError:
-        log(f"   [{symbol}] ⏱️  yfinance Timeout (>25s) — überspringe")
+        log(f"   [{symbol}] ⏱️  yfinance Timeout — überspringe")
         return None, None
     except Exception as e:
-        log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
+        if 'Rate limit' in str(e) or 'Too Many Requests' in str(e):
+            import time as _t3
+            global _yf_blocked_until
+            _yf_blocked_until = _t3.time() + _YF_COOLDOWN
         return None, None
 
 async def _yf_stock_scan(symbols: list, ib=None) -> dict:
