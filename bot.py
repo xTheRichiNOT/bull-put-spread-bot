@@ -782,33 +782,39 @@ async def _get_market_data_yf(symbol):
         return None, None
 
 async def _yf_stock_scan(symbols: list) -> dict:
-    """Aktienkurse via yfinance fast_info — kein IB reqMktData, kein Subscription-Limit."""
-    _sem = asyncio.Semaphore(5)
-
-    async def _fetch_one(sym):
-        async with _sem:
-            try:
-                def _get():
-                    import yfinance as yf
-                    fi = yf.Ticker(sym).fast_info
-                    price = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
-                    return float(price) if price and price > 0 else None
-                price = await asyncio.wait_for(asyncio.to_thread(_get), timeout=10)
-                if price:
-                    return sym, (price, None)
-            except Exception:
-                pass
-            return sym, None
-
-    raw = await asyncio.gather(*[_fetch_one(s) for s in symbols], return_exceptions=True)
-    results = {}
-    for item in raw:
-        if isinstance(item, Exception) or item is None:
-            continue
-        sym, data = item
-        if data is not None:
-            results[sym] = data
-    return results
+    """Bulk-Download via yf.download() — EINE API-Anfrage für alle Symbole, kein Rate-Limit."""
+    def _fetch():
+        import yfinance as yf
+        import pandas as pd
+        df = yf.download(
+            tickers=' '.join(symbols),
+            period='1d',
+            interval='1m',
+            progress=False,
+            auto_adjust=True,
+        )
+        if df is None or df.empty:
+            return {}
+        results = {}
+        close = df.get('Close', df.get('close'))
+        if close is None:
+            return {}
+        if isinstance(close, pd.Series):
+            # Einzelnes Symbol
+            last = close.dropna()
+            if len(last) > 0 and len(symbols) == 1:
+                results[symbols[0]] = (float(last.iloc[-1]), None)
+        else:
+            for sym in symbols:
+                if sym in close.columns:
+                    last = close[sym].dropna()
+                    if len(last) > 0:
+                        results[sym] = (float(last.iloc[-1]), None)
+        return results
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=30)
+    except Exception:
+        return {}
 
 
 async def check_news_trigger(symbol):
