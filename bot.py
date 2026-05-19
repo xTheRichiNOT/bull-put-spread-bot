@@ -825,32 +825,41 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
         results = {}
         log(f"   ⚠️  yfinance Rate-Limit / Timeout — wechsle zu IB-Snapshot")
 
-    # ── Fallback: IB-Snapshot (snapshot=True = einmalig, keine Subscription) ─
+    # ── Fallback: IB-Streaming + sofort Cancel (kein snapshot=True → kein Error 10213) ─
+    # Semaphore(15): max 15 offene Subscriptions gleichzeitig — weit unter dem 100er-Limit.
+    # Cancel läuft noch innerhalb des Semaphores → Subscription-Count bleibt sauber.
     if ib is None or not ib.isConnected():
         log(f"   ⚠️  IB nicht verbunden — kein Fallback verfügbar")
         return results
 
     missing = [s for s in symbols if s not in results]
-    log(f"   📡 IB-Snapshot für {len(missing)} Symbole ...")
-    sem_snap = asyncio.Semaphore(20)  # Snapshots halten keine Subscription → großzügig
+    log(f"   📡 IB-Streaming für {len(missing)} Symbole (Schlusskurs) ...")
+    sem_ib = asyncio.Semaphore(15)
 
     async def _fetch_ib(sym):
-        async with sem_snap:
+        async with sem_ib:
+            t = None
             try:
                 con = Stock(sym, 'SMART', 'USD')
                 await ib.qualifyContractsAsync(con)
                 if not con.conId:
                     return
-                t = ib.reqMktData(con, '', False, True)   # snapshot=True
-                for _ in range(4):                        # max 2s warten, früh abbrechen
-                    await asyncio.sleep(0.5)
-                    price = (t.last  if (t.last  and t.last  > 0) else
-                             t.close if (t.close and t.close > 0) else None)
+                t = ib.reqMktData(con, '', False, False)  # Streaming, kein Snapshot
+                for _ in range(4):                         # max 0.8s warten
+                    await asyncio.sleep(0.2)
+                    price = (t.close if (t.close and t.close > 0) else
+                             t.last  if (t.last  and t.last  > 0) else None)
                     if price and price > 0:
                         results[sym] = (float(price), None)
                         break
             except Exception:
                 pass
+            finally:
+                if t is not None:
+                    try:
+                        ib.cancelMktData(t)
+                    except Exception:
+                        pass
 
     await asyncio.gather(*[_fetch_ib(s) for s in missing], return_exceptions=True)
     return results
@@ -943,24 +952,29 @@ async def get_vix(ib=None) -> float:
 
     val = 0.0
 
-    # ── Versuch 1: IB-Snapshot (primär — kein Rate-Limit) ───────────────────
+    # ── Versuch 1: IB-Streaming primär (kein snapshot=True → kein Error 10213) ────
     if ib is not None and ib.isConnected():
+        t_vix = None
         try:
             vix_con = Index('VIX', 'CBOE')
             await ib.qualifyContractsAsync(vix_con)
             if vix_con.conId:
-                t = ib.reqMktData(vix_con, '', False, True)  # snapshot=True
-                for _ in range(6):                            # max 3s
+                t_vix = ib.reqMktData(vix_con, '', False, False)  # Streaming
+                for _ in range(6):                                  # max 3s
                     await asyncio.sleep(0.5)
-                    v = t.marketPrice() if hasattr(t, 'marketPrice') and callable(t.marketPrice) else None
-                    if not v or math.isnan(v) or v <= 0:
-                        v = t.last if (t.last and t.last > 0) else (
-                            t.close if (t.close and t.close > 0) else None)
-                    if v and v > 0 and not math.isnan(v):
+                    v = (t_vix.last  if (t_vix.last  and t_vix.last  > 0 and not math.isnan(t_vix.last))  else
+                         t_vix.close if (t_vix.close and t_vix.close > 0 and not math.isnan(t_vix.close)) else None)
+                    if v and v > 0:
                         val = float(v)
                         break
         except Exception:
             pass
+        finally:
+            if t_vix is not None:
+                try:
+                    ib.cancelMktData(t_vix)
+                except Exception:
+                    pass
 
     # ── Versuch 2: yfinance (Fallback wenn IB nichts liefert) ───────────────
     if val <= 0:
@@ -2168,7 +2182,9 @@ async def run_bot(stop_event: threading.Event = None):
             101,                    # Max Tickers — Demo-typisch, wird via Fallback behandelt
             200,                    # Kein Contract gefunden — wird im Code abgefangen (conId=0)
             10147,                  # Cancel für orderId=0 — wird im Code übersprungen
-            321,                    # Invalid genTickList (sollte nicht mehr vorkommen, Sicherheitsnetz)
+            321,                    # Invalid genTickList — Sicherheitsnetz
+            10213,                  # Regulatory Snapshot nachts nicht erlaubt — Streaming-Fallback greift
+            399,                    # Verzögerte Marktdaten verfügbar — kein Handlungsbedarf
         }
         _IB_SUPPRESS_PHRASES = (
             'cancelMktData: No reqId found',   # Cancel auf bereits bereinigter Subscription
