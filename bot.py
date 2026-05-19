@@ -890,20 +890,46 @@ async def check_earnings_conflict(symbol: str, expiry_str: str) -> tuple:
         return False, 0.0, ''
 
 
+_vix_cache_val: float = 0.0
+_vix_cache_ts:  float = 0.0
+_VIX_CACHE_TTL = 120  # VIX max alle 2 Minuten neu holen
+
 async def get_vix() -> float:
-    """Lädt den aktuellen VIX-Stand via yfinance (^VIX)."""
+    """Lädt den aktuellen VIX-Stand via yfinance (^VIX) mit Cache."""
+    import time as _t
+    global _vix_cache_val, _vix_cache_ts
+    if _vix_cache_val > 0 and _t.time() - _vix_cache_ts < _VIX_CACHE_TTL:
+        return _vix_cache_val
+
     def _fetch():
         import yfinance as yf
+        # Methode 1: fast_info
         try:
             fi = yf.Ticker('^VIX').fast_info
             v = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
-            return float(v) if v else 0.0
+            if v and float(v) > 0:
+                return float(v)
         except Exception:
-            return 0.0
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=10) or 0.0
-    except Exception:
+            pass
+        # Methode 2: download (robuster)
+        try:
+            df = yf.download('^VIX', period='1d', interval='1m', progress=False, auto_adjust=True)
+            if not df.empty and 'Close' in df.columns:
+                last = df['Close'].dropna()
+                if len(last) > 0:
+                    return float(last.iloc[-1])
+        except Exception:
+            pass
         return 0.0
+
+    try:
+        val = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15) or 0.0
+        if val > 0:
+            _vix_cache_val = val
+            _vix_cache_ts  = _t.time()
+        return val if val > 0 else _vix_cache_val  # alten Cache zurückgeben wenn neu fehlschlägt
+    except Exception:
+        return _vix_cache_val
 
 
 def vix_regime(vix: float) -> tuple:
@@ -2015,12 +2041,12 @@ def _print_shadow_summary(days: int = 30) -> None:
         if top5:
             log(f"  Top-5 geblockte Symbole: {', '.join(f'{s}({n})' for s, n in top5)}")
 
-        # Avg Score der WATCH-Kandidaten
+        # Historische Signale im Score-Bereich 0.50–ENTRY_THRESHOLD (damals zu schwach, heute evtl. anders)
         watch = [r for r in rejected if r.get('decision') == 'WATCH']
         if watch:
             avg_score = sum(r.get('score', 0) for r in watch) / len(watch)
             avg_ev    = sum(r.get('ev', 0) for r in watch) / len(watch)
-            log(f"  WATCH-Kandidaten: {len(watch)} | ⌀Score {avg_score:.3f} | ⌀EV ${avg_ev:+.0f}")
+            log(f"  Hist. Grenzfälle (Score <{ENTRY_THRESHOLD:.2f}): {len(watch)} | ⌀Score {avg_score:.3f} | ⌀EV ${avg_ev:+.0f}")
         log(f"{'─'*60}\n")
     except Exception as e:
         log(f"  ⚠️  Shadow-Analytics fehlgeschlagen: {e}")
@@ -2410,27 +2436,20 @@ async def run_bot(stop_event: threading.Event = None):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
-                # Margin-Check: Available Funds vor jedem Trade-Zyklus prüfen
+                # Margin-Check: reqAccountSummaryAsync (zuverlässiger als cached accountValues)
                 try:
-                    # USD-Einträge haben Vorrang — currency='' kann 0-Einträge liefern die echte Werte überschreiben
-                    acct_usd = {v.tag: v.value for v in ib.accountValues() if v.currency == 'USD'}
-                    acct_any = {v.tag: v.value for v in ib.accountValues() if v.currency in ('USD', '')}
-                    raw = (acct_usd.get('AvailableFunds')
-                           or acct_usd.get('AvailableFunds-S')
-                           or acct_any.get('AvailableFunds')
-                           or acct_any.get('AvailableFunds-S')
-                           or acct_any.get('NetLiquidation')
-                           or '0')
+                    summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
+                    av = {v.tag: v.value for v in summary
+                          if v.account == ACCOUNT_ID and v.currency in ('USD', '')}
+                    raw = (av.get('AvailableFunds') or av.get('AvailableFunds-S')
+                           or av.get('NetLiquidation') or '0')
                     available = float(raw)
-                    if available == 0.0 and IS_DEMO_MODE:
-                        available = 100_000.0
-                        log(f"  ℹ️  Demo-Konto: IB liefert $0 — Simulations-Kapital $100,000")
                     log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
                     if available < MIN_AVAILABLE_FUNDS:
                         log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
                         tradeable = []
                 except Exception:
-                    pass
+                    log(f"  ⚠️  Kapital-Abfrage fehlgeschlagen — überspringe Margin-Check")
 
                 # Daily Trade Budget: Wie viele neue Trades heute noch erlaubt?
                 _today_str   = datetime.now().strftime('%Y-%m-%d')
