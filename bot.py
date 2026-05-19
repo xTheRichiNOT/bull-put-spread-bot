@@ -331,7 +331,10 @@ def _now_et() -> datetime:
         return datetime.now(edt)
 
 def is_market_open() -> bool:
-    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ)."""
+    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ).
+    test_mode: true in config.json überspringt diese Prüfung komplett."""
+    if _cfg.get('test_mode', False):
+        return True
     now_et = _now_et()
     if now_et.weekday() >= 5:
         return False
