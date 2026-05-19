@@ -826,13 +826,7 @@ async def _batch_ib_price_scan(batch: list, ib) -> dict:
         except Exception:
             pass
     await asyncio.sleep(3)
-    # Cancel first, then read — IB benötigt etwas Zeit um Slots freizugeben
-    for sym, t in tickers.items():
-        try:
-            ib.cancelMktData(t)
-        except Exception:
-            pass
-    await asyncio.sleep(1.0)  # IB Zeit geben Cancels zu verarbeiten (verhindert >100 gleichzeitige Subscriptions)
+    # Daten lesen BEVOR gecancelt wird — nach cancelMktData können Ticker-Daten geleert werden
     results = {}
     for sym, t in tickers.items():
         price = None
@@ -846,6 +840,13 @@ async def _batch_ib_price_scan(batch: list, ib) -> dict:
             iv = float(t.impliedVolatility)
         if price is not None:
             results[sym] = (price, iv)
+    # Erst nach dem Lesen canceln + 1s warten damit IB Slots freigibt vor dem nächsten Batch
+    for sym, t in tickers.items():
+        try:
+            ib.cancelMktData(t)
+        except Exception:
+            pass
+    await asyncio.sleep(1.0)  # verhindert >100 gleichzeitige Subscriptions
     return results
 
 
