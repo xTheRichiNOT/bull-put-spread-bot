@@ -10,6 +10,19 @@ import threading
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="ib_insync")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="eventkit")
+
+# yfinance/Pandas-Kompatibilitätswarnungen: einmalig sauber ins Log, danach nicht mehr
+_yf_warned: set = set()
+_orig_showwarning = warnings.showwarning
+def _clean_showwarning(message, category, filename, lineno, file=None, line=None):
+    if 'yfinance' in (filename or '') or 'pandas' in (filename or '').lower():
+        key = str(message)
+        if key not in _yf_warned:
+            _yf_warned.add(key)
+            print(f"  ⚠️  yfinance Hinweis (einmalig): {message}", flush=True)
+    else:
+        _orig_showwarning(message, category, filename, lineno, file, line)
+warnings.showwarning = _clean_showwarning
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -42,7 +55,7 @@ if os.path.exists(_env_path):
 import json as _json
 _cfg_path = os.path.join(_BASE, 'config.json')
 _cfg_defaults = {
-    "ib_host": "127.0.0.1", "ib_port": 7497, "ib_account": "",
+    "ib_host": "127.0.0.1", "ib_port": 4001, "ib_account": "U25827024",
     "min_vola": 0.28, "abstand_y": 0.10, "min_credit": 70,
     "min_risk_reward": 0.20, "max_delta": 0.28, "max_positions": 8,
     "max_per_sector": 2, "scan_intervall": 60, "auto_trade": True,
@@ -142,7 +155,7 @@ MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
 MAX_PROBABILITY  = 0.85    # Hard-Block: P(Win) > 85% → Credit zu klein
-MAX_LOSS_PROB    = 0.20    # Hard-Block: P(MaxVerlust) > 20% → Totalverlustrisiko zu hoch
+MAX_LOSS_PROB    = 0.22    # Hard-Block: P(MaxVerlust) > 22% → Totalverlustrisiko zu hoch
 MIN_EV_RATIO     = 0.005   # Hard-Block: EV < 0.5% des Credits → statistisch kein Vorteil
 
 # Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
@@ -198,10 +211,11 @@ MAX_BID_ASK_SPREAD = float(_cfg.get('max_bid_ask_spread', 0.12))  # 12 % des Mid
 
 # Slippage-Modell: erwarteter Fill als Anteil des theoretischen Credits
 SLIPPAGE_FACTOR: dict[str, float] = {
-    'IB (Combo)':             0.92,
-    'yfinance (Bid)':         0.82,
+    'IB (Combo)':                0.92,
+    'IB (Bid)':                  0.88,
+    'yfinance (Bid)':            0.82,
     'Black-Scholes (geschätzt)': 0.65,
-    'default':                0.80,
+    'default':                   0.80,
 }
 
 # Fill-Timeout: Entry-Order wird nach N Sekunden storniert wenn nicht gefüllt
@@ -756,6 +770,16 @@ async def _get_market_data_yf(symbol):
     """Kurs + ATM-IV ausschließlich via yfinance (interner Fallback)."""
     def _fetch():
         import yfinance as yf
+        import time as _time
+        def _yf_call(fn, retries=3):
+            for i in range(retries):
+                try:
+                    return fn()
+                except Exception as e:
+                    if i < retries - 1 and ('Too Many Requests' in str(e) or 'Rate limited' in str(e)):
+                        _time.sleep(3 * (2 ** i))
+                        continue
+                    raise
         ticker = yf.Ticker(symbol)
         try:
             price = ticker.fast_info['last_price']
@@ -764,7 +788,7 @@ async def _get_market_data_yf(symbol):
             price = float(hist['Close'].iloc[-1]) if not hist.empty else None
         if not price or price != price:
             return None, None
-        expirations = ticker.options
+        expirations = _yf_call(lambda: ticker.options)
         if not expirations:
             return price, None
         today = datetime.now()
@@ -775,7 +799,7 @@ async def _get_market_data_yf(symbol):
             expiry = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0] if candidates else expirations[-1]
         else:
             expiry = valid[0]
-        puts = ticker.option_chain(expiry).puts
+        puts = _yf_call(lambda: ticker.option_chain(expiry).puts)
         if puts.empty:
             return price, None
         atm_idx = (puts['strike'] - price).abs().idxmin()
@@ -1015,31 +1039,34 @@ def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
 
 async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False):
     """Berechnet Bull-Put-Spread. Gibt Signal-Dict zurück oder None."""
-    def _fetch_chain():
-        import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        today = datetime.now()
-        dte_map = [(e, (datetime.strptime(e, '%Y-%m-%d') - today).days)
-                   for e in ticker.options]
-        valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
-        if not valid:
-            # Fallback: Expiry am nächsten an MIN_DTE, mindestens 21 DTE
-            candidates = [(e, d) for e, d in dte_map if d >= 21]
-            if not candidates:
-                return None, None, None
-            expiry_str = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0]
-        else:
-            expiry_str = valid[0]
-        puts = ticker.option_chain(expiry_str).puts
-        dte = (datetime.strptime(expiry_str, '%Y-%m-%d') - today).days
-        return expiry_str, puts, dte
-
     try:
-        expiry_yf, puts, dte = await asyncio.wait_for(asyncio.to_thread(_fetch_chain), timeout=30)
-        if puts is None or puts.empty:
+        # ── 1. Expiry-Auswahl aus IB Strike-Map ──────────────────────────────
+        if symbol not in _strike_map or not _strike_map[symbol].get('expirations'):
+            log(f"   [{symbol}] ✗ Keine IB Strike-Map — überspringe")
             return None
 
-        # Earnings: Penalty statt Hard-Block — nur bei Earnings ≤3d vor Expiry blockieren
+        map_entry = _strike_map[symbol]
+        today     = datetime.now()
+        dte_map   = []
+        for e in map_entry['expirations']:
+            try:
+                dte_map.append((e, (datetime.strptime(e, '%Y%m%d') - today).days))
+            except Exception:
+                pass
+
+        valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
+        if not valid:
+            candidates = [(e, d) for e, d in dte_map if d >= 21]
+            if not candidates:
+                return None
+            expiry_ib_str = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0]
+        else:
+            expiry_ib_str = valid[0]
+
+        expiry_yf = f"{expiry_ib_str[:4]}-{expiry_ib_str[4:6]}-{expiry_ib_str[6:]}"
+        dte       = (datetime.strptime(expiry_ib_str, '%Y%m%d') - today).days
+
+        # ── 2. Earnings-Check ─────────────────────────────────────────────────
         hard_block, earn_penalty, conflict_reason = await check_earnings_conflict(symbol, expiry_yf)
         if hard_block:
             log(f"   [{symbol}] 🚫 Earnings-HardBlock: {conflict_reason} — überspringe")
@@ -1048,147 +1075,128 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         if earn_penalty > 0:
             log(f"   [{symbol}] ⚠️  Earnings-Penalty: {conflict_reason} → Score -{earn_penalty:.2f}")
 
-        # Short Strike: nächster echter Strike ~OTM unter Kurs
-        target = preis * (1 - ABSTAND_Y)
-        otm_puts = puts[puts['strike'] <= preis]
-        if otm_puts.empty:
-            otm_puts = puts
-        short_row = otm_puts.loc[(otm_puts['strike'] - target).abs().idxmin()]
-        short_strike = float(short_row['strike'])
+        # ── 3. Strike-Auswahl direkt aus IB Strike-Map ───────────────────────
+        ib_strikes  = sorted(map_entry['strikes'])
+        target      = preis * (1 - ABSTAND_Y)
+        valid_short = [s for s in ib_strikes if s < preis]
+        if not valid_short:
+            log(f"   [{symbol}] ✗ Keine OTM Strikes in IB Strike-Map — überspringe")
+            return None
+        short_strike = _round_to_standard_strike(
+            min(valid_short, key=lambda s: abs(s - target)), preis
+        )
 
-        # ── Liquiditäts-Scoring (kein Hard-Gate mehr außer absolutem Datenpunkt-Floor) ──
-        _oi  = float(short_row.get('openInterest', 0) or 0)
-        _vol = float(short_row.get('volume', 0) or 0)
-        _sb  = float(short_row.get('bid', 0) or 0)
-        _sa  = float(short_row.get('ask', 0) or 0)
+        # ── 4. IB Marktdaten für Short-Put (Bid/Ask) ─────────────────────────
+        if not (ib and ib.isConnected()):
+            return None
+        global _sem_ib_mktdata
+        if _sem_ib_mktdata is None:
+            _sem_ib_mktdata = asyncio.Semaphore(2)
 
-        # Absoluter Floor: OI = 0 UND Volume = 0 → kein Datenpunkt (beide Null)
-        if _oi < LIQUIDITY_SCAN_FLOOR_OI and _vol < LIQUIDITY_SCAN_FLOOR_VOL:
-            log(f"   [{symbol}] ✗ OI={_oi:.0f} & Vol={_vol:.0f} — kein verwertbarer Datenpunkt")
-            _shadow_partial(symbol, preis, iv, 'liquidity',
-                            f"OI={_oi:.0f}&Vol={_vol:.0f} unter absolutem Floor",
-                            short_strike=float(short_row['strike']))
+        # Qualifizierung: wenn gerundeter Strike für diese Expiry nicht existiert,
+        # nächsten IB-Strike probieren (Strike-Map enthält Strikes aus allen Expiries)
+        t_scan = None
+        for _try_strike in sorted(valid_short, key=lambda s: abs(s - short_strike))[:4]:
+            _candidate = _round_to_standard_strike(_try_strike, preis)
+            try:
+                _con = Option(symbol, expiry_ib_str, _candidate, 'P', 'SMART')
+                await ib.qualifyContractsAsync(_con)
+                if _con.conId:
+                    short_strike = _candidate
+                    async with _sem_ib_mktdata:
+                        t_scan = ib.reqMktData(_con, '', False, False)
+                        await asyncio.sleep(6)
+                    try:
+                        ib.cancelMktData(t_scan)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+
+        if t_scan is None:
+            log(f"   [{symbol}] ✗ Short-Put nicht qualifizierbar — überspringe")
             return None
 
-        # Rolling-Stats aktualisieren und relativen Liquidity Score berechnen
-        _update_liq_stats(symbol, _oi, _vol)
-        _liquidity_score = _compute_liq_score(symbol, _oi, _vol)
+        _sb = t_scan.bid if (t_scan.bid and not math.isnan(t_scan.bid) and t_scan.bid > 0) else 0.0
+        _sa = t_scan.ask if (t_scan.ask and not math.isnan(t_scan.ask) and t_scan.ask > 0) else 0.0
 
-        if symbol in _HIGH_LIQUIDITY_SYMS and _liquidity_score < 0.3:
-            log(f"   [{symbol}] ⚠️  Liquidity-Score={_liquidity_score:.2f} — OI={_oi:.0f} suspekt"
-                f" niedrig für Haupt-Symbol (yfinance delayed?)")
+        # modelGreeks-Fallback: IB Delayed liefert oft kein echtes Bid/Ask für Optionen
+        if _sb == 0.0:
+            _mg = getattr(t_scan, 'modelGreeks', None)
+            if _mg and getattr(_mg, 'optPrice', None) and not math.isnan(_mg.optPrice) and _mg.optPrice > 0:
+                _sb = float(_mg.optPrice)
+                _sa = _sb * 1.05  # synthetischer Ask: +5% als konservativer Spread
 
-        # Bid-Ask bleibt als Datenqualitäts-Gate (messbarer Spread = echter Markt)
+        # ── 5. Liquiditäts-Check via Bid/Ask (OI/Volume in Delayed-Daten nicht verfügbar) ─
+        if _sb == 0 and _sa == 0:
+            log(f"   [{symbol}] ✗ Kein Bid/Ask von IB — überspringe")
+            _shadow_partial(symbol, preis, iv, 'liquidity', "Kein IB-Bid/Ask", short_strike=short_strike)
+            return None
         if _sb > 0 and _sa > 0:
-            _mid_yf = (_sb + _sa) / 2
-            _ba_pct = (_sa - _sb) / _mid_yf
+            _ba_pct = (_sa - _sb) / ((_sb + _sa) / 2)
             if _ba_pct > MAX_BID_ASK_SPREAD:
                 log(f"   [{symbol}] ✗ Bid/Ask-Spread {_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%} — zu illiquide")
                 _shadow_partial(symbol, preis, iv, 'liquidity',
                                 f"BidAskSpread={_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%}",
-                                short_strike=float(short_row['strike']))
+                                short_strike=short_strike)
                 return None
-
-        # Prämie: Short-Bid für Spread-Breiten-Berechnung
-        bid = float(short_row['bid'])
-        if bid > 0 and bid == bid:
-            praemie = bid
-            praemie_quelle = "yfinance (Bid)"
+            _liquidity_score = max(0.1, 1.0 - _ba_pct * 3)
         else:
-            T = max(dte / 365, 0.001)
-            praemie = _bs_put(preis, short_strike, T, iv)
-            praemie_quelle = "Black-Scholes (geschätzt)"
+            _liquidity_score = 0.4
 
-        # ── Strike-Snapping: yfinance-Strikes auf IB-valide Werte anpassen ──────
-        # Verhindert "Qualifizierung fehlgeschlagen" für Strikes die IB nicht kennt
-        expiry_ib_str = expiry_yf.replace('-', '')
-        if symbol in _strike_map and _strike_map[symbol]['strikes']:
-            ib_strikes = _strike_map[symbol]['strikes']
-            # Short Strike: nächsten Map-Strike finden, dann auf Standard-Inkrement runden.
-            # Kein Re-Snap zurück in die Map — reqSecDefOptParamsAsync liefert Strikes aus ALLEN
-            # Expiries. Für Quartals-Expiries (z.B. 20260626) existieren nur Standard-Inkremente
-            # ($5/$10). Das Rounding ist sicherer als der Re-Snap in die Map.
-            valid_short = [s for s in ib_strikes if s < preis]
-            if valid_short:
-                snapped = min(valid_short, key=lambda s: abs(s - short_strike))
-                short_strike = _round_to_standard_strike(snapped, preis)
-            # Long Strike: nächster Map-Strike unter short_strike, dann runden
-            valid_long = [s for s in ib_strikes if s < short_strike]
-            if valid_long:
-                spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
-                breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
-                long_target = short_strike - breite_ziel
-                snapped_l   = min(valid_long, key=lambda s: abs(s - long_target))
-                long_strike = _round_to_standard_strike(snapped_l, preis)
-            else:
-                long_strike = short_strike - SPREAD_MIN
+        # ── 6. Initiale Prämie aus IB-Bid ─────────────────────────────────────
+        bid = _sb
+        if not bid > 0:
+            log(f"   [{symbol}] ✗ Kein IB-Bid für Short-Put — überspringe")
+            _shadow_partial(symbol, preis, iv, 'no_live_data', "Kein IB-Bid", short_strike=short_strike)
+            return None
+        praemie        = bid
+        praemie_quelle = "IB (Bid)"
+
+        # ── 7. Long-Strike und Spread-Breite ──────────────────────────────────
+        valid_long  = [s for s in ib_strikes if s < short_strike]
+        spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
+        breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
+        if valid_long:
+            long_target = short_strike - breite_ziel
+            snapped_l   = min(valid_long, key=lambda s: abs(s - long_target))
+            long_strike = _round_to_standard_strike(snapped_l, preis)
         else:
-            # Kein Strike-Map → Standard-Inkrement-Rounding (verhindert Error 200)
-            short_strike = _round_to_standard_strike(short_strike, preis)
-            spread_max  = max(SPREAD_MIN, round(preis * SPREAD_MAX_PCT / 5) * 5)
-            breite_ziel = max(SPREAD_MIN, min(math.ceil((praemie * 4) / 5) * 5, spread_max))
-            candidates  = sorted(puts[puts['strike'] < short_strike]['strike'].tolist())
-            if candidates:
-                long_target = short_strike - breite_ziel
-                long_strike = float(min(candidates, key=lambda s: abs(s - long_target)))
-                long_strike = _round_to_standard_strike(long_strike, preis)
-            else:
-                long_strike = short_strike - breite_ziel
+            long_strike = short_strike - SPREAD_MIN
         breite = short_strike - long_strike
 
-        # ── IB Combo/Bag Pricing (primär) ────────────────────────────────────
-        # Fragt IB nach dem echten handelbaren Netto-Credit für den gesamten Spread.
-        # Combo-Bid = was wir beim Verkauf erhalten — negativ bedeutet Debit-Spread.
-        if ib and ib.isConnected():
-            try:
-                s_con = Option(symbol, expiry_ib_str, short_strike, 'P', 'SMART')
-                l_con = Option(symbol, expiry_ib_str, long_strike,  'P', 'SMART')
-                await ib.qualifyContractsAsync(s_con, l_con)
-                if s_con.conId > 0 and l_con.conId > 0:
-                    combo_bag = Bag(
-                        symbol=symbol, exchange='SMART', currency='USD',
-                        comboLegs=[
-                            ComboLeg(conId=s_con.conId, ratio=1, action='SELL', exchange='SMART'),
-                            ComboLeg(conId=l_con.conId, ratio=1, action='BUY',  exchange='SMART'),
-                        ]
-                    )
-                    global _sem_ib_mktdata
-                    if _sem_ib_mktdata is None:
-                        _sem_ib_mktdata = asyncio.Semaphore(2)
-                    async with _sem_ib_mktdata:
-                        t_combo = ib.reqMktData(combo_bag, '', False, False)
-                        await asyncio.sleep(5)
-                        combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
-                    try: ib.cancelMktData(t_combo)
-                    except Exception: pass
-                    if combo_bid is not None and combo_bid > 0:
-                        praemie = combo_bid
-                        praemie_quelle = "IB (Combo)"
-                    else:
-                        # IB Combo Bid ≤ 0: Im Demo-Konto liefern verzögerte Daten oft 0.
-                        # Fallback: yfinance Mid-Point (Demo) oder Net Bid-Ask (Live).
-                        _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
-                        if _r:
-                            praemie, praemie_quelle = _r
-                        else:
-                            praemie_quelle = "Black-Scholes (geschätzt)"
-                else:
-                    # Strike existiert nicht bei IB → yfinance-Fallback
-                    _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
-                    if _r:
-                        praemie, praemie_quelle = _r
-                    else:
-                        praemie_quelle = "Black-Scholes (geschätzt)"
-            except Exception:
-                # IB-Fehler → yfinance Net-Credit als Fallback
-                _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
-                if _r:
-                    praemie, praemie_quelle = _r
-        else:
-            # Kein IB → yfinance Net-Credit
-            _r = _yf_net_credit(puts, short_strike, long_strike, bid, IS_DEMO_MODE)
-            if _r:
-                praemie, praemie_quelle = _r
+        # ── IB Combo/Bag Pricing (verbessert Prämie von IB-Bid zu Netto-Credit) ─
+        try:
+            s_con = Option(symbol, expiry_ib_str, short_strike, 'P', 'SMART')
+            l_con = Option(symbol, expiry_ib_str, long_strike,  'P', 'SMART')
+            await ib.qualifyContractsAsync(s_con, l_con)
+            if s_con.conId > 0 and l_con.conId > 0:
+                combo_bag = Bag(
+                    symbol=symbol, exchange='SMART', currency='USD',
+                    comboLegs=[
+                        ComboLeg(conId=s_con.conId, ratio=1, action='SELL', exchange='SMART'),
+                        ComboLeg(conId=l_con.conId, ratio=1, action='BUY',  exchange='SMART'),
+                    ]
+                )
+                async with _sem_ib_mktdata:
+                    t_combo = ib.reqMktData(combo_bag, '', False, False)
+                    await asyncio.sleep(5)
+                    combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
+                try: ib.cancelMktData(t_combo)
+                except Exception: pass
+                if combo_bid is not None and combo_bid > 0:
+                    praemie        = combo_bid
+                    praemie_quelle = "IB (Combo)"
+                # else: IB-Bid aus Schritt 6 bleibt erhalten
+        except Exception:
+            pass  # IB-Bid aus Schritt 6 bleibt erhalten
+
+        if praemie_quelle == "Black-Scholes (geschätzt)":
+            log(f"   [{symbol}] ✗ Keine Live-/Delayed-Daten verfügbar — Symbol übersprungen")
+            _shadow_partial(symbol, preis, iv, 'no_live_data', "Keine verwertbaren Marktdaten",
+                            short_strike=short_strike)
+            return None
 
         credit    = praemie * 100
         max_risk  = (breite - praemie) * 100
@@ -1247,7 +1255,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
             'preis':            preis,
             'iv':               iv,
             'dte':              dte,
-            'expiry_ib':        expiry_yf.replace('-', ''),
+            'expiry_ib':        expiry_ib_str,
             'short_strike':     short_strike,
             'long_strike':      long_strike,
             'breite':           breite,
@@ -1751,16 +1759,9 @@ async def place_order(ib, sig):
                             price_src = 'LAST_PRICE'
                             log(f"  ⚠️  [{sym}] Kein Bid/Ask, kein Greek — Last-Preis: Short ${short_last:.2f}  Long ${long_last:.2f}")
                         else:
-                            if IS_DEMO_MODE and sig.get('praemie', 0) > 0:
-                                short_bid = sig['praemie']
-                                long_ask  = 0.0
-                                price_src = 'BS_ESTIMATE'
-                                log(f"  ⚠️  [{sym}] PAPER MODE: Keine IB-Marktdaten — "
-                                    f"Scan-Schätzung ${sig['praemie']:.2f}/Share ({sig.get('praemie_quelle','?')})")
-                            else:
-                                log(f"  ✗ [{sym}] Keine Preisdaten verfügbar — Trade abgebrochen")
-                                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                                return
+                            log(f"  ✗ [{sym}] Keine IB-Marktdaten verfügbar — Trade abgebrochen")
+                            _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                            return
 
             has_real_bid = bool(t_short.bid and t_short.bid > 0)
             has_real_ask = bool(t_long.ask  and t_long.ask  > 0)
@@ -1775,11 +1776,10 @@ async def place_order(ib, sig):
                 short_val = _mid(t_short, short_bid)
                 long_val  = _mid(t_long,  long_ask)
                 ibkr_net  = round(short_val - long_val, 2)
-                if ibkr_net <= 0 and sig.get('praemie', 0) > 0:
-                    ibkr_net  = sig['praemie']
-                    price_src = 'BS_ESTIMATE'
-                    log(f"  ⚠️  [{sym}] PAPER MODE: Mid-Point ≤0 — "
-                        f"Scan-Schätzung ${ibkr_net:.2f}/Share ({sig.get('praemie_quelle','?')})")
+                if ibkr_net <= 0:
+                    log(f"  ✗ [{sym}] PAPER MODE: IB Mid-Point ≤0 — keine verwertbaren Marktdaten, Trade abgebrochen")
+                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                    return
                 elif price_src == 'BS_ESTIMATE' and (has_real_bid or has_real_ask):
                     price_src = 'MIDPRICE'   # Zumindest ein echter Kurs vorhanden
                 elif has_real_bid and has_real_ask:
@@ -1995,7 +1995,7 @@ async def configure_environment(ib) -> bool:
         if use_live_data:
             log("  Echtzeit-Daten aktiv (live_market_data: true)")
         else:
-            log("  Delayed-Daten aktiv — BS-Schätzungen erlaubt")
+            log("  Delayed-Daten aktiv — nur echte IB/yfinance-Daten erlaubt")
         log("  Orders werden mit Toleranz +/-$0.02 platziert")
     else:
         log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
@@ -2343,7 +2343,7 @@ async def run_bot(stop_event: threading.Event = None):
             # ── Phase 1b: yfinance-Fallback für fehlende Symbole ─────────────
             missing = [s for s in WATCHLIST if s not in ib_price_data]
             if missing:
-                _sem_yf = asyncio.Semaphore(10)
+                _sem_yf = asyncio.Semaphore(3)
                 async def _yf_fill(sym):
                     async with _sem_yf:
                         p, v = await _get_market_data_yf(sym)
@@ -2356,7 +2356,7 @@ async def run_bot(stop_event: threading.Event = None):
             # IB liefert bei Delayed Data oft keinen IV → yfinance nachladen
             no_iv = [s for s, (_, v) in ib_price_data.items() if v is None]
             if no_iv:
-                _sem_iv = asyncio.Semaphore(10)
+                _sem_iv = asyncio.Semaphore(3)
                 async def _iv_fill(sym):
                     async with _sem_iv:
                         _, yf_iv = await _get_market_data_yf(sym)
@@ -2367,8 +2367,8 @@ async def run_bot(stop_event: threading.Event = None):
                                      return_exceptions=True)
 
             # ── Phase 1d: News-Check und Signal-Berechnung für Trigger ───────
-            _sem_news = asyncio.Semaphore(10)
-            _sem_sig  = asyncio.Semaphore(5)
+            _sem_news = asyncio.Semaphore(5)
+            _sem_sig  = asyncio.Semaphore(4)
 
             async def scan_symbol(symbol):
                 entry = ib_price_data.get(symbol)
@@ -2410,7 +2410,7 @@ async def run_bot(stop_event: threading.Event = None):
                                    return_exceptions=True),
                     timeout=300)
             except asyncio.TimeoutError:
-                log("  ⏱️  Scan-Timeout nach 120s — nächster Zyklus")
+                log("  ⏱️  Scan-Timeout nach 300s — nächster Zyklus")
                 results = []
             results     = [r for r in results if not isinstance(r, BaseException)]
             all_signals = [s for s in results if s is not None]
@@ -2460,6 +2460,9 @@ async def run_bot(stop_event: threading.Event = None):
                            or acct_any.get('NetLiquidation')
                            or '0')
                     available = float(raw)
+                    if available == 0.0 and IS_DEMO_MODE:
+                        available = 100_000.0
+                        log(f"  ℹ️  Demo-Konto: IB liefert $0 — Simulations-Kapital $100,000")
                     log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
                     if available < MIN_AVAILABLE_FUNDS:
                         log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
