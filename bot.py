@@ -826,12 +826,15 @@ async def _batch_ib_price_scan(batch: list, ib) -> dict:
         except Exception:
             pass
     await asyncio.sleep(3)
-    results = {}
+    # Cancel first, then read — IB benötigt etwas Zeit um Slots freizugeben
     for sym, t in tickers.items():
         try:
             ib.cancelMktData(t)
         except Exception:
             pass
+    await asyncio.sleep(1.0)  # IB Zeit geben Cancels zu verarbeiten (verhindert >100 gleichzeitige Subscriptions)
+    results = {}
+    for sym, t in tickers.items():
         price = None
         for v in (t.last, t.close, t.bid):
             if v and v > 0 and not _math.isnan(v):
@@ -2338,7 +2341,7 @@ async def run_bot(stop_event: threading.Event = None):
                     log(f"   [Batch {b_idx}/{n_batches}] Ticker-Slots freigegeben — "
                         f"{len(batch_result)}/{len(batch)} Preise erhalten")
                     if b_idx < n_batches:
-                        await asyncio.sleep(0.3)   # IB-Rate-Limit: kurze Pause zwischen Batches
+                        await asyncio.sleep(0.2)
 
             # ── Phase 1b: yfinance-Fallback für fehlende Symbole ─────────────
             missing = [s for s in WATCHLIST if s not in ib_price_data]
