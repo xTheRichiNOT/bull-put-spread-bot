@@ -933,42 +933,65 @@ _vix_cache_val: float = 0.0
 _vix_cache_ts:  float = 0.0
 _VIX_CACHE_TTL = 120  # VIX max alle 2 Minuten neu holen
 
-async def get_vix() -> float:
-    """Lädt den aktuellen VIX-Stand via yfinance (^VIX) mit Cache."""
+async def get_vix(ib=None) -> float:
+    """VIX primär via IB-Snapshot (CBOE), Fallback yfinance, dann Cache."""
     import time as _t
+    import math
     global _vix_cache_val, _vix_cache_ts
     if _vix_cache_val > 0 and _t.time() - _vix_cache_ts < _VIX_CACHE_TTL:
         return _vix_cache_val
 
-    def _fetch():
-        import yfinance as yf
-        # Methode 1: fast_info
-        try:
-            fi = yf.Ticker('^VIX').fast_info
-            v = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
-            if v and float(v) > 0:
-                return float(v)
-        except Exception:
-            pass
-        # Methode 2: download (robuster)
-        try:
-            df = yf.download('^VIX', period='1d', interval='1m', progress=False, auto_adjust=True)
-            if not df.empty and 'Close' in df.columns:
-                last = df['Close'].dropna()
-                if len(last) > 0:
-                    return float(last.iloc[-1])
-        except Exception:
-            pass
-        return 0.0
+    val = 0.0
 
-    try:
-        val = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15) or 0.0
-        if val > 0:
-            _vix_cache_val = val
-            _vix_cache_ts  = _t.time()
-        return val if val > 0 else _vix_cache_val  # alten Cache zurückgeben wenn neu fehlschlägt
-    except Exception:
-        return _vix_cache_val
+    # ── Versuch 1: IB-Snapshot (primär — kein Rate-Limit) ───────────────────
+    if ib is not None and ib.isConnected():
+        try:
+            vix_con = Index('VIX', 'CBOE')
+            await ib.qualifyContractsAsync(vix_con)
+            if vix_con.conId:
+                t = ib.reqMktData(vix_con, '', False, True)  # snapshot=True
+                for _ in range(6):                            # max 3s
+                    await asyncio.sleep(0.5)
+                    v = t.marketPrice() if hasattr(t, 'marketPrice') and callable(t.marketPrice) else None
+                    if not v or math.isnan(v) or v <= 0:
+                        v = t.last if (t.last and t.last > 0) else (
+                            t.close if (t.close and t.close > 0) else None)
+                    if v and v > 0 and not math.isnan(v):
+                        val = float(v)
+                        break
+        except Exception:
+            pass
+
+    # ── Versuch 2: yfinance (Fallback wenn IB nichts liefert) ───────────────
+    if val <= 0:
+        def _fetch_yf():
+            import yfinance as yf
+            try:
+                fi = yf.Ticker('^VIX').fast_info
+                v = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
+                if v and float(v) > 0:
+                    return float(v)
+            except Exception:
+                pass
+            try:
+                df = yf.download('^VIX', period='1d', interval='1m',
+                                 progress=False, auto_adjust=True)
+                if not df.empty and 'Close' in df.columns:
+                    last = df['Close'].dropna()
+                    if len(last) > 0:
+                        return float(last.iloc[-1])
+            except Exception:
+                pass
+            return 0.0
+        try:
+            val = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=15) or 0.0
+        except Exception:
+            val = 0.0
+
+    if val > 0:
+        _vix_cache_val = val
+        _vix_cache_ts  = _t.time()
+    return val if val > 0 else _vix_cache_val
 
 
 def vix_regime(vix: float) -> tuple:
@@ -2341,7 +2364,7 @@ async def run_bot(stop_event: threading.Event = None):
 
             # ── VIX-Regime + Event-Lock ──────────────────────────────────────
             global _vix_level, _vix_regime
-            _vix_level = await get_vix()
+            _vix_level = await get_vix(ib)
             _regime_str, _size_factor = vix_regime(_vix_level)
             _vix_regime = _regime_str
             vix_icon = {'calm': '😴', 'normal': '✅', 'elevated': '⚡', 'crisis': '🚨'}.get(_regime_str, '❓')
