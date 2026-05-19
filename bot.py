@@ -785,17 +785,18 @@ async def _get_market_data_yf(symbol):
         log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
 
-async def _yf_stock_scan(symbols: list) -> dict:
-    """Bulk-Download via yf.download() — EINE API-Anfrage für alle Symbole, kein Rate-Limit."""
-    def _fetch():
+async def _yf_stock_scan(symbols: list, ib=None) -> dict:
+    """Aktienpreise: yfinance Bulk-Download primär, IB-Snapshot als Fallback.
+    IB-Snapshot nutzt snapshot=True → keine dauerhafte Subscription, kein Error 101."""
+
+    # ── Versuch 1: yfinance Bulk-Download ────────────────────────────────────
+    def _fetch_yf():
         import yfinance as yf
         import pandas as pd
         df = yf.download(
             tickers=' '.join(symbols),
-            period='1d',
-            interval='1m',
-            progress=False,
-            auto_adjust=True,
+            period='1d', interval='1m',
+            progress=False, auto_adjust=True,
         )
         if df is None or df.empty:
             return {}
@@ -804,7 +805,6 @@ async def _yf_stock_scan(symbols: list) -> dict:
         if close is None:
             return {}
         if isinstance(close, pd.Series):
-            # Einzelnes Symbol
             last = close.dropna()
             if len(last) > 0 and len(symbols) == 1:
                 results[symbols[0]] = (float(last.iloc[-1]), None)
@@ -815,10 +815,43 @@ async def _yf_stock_scan(symbols: list) -> dict:
                     if len(last) > 0:
                         results[sym] = (float(last.iloc[-1]), None)
         return results
+
     try:
-        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=30)
+        results = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=30)
+        if len(results) >= len(symbols) * 0.5:   # ≥50% erfolgreich → yfinance reicht
+            return results
+        log(f"   ⚠️  yfinance: nur {len(results)}/{len(symbols)} Preise — wechsle zu IB-Snapshot")
     except Exception:
-        return {}
+        results = {}
+        log(f"   ⚠️  yfinance Rate-Limit / Timeout — wechsle zu IB-Snapshot")
+
+    # ── Fallback: IB-Snapshot (snapshot=True = einmalig, keine Subscription) ─
+    if ib is None or not ib.isConnected():
+        log(f"   ⚠️  IB nicht verbunden — kein Fallback verfügbar")
+        return results
+
+    missing = [s for s in symbols if s not in results]
+    log(f"   📡 IB-Snapshot für {len(missing)} Symbole ...")
+    sem_snap = asyncio.Semaphore(10)
+
+    async def _fetch_ib(sym):
+        async with sem_snap:
+            try:
+                con = Stock(sym, 'SMART', 'USD')
+                await ib.qualifyContractsAsync(con)
+                if not con.conId:
+                    return
+                t = ib.reqMktData(con, '', False, True)   # snapshot=True
+                await asyncio.sleep(1.5)
+                price = (t.last  if (t.last  and t.last  > 0) else
+                         t.close if (t.close and t.close > 0) else None)
+                if price and price > 0:
+                    results[sym] = (float(price), None)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[_fetch_ib(s) for s in missing], return_exceptions=True)
+    return results
 
 
 async def check_news_trigger(symbol):
@@ -2327,11 +2360,11 @@ async def run_bot(stop_event: threading.Event = None):
                     await asyncio.sleep(1)
                 continue
 
-            # ── Phase 1a: yfinance Stock-Scan (primär, kein IB-Subscription-Limit) ─
+            # ── Phase 1a: Stock-Scan (yfinance primär, IB-Snapshot Fallback) ──
             t0 = datetime.now()
             import time as _time
-            log(f"   Scanne {len(WATCHLIST)} Symbole via yfinance ...")
-            ib_price_data: dict = await _yf_stock_scan(WATCHLIST)
+            log(f"   Scanne {len(WATCHLIST)} Symbole ...")
+            ib_price_data: dict = await _yf_stock_scan(WATCHLIST, ib)
             elapsed = (datetime.now() - t0).total_seconds()
             log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
 
