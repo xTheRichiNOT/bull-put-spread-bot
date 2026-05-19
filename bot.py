@@ -743,6 +743,7 @@ async def get_market_data(symbol, ib=None):
 
 async def _get_market_data_yf(symbol, ib=None):
     """Kurs + ATM-IV: IB-modelGreeks primär (kein Rate-Limit), yfinance als Fallback."""
+    global _yf_blocked_until
 
     # ── Versuch 1: IB modelGreeks (ATM-Put, '' genTickList → Greeks automatisch) ─
     if ib is not None and ib.isConnected() and symbol in _strike_map:
@@ -836,7 +837,6 @@ async def _get_market_data_yf(symbol, ib=None):
     except Exception as e:
         if 'Rate limit' in str(e) or 'Too Many Requests' in str(e):
             import time as _t3
-            global _yf_blocked_until
             _yf_blocked_until = _t3.time() + _YF_COOLDOWN
         return None, None
 
