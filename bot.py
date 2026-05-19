@@ -737,8 +737,53 @@ async def get_market_data(symbol, ib=None):
     return await _get_market_data_yf(symbol)
 
 
-async def _get_market_data_yf(symbol):
-    """Kurs + ATM-IV ausschließlich via yfinance (interner Fallback)."""
+async def _get_market_data_yf(symbol, ib=None):
+    """Kurs + ATM-IV: IB-modelGreeks primär (kein Rate-Limit), yfinance als Fallback."""
+
+    # ── Versuch 1: IB modelGreeks (ATM-Put, '' genTickList → Greeks automatisch) ─
+    if ib is not None and ib.isConnected() and symbol in _strike_map:
+        try:
+            sm = _strike_map[symbol]
+            price_ref = None
+            # Kurs aus ib_price_data wenn vorhanden, sonst None (wird im Optionspfad nicht gebraucht)
+            strikes   = sm.get('strikes', [])
+            expiries  = sm.get('expirations', [])
+            if strikes and expiries:
+                today = datetime.now()
+                # Nächste Expiry mit ~30-45 DTE
+                exp = min(
+                    expiries,
+                    key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38)
+                )
+                dte_e = (datetime.strptime(exp, '%Y%m%d') - today).days
+                if dte_e >= 7:
+                    # ATM-Strike: wähle den Mittleren der sortierten Strikes als Näherung
+                    atm_strike = sorted(strikes)[len(strikes) // 2]
+                    opt_con = Option(symbol, exp, atm_strike, 'P', 'SMART')
+                    await ib.qualifyContractsAsync(opt_con)
+                    if opt_con.conId:
+                        t_opt = None
+                        try:
+                            t_opt = ib.reqMktData(opt_con, '', False, False)  # '' → Greeks automatisch
+                            iv_ib = None
+                            for _ in range(8):   # max 4s warten
+                                await asyncio.sleep(0.5)
+                                mg = getattr(t_opt, 'modelGreeks', None)
+                                if mg and getattr(mg, 'impliedVol', None) and mg.impliedVol > 0:
+                                    iv_ib = float(mg.impliedVol)
+                                    break
+                            if iv_ib and iv_ib > 0:
+                                return None, iv_ib   # Preis kommt aus ib_price_data, IV ist das Ziel
+                        finally:
+                            if t_opt is not None:
+                                try:
+                                    ib.cancelMktData(t_opt)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+
+    # ── Versuch 2: yfinance (Fallback wenn IB keine Greeks liefert) ──────────
     def _fetch():
         import yfinance as yf
         import time as _time
@@ -2423,12 +2468,12 @@ async def run_bot(stop_event: threading.Event = None):
                     no_iv.remove(sym)
             # Nur abgelaufene / unbekannte IV per yfinance holen
             if no_iv:
-                log(f"   IV via yfinance für {len(no_iv)} Symbole (Cache abgelaufen/neu) ...")
+                log(f"   IV für {len(no_iv)} Symbole (IB-Greeks primär, yfinance Fallback) ...")
                 _sem_iv = asyncio.Semaphore(3)
                 async def _iv_fill(sym):
                     async with _sem_iv:
-                        _, yf_iv = await _get_market_data_yf(sym)
-                        await asyncio.sleep(0.4)  # Anti-Rate-Limit: 400ms Pause pro yfinance-Anfrage
+                        _, yf_iv = await _get_market_data_yf(sym, ib)
+                        await asyncio.sleep(0.4)  # Pause zwischen IV-Anfragen (yfinance Rate-Limit)
                     if yf_iv is not None:
                         p, _ = ib_price_data[sym]
                         ib_price_data[sym] = (p, yf_iv)
