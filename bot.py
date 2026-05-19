@@ -396,10 +396,11 @@ _trades_today: dict = {}   # {'2026-05-15': 3, ...}
 _vix_level:  float = 0.0
 _vix_regime: str   = 'unknown'
 
-_STATE_FILE     = os.path.join(_BASE, '.bot_state.json')
-_HISTORY_FILE   = os.path.join(_BASE, 'trade_history.json')
-_POSITIONS_FILE = os.path.join(_BASE, 'positions.json')
-_SHADOW_FILE    = os.path.join(_BASE, 'shadow_trades.jsonl')
+_STATE_FILE          = os.path.join(_BASE, '.bot_state.json')
+_HISTORY_FILE        = os.path.join(_BASE, 'trade_history.json')
+_POSITIONS_FILE      = os.path.join(_BASE, 'positions.json')
+_SHADOW_FILE         = os.path.join(_BASE, 'shadow_trades.jsonl')
+_RECOMMENDATIONS_FILE = os.path.join(_BASE, 'recommendations.json')
 
 def _write_positions_file():
     """Schreibt offene Positionen für den Launcher (Live-Anzeige im Historie-Tab)."""
@@ -433,6 +434,46 @@ def _write_positions_file():
             }, f, indent=2)
     except Exception:
         pass
+
+
+def _write_recommendations_file(signals: list) -> None:
+    """Schreibt Bot-Empfehlungen in recommendations.json (menschlicher Filter vor Echtgeld-Trade)."""
+    try:
+        recs = []
+        for s in signals:
+            exp_raw = s.get('expiry_ib', '')
+            try:
+                exp_fmt = f"{exp_raw[:4]}-{exp_raw[4:6]}-{exp_raw[6:]}"
+            except Exception:
+                exp_fmt = exp_raw
+            recs.append({
+                'symbol':       s['symbol'],
+                'short_strike': s['short_strike'],
+                'long_strike':  s['long_strike'],
+                'breite':       s['breite'],
+                'expiry':       exp_fmt,
+                'dte':          s['dte'],
+                'preis':        round(s['preis'], 2),
+                'iv':           round(s['iv'], 4),
+                'praemie':      round(s['praemie'], 2),
+                'credit':       round(s['credit'], 0),
+                'max_risk':     round(s['max_risk'], 0),
+                'risk_reward':  round(s['risk_reward'], 3),
+                'prob_otm':     round(s['prob_otm'], 3),
+                'score':        round(s['score'], 4),
+                'ev':           round(s['ev'], 2),
+                'sektor':       SECTOR_MAP.get(s['symbol'], 'Unbekannt'),
+                'quelle':       s.get('praemie_quelle', ''),
+            })
+        with open(_RECOMMENDATIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                'generated':     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'count':         len(recs),
+                'recommendations': recs,
+            }, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
 
 def _log_shadow(entry: dict) -> None:
     """Hängt einen Shadow-Trade-Eintrag an shadow_trades.jsonl an (eine JSON-Zeile pro Eintrag)."""
@@ -2678,9 +2719,7 @@ async def run_bot(stop_event: threading.Event = None):
             if best_rr:
                 log(f"  Bestes R/R: {best_rr:.2f}x | {len(tradeable)} Signale qualifiziert")
 
-            if not AUTO_TRADE:
-                log("  [AUTO_TRADE aus — nur Anzeige]")
-            elif slots <= 0:
+            if slots <= 0:
                 log(f"  ⏸️  Bot-Limit erreicht ({open_count}/{MAX_POSITIONS} Orders diese Session) — kein neuer Trade")
             elif not tradeable:
                 log(f"  ⏸️  Kein Signal mit Score ≥ {ENTRY_THRESHOLD} (TRADE) und erfülltem Credit-Gate")
@@ -2707,14 +2746,37 @@ async def run_bot(stop_event: threading.Event = None):
                     _shadow_from_sig(_s, 'blocked', 'exit_retry', f"EXIT_RETRY: {_retry_syms}")
                 selected = []
 
-            for sig in selected:
-                log(f"\n  🚀 Trade: {sig['symbol']} | Score {sig['score']:.3f}"
-                    f" | EV adj. ${sig['ev']:+.0f} (raw ${sig.get('ev_raw', sig['ev']):+.0f})"
-                    f" | Slip {sig.get('slippage_factor', 1.0):.0%}")
-                _shadow_from_sig(sig, 'taken', 'entry', 'Trade platziert')
-                await place_order(ib, sig)
-                _today_str = datetime.now().strftime('%Y-%m-%d')
-                _trades_today[_today_str] = _trades_today.get(_today_str, 0) + 1
+            # ── EMPFEHLUNGS-MODUS: kein Auto-Trade — menschlicher Filter ────────
+            if selected:
+                log(f"\n{'═'*54}")
+                log(f"  EMPFEHLUNGEN — BITTE MANUELL PRÜFEN UND PLATZIEREN")
+                log(f"{'═'*54}")
+                for i, sig in enumerate(selected, 1):
+                    exp_raw = sig.get('expiry_ib', '')
+                    try:
+                        exp_fmt = f"{exp_raw[:4]}-{exp_raw[4:6]}-{exp_raw[6:]}"
+                    except Exception:
+                        exp_fmt = exp_raw
+                    log(f"  {i}. {sig['symbol']:6s}  "
+                        f"{sig['short_strike']:.0f}/{sig['long_strike']:.0f}P  "
+                        f"{exp_fmt}  ({sig['dte']}DTE)")
+                    log(f"     Prämie ${sig['praemie']:.2f}  |  "
+                        f"Credit ${sig['credit']:.0f}  |  "
+                        f"Max-Risiko ${sig['max_risk']:.0f}")
+                    log(f"     RR {sig['risk_reward']:.2f}x  |  "
+                        f"P(OTM) {sig['prob_otm']:.1%}  |  "
+                        f"Score {sig['score']:.3f}  |  "
+                        f"EV ${sig['ev']:+.0f}")
+                    log(f"     Quelle: {sig.get('praemie_quelle', '—')}")
+                log(f"{'═'*54}")
+                _write_recommendations_file(selected)
+                log(f"  Gespeichert: {_RECOMMENDATIONS_FILE}")
+                # Shadow-Log: als 'watch' markieren (kein echter Trade)
+                for sig in selected:
+                    _shadow_from_sig(sig, 'watch', 'recommendation', 'Empfehlung — manueller Trade erforderlich')
+            else:
+                log("  Keine Empfehlungen in diesem Zyklus.")
+                _write_recommendations_file([])
 
             # Positionen für Launcher-Anzeige schreiben
             _write_positions_file()
