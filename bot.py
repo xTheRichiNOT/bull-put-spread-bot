@@ -374,8 +374,9 @@ def _sym_lock(symbol: str) -> asyncio.Lock:
     return _contract_locks.setdefault(symbol, asyncio.Lock())
 
 # Demo/Live-Modus — wird beim Start via Kontonummer gesetzt
-IS_DEMO_MODE: bool = False
-ACCOUNT_ID:   str  = ''
+IS_DEMO_MODE:   bool = False
+USE_LIVE_DATA:  bool = False   # True wenn live_market_data:true oder echtes Live-Konto
+ACCOUNT_ID:     str  = ''
 
 # Kill-Switch: True wenn Tages-/Wochenverlust-Limit überschritten
 _kill_switch_active: bool  = False
@@ -1763,7 +1764,21 @@ async def place_order(ib, sig):
             has_real_bid = bool(t_short.bid and t_short.bid > 0)
             has_real_ask = bool(t_long.ask  and t_long.ask  > 0)
 
-            if IS_DEMO_MODE:
+            if USE_LIVE_DATA:
+                # Live-Pfad: echtes Bid/Ask oder modelGreeks — striktere Preisfindung
+                ibkr_net = round(short_bid - long_ask, 2) if (short_bid and long_ask) else 0.0
+                has_model = not has_real_bid and bool(
+                    t_short.modelGreeks and t_short.modelGreeks.optPrice
+                    and t_short.modelGreeks.optPrice > 0)
+                discount    = 0.75 if (has_real_bid or has_model) else 0.65
+                limit_price = round(max(ibkr_net * discount, 0.01), 2)
+                quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
+                if has_real_bid:
+                    price_src = 'REAL_BID_ASK'
+                elif price_src == 'BS_ESTIMATE':
+                    price_src = 'LAST_PRICE'
+            else:
+                # Delayed-Daten / Paper ohne Abo: Mid-Point-Fallback mit Toleranz
                 def _mid(t, fallback):
                     b = t.bid if (t.bid and t.bid > 0) else None
                     a = t.ask if (t.ask and t.ask > 0) else None
@@ -1778,37 +1793,25 @@ async def place_order(ib, sig):
                     _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                     return
                 elif price_src == 'BS_ESTIMATE' and (has_real_bid or has_real_ask):
-                    price_src = 'MIDPRICE'   # Zumindest ein echter Kurs vorhanden
+                    price_src = 'MIDPRICE'
                 elif has_real_bid and has_real_ask:
                     price_src = 'MIDPRICE'
                 limit_price = round(max(ibkr_net - 0.02, 0.01), 2)
-                quelle = "Mid-Point (Demo)"
-            else:
-                ibkr_net = round(short_bid - long_ask, 2)
-                has_model = not has_real_bid and bool(
-                    t_short.modelGreeks and t_short.modelGreeks.optPrice
-                    and t_short.modelGreeks.optPrice > 0)
-                discount    = 0.75 if (has_real_bid or has_model) else 0.65
-                limit_price = round(max(ibkr_net * discount, 0.01), 2)
-                quelle      = "IBKR-Bid" if has_real_bid else ("modelGreeks" if has_model else "Last-Preis-Fallback")
-                if has_real_bid:
-                    price_src = 'REAL_BID_ASK'
-                elif price_src == 'BS_ESTIMATE':
-                    price_src = 'LAST_PRICE'   # modelGreeks / Last zählen als LAST_PRICE im Live-Modus
+                quelle = "Mid-Point (Delayed)"
 
             # ── Confidence-Gate ─────────────────────────────────────────────
             confidence = PRICE_CONFIDENCE[price_src]
-            min_conf   = MIN_CONFIDENCE_PAPER if IS_DEMO_MODE else MIN_CONFIDENCE_LIVE
+            min_conf   = MIN_CONFIDENCE_LIVE if USE_LIVE_DATA else MIN_CONFIDENCE_PAPER
             if confidence < min_conf:
                 sig_iv    = sig.get('iv', 0)
                 sig_preis = sig.get('preis', 0)
-                # BS im Demo-Modus: erlaubt wenn IV>25% und Underlying-Preis valide
-                if IS_DEMO_MODE and price_src == 'BS_ESTIMATE' and sig_iv > 0.25 and sig_preis > 0:
-                    log(f"  ⚠️  [{sym}] [{price_src}] Conf={confidence:.2f} — erlaubt (Demo): "
+                # BS im Delayed-Modus: erlaubt wenn IV>25% und Underlying-Preis valide
+                if not USE_LIVE_DATA and price_src == 'BS_ESTIMATE' and sig_iv > 0.25 and sig_preis > 0:
+                    log(f"  ⚠️  [{sym}] [{price_src}] Conf={confidence:.2f} — erlaubt (Delayed): "
                         f"IV={sig_iv:.1%}>25%, Kurs=${sig_preis:.2f} valid")
                 else:
                     reasons = []
-                    if IS_DEMO_MODE and price_src == 'BS_ESTIMATE':
+                    if not USE_LIVE_DATA and price_src == 'BS_ESTIMATE':
                         if sig_iv <= 0.25:  reasons.append(f"IV={sig_iv:.1%} ≤ 25%")
                         if not sig_preis:   reasons.append("Kurs ungültig")
                     log(f"  ✗ [{sym}] Confidence {confidence:.2f} [{price_src}] < {min_conf:.2f} min"
@@ -1818,7 +1821,7 @@ async def place_order(ib, sig):
 
             has_model  = bool(t_short.modelGreeks and t_short.modelGreeks.optPrice
                               and t_short.modelGreeks.optPrice > 0)
-            rr_minimum = MIN_RISK_REWARD if (IS_DEMO_MODE or has_real_bid) else MIN_RISK_REWARD * 1.5
+            rr_minimum = MIN_RISK_REWARD if (not USE_LIVE_DATA or has_real_bid) else MIN_RISK_REWARD * 1.5
 
             short_delta = None
             if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
@@ -1976,20 +1979,20 @@ async def configure_environment(ib) -> bool:
     """Erkennt Demo/Live-Modus anhand der Kontonummer und konfiguriert IB entsprechend.
     Demo-Konten bei IBKR beginnen mit 'D' (z.B. DU123456).
     Gibt True zurück wenn Demo-Modus aktiv, sonst False."""
-    global IS_DEMO_MODE, ACCOUNT_ID
+    global IS_DEMO_MODE, USE_LIVE_DATA, ACCOUNT_ID
     accounts = ib.managedAccounts()
     ACCOUNT_ID = accounts[0] if accounts else _cfg.get('ib_account', '')
     IS_DEMO_MODE = ACCOUNT_ID.upper().startswith('D')
 
     # Datenqualität: unabhängig vom Account-Typ konfigurierbar.
     # Paper-Konten mit Live-Daten-Abo → live_market_data: true in config.json
-    use_live_data = not IS_DEMO_MODE or bool(_cfg.get('live_market_data', False))
-    ib.reqMarketDataType(1 if use_live_data else 3)
+    USE_LIVE_DATA = not IS_DEMO_MODE or bool(_cfg.get('live_market_data', False))
+    ib.reqMarketDataType(1 if USE_LIVE_DATA else 3)
 
     log("=" * 60)
     if IS_DEMO_MODE:
         log("  MODUS: DEMO / PAPER-TRADING  (Konto: " + ACCOUNT_ID + ")")
-        if use_live_data:
+        if USE_LIVE_DATA:
             log("  Echtzeit-Daten aktiv (live_market_data: true)")
         else:
             log("  Delayed-Daten aktiv — nur echte IB/yfinance-Daten erlaubt")
@@ -2348,6 +2351,7 @@ async def run_bot(stop_event: threading.Event = None):
                 async def _iv_fill(sym):
                     async with _sem_iv:
                         _, yf_iv = await _get_market_data_yf(sym)
+                        await asyncio.sleep(0.4)  # Anti-Rate-Limit: 400ms Pause pro yfinance-Anfrage
                     if yf_iv is not None:
                         p, _ = ib_price_data[sym]
                         ib_price_data[sym] = (p, yf_iv)
@@ -2437,7 +2441,7 @@ async def run_bot(stop_event: threading.Event = None):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
-                # Margin-Check: reqAccountSummaryAsync (zuverlässiger als cached accountValues)
+                # Margin-Check: reqAccountSummaryAsync → accountValues()-Cache → Demo-Fallback
                 try:
                     summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
                     av = {v.tag: v.value for v in summary
@@ -2445,7 +2449,25 @@ async def run_bot(stop_event: threading.Event = None):
                     raw = (av.get('AvailableFunds') or av.get('AvailableFunds-S')
                            or av.get('NetLiquidation') or '0')
                     available = float(raw)
-                    log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
+
+                    # Wenn reqAccountSummaryAsync 0 liefert (Demo-API-Verzögerung),
+                    # versuche den IB-internen Cache (accountValues) als zweite Quelle
+                    if available <= 0:
+                        cached_vals = {v.tag: v.value for v in ib.accountValues()
+                                       if v.account == ACCOUNT_ID and v.currency in ('USD', '')}
+                        raw2 = (cached_vals.get('AvailableFunds') or cached_vals.get('TotalCashValue')
+                                or cached_vals.get('NetLiquidation') or '0')
+                        available = float(raw2)
+                        if available > 0:
+                            log(f"  💰 Verfügbare Mittel (Cache): ${available:,.0f}")
+                        elif IS_DEMO_MODE:
+                            log(f"  ⚠️  IBKR liefert $0 im Demo-Modus (API-Verzögerung) — Margin-Check übersprungen")
+                            available = MIN_AVAILABLE_FUNDS  # Kein Block, aber kein fake Kapital
+                        else:
+                            log(f"  ⚠️  Kapital $0 — Live-Konto, Margin-Check wird ausgeführt")
+                    else:
+                        log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
+
                     if available < MIN_AVAILABLE_FUNDS:
                         log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
                         tradeable = []
