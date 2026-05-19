@@ -832,7 +832,7 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
 
     missing = [s for s in symbols if s not in results]
     log(f"   📡 IB-Snapshot für {len(missing)} Symbole ...")
-    sem_snap = asyncio.Semaphore(10)
+    sem_snap = asyncio.Semaphore(20)  # Snapshots halten keine Subscription → großzügig
 
     async def _fetch_ib(sym):
         async with sem_snap:
@@ -842,11 +842,13 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
                 if not con.conId:
                     return
                 t = ib.reqMktData(con, '', False, True)   # snapshot=True
-                await asyncio.sleep(1.5)
-                price = (t.last  if (t.last  and t.last  > 0) else
-                         t.close if (t.close and t.close > 0) else None)
-                if price and price > 0:
-                    results[sym] = (float(price), None)
+                for _ in range(4):                        # max 2s warten, früh abbrechen
+                    await asyncio.sleep(0.5)
+                    price = (t.last  if (t.last  and t.last  > 0) else
+                             t.close if (t.close and t.close > 0) else None)
+                    if price and price > 0:
+                        results[sym] = (float(price), None)
+                        break
             except Exception:
                 pass
 
