@@ -358,6 +358,9 @@ _iv_memory: dict = {}
 _bot_trades: dict = {}
 # IB-validierte Strikes und Expiries pro Symbol (einmalig beim Start geladen)
 _strike_map: dict = {}
+# IV-Cache: {symbol: (iv, timestamp)} — verhindert yfinance-Spam bei jedem Scan-Zyklus
+_iv_cache: dict = {}
+_IV_CACHE_TTL = 300  # Sekunden (5 Minuten)
 # Order-IDs die absichtlich storniert werden (TP/SL-Rotation → kein falsches 'cancelled')
 _expected_cancels: set = set()
 # Begrenzt gleichzeitige IB reqMktData-Aufrufe — verhindert Error 101 (Max Tickers)
@@ -2343,14 +2346,33 @@ async def run_bot(stop_event: threading.Event = None):
                     async with _sem_yf:
                         p, v = await _get_market_data_yf(sym)
                     if p is not None:
+                        # IV aus Cache nehmen falls yfinance keinen liefert
+                        if v is None:
+                            cached = _iv_cache.get(sym)
+                            if cached and _time.time() - cached[1] < _IV_CACHE_TTL:
+                                v = cached[0]
+                        if v is not None:
+                            _iv_cache[sym] = (v, _time.time())
                         ib_price_data[sym] = (p, v)
+                import time as _time
                 await asyncio.gather(*[_yf_fill(s) for s in missing],
                                      return_exceptions=True)
 
-            # ── Phase 1c: IV-Fallback via yfinance für Symbole ohne IB-IV ───
-            # IB liefert bei Delayed Data oft keinen IV → yfinance nachladen
+            # ── Phase 1c: IV via Cache + yfinance-Fallback (TTL 5min) ──────────
+            # IV ändert sich langsam → Cache verhindert yfinance-Spam jeden Scan-Zyklus
+            import time as _time
+            now_ts = _time.time()
             no_iv = [s for s, (_, v) in ib_price_data.items() if v is None]
+            # Cache-Treffer sofort eintragen
+            for sym in list(no_iv):
+                cached = _iv_cache.get(sym)
+                if cached and now_ts - cached[1] < _IV_CACHE_TTL:
+                    p, _ = ib_price_data[sym]
+                    ib_price_data[sym] = (p, cached[0])
+                    no_iv.remove(sym)
+            # Nur abgelaufene / unbekannte IV per yfinance holen
             if no_iv:
+                log(f"   IV via yfinance für {len(no_iv)} Symbole (Cache abgelaufen/neu) ...")
                 _sem_iv = asyncio.Semaphore(3)
                 async def _iv_fill(sym):
                     async with _sem_iv:
@@ -2358,6 +2380,7 @@ async def run_bot(stop_event: threading.Event = None):
                     if yf_iv is not None:
                         p, _ = ib_price_data[sym]
                         ib_price_data[sym] = (p, yf_iv)
+                        _iv_cache[sym] = (yf_iv, _time.time())
                 await asyncio.gather(*[_iv_fill(s) for s in no_iv],
                                      return_exceptions=True)
 
