@@ -726,33 +726,29 @@ async def build_strike_map(ib):
 
 
 async def get_market_data(symbol, ib=None):
-    """Hole Kurs und ATM-IV. IB Historical Data zuerst, Fallback auf yfinance."""
+    """Hole Kurs und ATM-IV. IB reqMktData zuerst, Fallback auf yfinance."""
     import math as _math
     from ib_insync import Stock as _Stock
 
     if ib and ib.isConnected():
         try:
-            contract = _Stock(symbol, 'SMART', 'USD')
-            bars_p, bars_iv = await asyncio.gather(
-                ib.reqHistoricalDataAsync(
-                    contract, endDateTime='', durationStr='1 D',
-                    barSizeSetting='5 mins', whatToShow='TRADES',
-                    useRTH=False, formatDate=1),
-                ib.reqHistoricalDataAsync(
-                    contract, endDateTime='', durationStr='5 D',
-                    barSizeSetting='1 day', whatToShow='OPTION_IMPLIED_VOLATILITY',
-                    useRTH=True, formatDate=1),
-                return_exceptions=True)
+            global _sem_ib_mktdata
+            if _sem_ib_mktdata is None:
+                _sem_ib_mktdata = asyncio.Semaphore(2)
+            async with _sem_ib_mktdata:
+                t = ib.reqMktData(_Stock(symbol, 'SMART', 'USD'), '106', False, False)
+                await asyncio.sleep(4)
             ib_price = None
-            if bars_p and not isinstance(bars_p, Exception) and len(bars_p) > 0:
-                c = bars_p[-1].close
-                if c and c > 0 and not _math.isnan(c):
-                    ib_price = float(c)
-            ib_iv = None
-            if bars_iv and not isinstance(bars_iv, Exception) and len(bars_iv) > 0:
-                v = bars_iv[-1].close
+            for v in (t.last, t.close, t.bid):
                 if v and v > 0 and not _math.isnan(v):
-                    ib_iv = float(v)
+                    ib_price = float(v)
+                    break
+            try:
+                ib.cancelMktData(t)
+            except Exception:
+                pass
+            ib_iv = getattr(t, 'impliedVolatility', None)
+            ib_iv = float(ib_iv) if (ib_iv and not _math.isnan(ib_iv) and ib_iv > 0) else None
             if ib_price:
                 if ib_iv:
                     return ib_price, ib_iv
@@ -812,37 +808,31 @@ async def _get_market_data_yf(symbol):
         log(f"   [{symbol}] ❌ yfinance Fehler: {e}")
         return None, None
 
-async def _ib_hist_price_scan(symbols: list, ib) -> dict:
-    """Holt Kurse+IV via reqHistoricalData — parallel, kein Subscription-Limit, kein cancelMktData."""
+async def _ib_price_scan(symbols: list, ib) -> dict:
+    """Concurrent reqMktData für alle Symbole — max 70 gleichzeitig (< IB-Limit 100).
+    Alle Symbole starten parallel, Semaphore hält Slot für die volle Subscription-Dauer.
+    Zwei Wellen à ~4s statt 15 sequentielle Batches à ~4s = ~8s statt ~60s."""
     import math as _math
     from ib_insync import Stock as _Stock
 
-    _sem = asyncio.Semaphore(10)
+    _sem = asyncio.Semaphore(70)
 
     async def _fetch_one(sym):
         async with _sem:
             try:
-                contract = _Stock(sym, 'SMART', 'USD')
-                bars_p, bars_iv = await asyncio.gather(
-                    ib.reqHistoricalDataAsync(
-                        contract, endDateTime='', durationStr='1 D',
-                        barSizeSetting='5 mins', whatToShow='TRADES',
-                        useRTH=False, formatDate=1),
-                    ib.reqHistoricalDataAsync(
-                        contract, endDateTime='', durationStr='5 D',
-                        barSizeSetting='1 day', whatToShow='OPTION_IMPLIED_VOLATILITY',
-                        useRTH=True, formatDate=1),
-                    return_exceptions=True)
+                t = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '106', False, False)
+                await asyncio.sleep(4)
                 price = None
-                if bars_p and not isinstance(bars_p, Exception) and len(bars_p) > 0:
-                    c = bars_p[-1].close
-                    if c and c > 0 and not _math.isnan(c):
-                        price = float(c)
-                iv = None
-                if bars_iv and not isinstance(bars_iv, Exception) and len(bars_iv) > 0:
-                    v = bars_iv[-1].close
+                for v in (t.last, t.close, t.bid):
                     if v and v > 0 and not _math.isnan(v):
-                        iv = float(v)
+                        price = float(v)
+                        break
+                iv = getattr(t, 'impliedVolatility', None)
+                iv = float(iv) if (iv and not _math.isnan(iv) and iv > 0) else None
+                try:
+                    ib.cancelMktData(t)
+                except Exception:
+                    pass
                 if price is not None:
                     return sym, (price, iv)
             except Exception:
@@ -2336,12 +2326,12 @@ async def run_bot(stop_event: threading.Event = None):
                     await asyncio.sleep(1)
                 continue
 
-            # ── Phase 1a: IB Historical Data Scan (alle Symbole parallel) ──────
+            # ── Phase 1a: IB concurrent reqMktData (alle Symbole, max 70 gleichzeitig) ─
             t0 = datetime.now()
             ib_price_data: dict = {}
             if ib and ib.isConnected():
-                log(f"   Scanne {len(WATCHLIST)} Symbole via IB Historical Data ...")
-                ib_price_data = await _ib_hist_price_scan(WATCHLIST, ib)
+                log(f"   Scanne {len(WATCHLIST)} Symbole via IB ...")
+                ib_price_data = await _ib_price_scan(WATCHLIST, ib)
                 elapsed = (datetime.now() - t0).total_seconds()
                 log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
 
