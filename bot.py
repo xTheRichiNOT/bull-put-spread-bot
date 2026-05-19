@@ -820,7 +820,7 @@ async def _ib_price_scan(symbols: list, ib) -> dict:
     async def _fetch_one(sym):
         async with _sem:
             try:
-                t = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '106', False, False)
+                t = ib.reqMktData(_Stock(sym, 'SMART', 'USD'), '', False, False)
                 await asyncio.sleep(4)
                 price = None
                 for v in (t.last, t.close, t.bid):
@@ -2103,7 +2103,7 @@ async def run_bot(stop_event: threading.Event = None):
         import logging as _logging
 
         _IB_SUPPRESS_CODES = {
-            10090, 10091,           # Kein Abo — Delayed verfügbar (informativ)
+            10089, 10090, 10091,    # Kein Abo / Subscription nötig — yfinance-Fallback greift
             2104, 2106, 2107,       # Market-Data-Farm OK
             2108, 2158, 2157,       # Hist./SecDef-Farm OK
             504,                    # Not connected (transient)
