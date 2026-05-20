@@ -2521,37 +2521,41 @@ async def run_bot(stop_event: threading.Event = None):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
-                # Margin-Check: reqAccountSummaryAsync → accountValues()-Cache als Fallback
+                # Margin-Check: reqAccountSummaryAsync → Cache → Paper-Fallback
                 _margin_stop = False
+                _is_paper_acct = ACCOUNT_ID.upper().startswith('DU')
+                available = 0.0
                 try:
                     summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
-                    # Paper-Konten liefern Werte teils mit currency='BASE' → alle akzeptieren
-                    _FUND_CURRENCIES = ('USD', 'BASE', '')
-                    av = {v.tag: v.value for v in summary
-                          if v.account == ACCOUNT_ID and v.currency in _FUND_CURRENCIES}
+                    # Kein Währungsfilter — Paper-Konten liefern teils BASE, USD oder leere Felder
+                    av = {v.tag: v.value for v in summary if v.account == ACCOUNT_ID}
                     raw = (av.get('AvailableFunds') or av.get('AvailableFunds-S')
-                           or av.get('NetLiquidation') or '0')
+                           or av.get('NetLiquidation') or av.get('TotalCashValue') or '0')
                     available = float(raw)
 
                     if available <= 0:
+                        # Fallback: lokaler TWS-Cache
                         cached_vals = {v.tag: v.value for v in ib.accountValues()
-                                       if v.account == ACCOUNT_ID and v.currency in _FUND_CURRENCIES}
+                                       if v.account == ACCOUNT_ID}
                         raw2 = (cached_vals.get('AvailableFunds') or cached_vals.get('TotalCashValue')
                                 or cached_vals.get('NetLiquidation') or '0')
                         available = float(raw2)
-                        if available > 0:
-                            log(f"  💰 Verfügbare Mittel (Cache): ${available:,.0f}")
-                        else:
-                            log(f"  ⚠️  Kapital $0 — Margin-Check wird ausgeführt")
-                    else:
-                        log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
-
-                    if available < MIN_AVAILABLE_FUNDS:
-                        log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
-                        tradeable = []
-                        _margin_stop = True
                 except Exception:
                     log(f"  ⚠️  Kapital-Abfrage fehlgeschlagen — überspringe Margin-Check")
+
+                if available <= 0 and _is_paper_acct:
+                    # Paper-Konto: IB liefert oft $0 über API → virtuelles Budget als Fallback
+                    available = 50_000.0
+                    log(f"  ℹ️  Paper-Konto meldet $0 — virtuelles Kapital: ${available:,.0f}")
+                elif available > 0:
+                    log(f"  💰 Verfügbare Mittel: ${available:,.0f}")
+                else:
+                    log(f"  ⚠️  Kapital $0 — Margin-Check wird ausgeführt")
+
+                if available < MIN_AVAILABLE_FUNDS:
+                    log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
+                    tradeable = []
+                    _margin_stop = True
 
                 # Daily Trade Budget: Wie viele neue Trades heute noch erlaubt?
                 _today_str   = datetime.now().strftime('%Y-%m-%d')
