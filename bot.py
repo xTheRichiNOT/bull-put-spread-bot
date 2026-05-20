@@ -2055,6 +2055,7 @@ async def place_order(ib, sig):
                 log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
                 log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
                 log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
+            return True
     except Exception as e:
         import traceback
         log(f"  ❌ [{sym}] Order-Fehler: {e}\n{traceback.format_exc()}")
