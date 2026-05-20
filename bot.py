@@ -2010,37 +2010,48 @@ async def place_order(ib, sig):
             tp_close = max(round(limit_price * (1 - TAKE_PROFIT_PCT), 2), 0.01)
             sl_close = round(limit_price * STOP_LOSS_MULT, 2)
 
+            _is_paper = ACCOUNT_ID.upper().startswith('DU')
+
             entry_order = LimitOrder('BUY', n_contracts, -limit_price, tif='GTC')
-            entry_order.transmit = False
+            # Paper: transmit=True (kein Bracket) — IBKR lehnt Combo-Child-Orders ab (Error 201)
+            entry_order.transmit = _is_paper
             entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
             entry_order.account = _cfg.get('ib_account', '')
             entry_trade = ib.placeOrder(bag, entry_order)
             parent_id = entry_trade.order.orderId
 
-            tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
-            tp_order.parentId = parent_id
-            tp_order.transmit = False
-            tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-            tp_order.account = _cfg.get('ib_account', '')
-            tp_trade = ib.placeOrder(bag, tp_order)
-
-            sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
-            sl_order.parentId = parent_id
-            sl_order.transmit = True
-            sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-            sl_order.account = _cfg.get('ib_account', '')
-            sl_trade = ib.placeOrder(bag, sl_order)
-
-            _bot_trades[sym]['tp_order_id']    = tp_trade.order.orderId
-            _bot_trades[sym]['sl_order_id']    = sl_trade.order.orderId
             _bot_trades[sym]['entry_order_id'] = parent_id
+
+            if not _is_paper:
+                # Live-Konto: Bracket mit TP + SL
+                tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
+                tp_order.parentId = parent_id
+                tp_order.transmit = False
+                tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+                tp_order.account = _cfg.get('ib_account', '')
+                tp_trade = ib.placeOrder(bag, tp_order)
+
+                sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
+                sl_order.parentId = parent_id
+                sl_order.transmit = True
+                sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+                sl_order.account = _cfg.get('ib_account', '')
+                sl_trade = ib.placeOrder(bag, sl_order)
+
+                _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+                _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+
             _save_state()
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
-            log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
-            log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
-            log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
-            log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
+            if _is_paper:
+                log(f"  ✅ [{sym}] ENTRY-ORDER PLATZIERT (Paper — kein Bracket) × {n_contracts} Kontrakt(e)")
+                log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+            else:
+                log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
+                log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+                log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
+                log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
     except Exception as e:
         import traceback
         log(f"  ❌ [{sym}] Order-Fehler: {e}\n{traceback.format_exc()}")
