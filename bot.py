@@ -2522,17 +2522,20 @@ async def run_bot(stop_event: threading.Event = None):
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
                 # Margin-Check: reqAccountSummaryAsync → accountValues()-Cache als Fallback
+                _margin_stop = False
                 try:
                     summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
+                    # Paper-Konten liefern Werte teils mit currency='BASE' → alle akzeptieren
+                    _FUND_CURRENCIES = ('USD', 'BASE', '')
                     av = {v.tag: v.value for v in summary
-                          if v.account == ACCOUNT_ID and v.currency in ('USD', '')}
+                          if v.account == ACCOUNT_ID and v.currency in _FUND_CURRENCIES}
                     raw = (av.get('AvailableFunds') or av.get('AvailableFunds-S')
                            or av.get('NetLiquidation') or '0')
                     available = float(raw)
 
                     if available <= 0:
                         cached_vals = {v.tag: v.value for v in ib.accountValues()
-                                       if v.account == ACCOUNT_ID and v.currency in ('USD', '')}
+                                       if v.account == ACCOUNT_ID and v.currency in _FUND_CURRENCIES}
                         raw2 = (cached_vals.get('AvailableFunds') or cached_vals.get('TotalCashValue')
                                 or cached_vals.get('NetLiquidation') or '0')
                         available = float(raw2)
@@ -2546,6 +2549,7 @@ async def run_bot(stop_event: threading.Event = None):
                     if available < MIN_AVAILABLE_FUNDS:
                         log(f"  ⛔ Margin-Stop: ${available:,.0f} < ${MIN_AVAILABLE_FUNDS:,} Minimum — kein neuer Trade")
                         tradeable = []
+                        _margin_stop = True
                 except Exception:
                     log(f"  ⚠️  Kapital-Abfrage fehlgeschlagen — überspringe Margin-Check")
 
@@ -2594,6 +2598,8 @@ async def run_bot(stop_event: threading.Event = None):
                 blocked = [s for s in all_signals if s not in tradeable]
                 for s in blocked:
                     reasons = []
+                    if _margin_stop:
+                        reasons.append(f"Margin-Stop: Kapital < ${MIN_AVAILABLE_FUNDS:,}")
                     if s['praemie_quelle'] == "Black-Scholes (geschätzt)":
                         reasons.append("kein echtes Bid (BS-Schätzung) — Live-Modus erfordert echtes Bid")
                     if not s.get('credit_ok_hard', True):
