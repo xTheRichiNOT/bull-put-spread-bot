@@ -207,6 +207,7 @@ MAX_BID_ASK_SPREAD = float(_cfg.get('max_bid_ask_spread', 0.12))  # 12 % des Mid
 # Slippage-Modell: erwarteter Fill als Anteil des theoretischen Credits
 SLIPPAGE_FACTOR: dict[str, float] = {
     'IB (Combo)':                0.92,
+    'IB (Net-Bid)':              0.90,
     'IB (Bid)':                  0.88,
     'yfinance (Bid)':            0.82,
     'Black-Scholes (geschätzt)': 0.65,
@@ -1288,6 +1289,30 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         else:
             long_strike = short_strike - SPREAD_MIN
         breite = short_strike - long_strike
+
+        # ── Long-Put Ask holen → echter Netto-Credit (Short-Bid minus Long-Ask) ──
+        _long_ask_net = 0.0
+        try:
+            _l_con_net = Option(symbol, expiry_ib_str, long_strike, 'P', 'SMART')
+            await ib.qualifyContractsAsync(_l_con_net)
+            if _l_con_net.conId > 0:
+                async with _sem_ib_mktdata:
+                    _t_long = ib.reqMktData(_l_con_net, '', False, False)
+                    await asyncio.sleep(5)
+                    _la = _t_long.ask if (_t_long.ask and not math.isnan(_t_long.ask) and _t_long.ask > 0) else 0.0
+                    if _la == 0.0:
+                        _la = _t_long.bid if (_t_long.bid and not math.isnan(_t_long.bid) and _t_long.bid > 0) else 0.0
+                    try:
+                        ib.cancelMktData(_t_long)
+                    except Exception:
+                        pass
+                _long_ask_net = _la
+        except Exception:
+            pass
+
+        if _long_ask_net > 0:
+            praemie        = max(_sb - _long_ask_net, 0.01)
+            praemie_quelle = "IB (Net-Bid)"
 
         # ── IB Combo/Bag Pricing (verbessert Prämie von IB-Bid zu Netto-Credit) ─
         try:
