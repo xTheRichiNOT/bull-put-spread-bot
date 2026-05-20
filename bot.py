@@ -1928,8 +1928,9 @@ async def place_order(ib, sig):
 
             market_rr     = ibkr_net / (sig['breite'] - ibkr_net) if sig['breite'] > ibkr_net else 0.0
             market_credit = ibkr_net * 100
+            _is_paper_rr  = ACCOUNT_ID.upper().startswith('DU')
 
-            if market_rr < rr_minimum:
+            if not _is_paper_rr and market_rr < rr_minimum:
                 log(f"  ✗ [{sym}] R/R {market_rr:.2f}x < {rr_minimum:.2f}x ({quelle}) — Trade abgebrochen")
                 _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                 return
