@@ -51,9 +51,17 @@ if os.path.exists(_env_path):
                 _k, _, _v = _line.partition('=')
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-# ── Config laden (config.json) ───────────────────────────────────────────────
+# ── Config laden (config.json oder --config <datei>) ─────────────────────────
 import json as _json
-_cfg_path = os.path.join(_BASE, 'config.json')
+_cfg_name = 'config.json'
+for _i, _arg in enumerate(sys.argv[1:], 1):
+    if _arg in ('--config', '-c') and _i < len(sys.argv):
+        _cfg_name = sys.argv[_i + 1]
+        break
+    if _arg.startswith('--config='):
+        _cfg_name = _arg.split('=', 1)[1]
+        break
+_cfg_path = os.path.join(_BASE, _cfg_name)
 _cfg_defaults = {
     "ib_host": "127.0.0.1", "ib_port": 4001, "ib_account": "U25827024",
     "min_vola": 0.28, "abstand_y": 0.10, "min_credit": 70,
@@ -110,37 +118,27 @@ from ib_insync import *
 
 # --- STRATEGIE-VARIABLEN ---
 WATCHLIST        = [
-    # Mega-Cap Tech (10)
-    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'CSCO', 'IBM', 'DELL', 'AMAT',
-    # Halbleiter (12)
-    'AMD', 'AVGO', 'QCOM', 'MU', 'TSM', 'INTC', 'TXN', 'LRCX', 'KLAC', 'MRVL', 'ON', 'ARM',
-    # Software & Cloud (12)
-    'CRM', 'ORCL', 'NOW', 'ADBE', 'PLTR', 'WDAY', 'SNOW', 'PANW', 'CRWD', 'FTNT', 'DDOG', 'APP',
-    # Consumer Tech / EV (8)
-    'TSLA', 'NFLX', 'UBER', 'SHOP', 'LYFT', 'PINS', 'DASH', 'RBLX',
-    # Fintech & Krypto (6)
-    'COIN', 'PYPL', 'V', 'MA', 'AFRM', 'SOFI',
-    # Banken & Finanzen (11)
-    'JPM', 'GS', 'MS', 'BAC', 'WFC', 'C', 'AXP', 'SCHW', 'BLK', 'BX', 'USB',
-    # Pharma / Healthcare (13)
-    'LLY', 'JNJ', 'UNH', 'ABBV', 'PFE', 'MRK', 'BMY', 'AMGN', 'MDT', 'ABT', 'CVS', 'GILD', 'VRTX',
-    # Energie (8)
-    'XOM', 'CVX', 'COP', 'EOG', 'SLB', 'OXY', 'MPC', 'VLO',
-    # Retail & Consumer (11)
-    'WMT', 'COST', 'TGT', 'HD', 'LOW', 'NKE', 'SBUX', 'MCD', 'CMG', 'DG', 'LULU',
-    # Industrie & Aerospace (10)
-    'CAT', 'DE', 'HON', 'GE', 'LMT', 'RTX', 'BA', 'NOC', 'EMR', 'MMM',
-    # Telecom (3)
-    'T', 'VZ', 'TMUS',
-    # Versorger & REITs (4)
-    'NEE', 'AMT', 'PLD', 'DUK',
-    # Rohstoffe & Materialien (4)
-    'LIN', 'NEM', 'FCX', 'AA',
-    # Food & Beverages (4)
-    'KO', 'PEP', 'PM', 'MO',
-    # Travel & Leisure (3)
-    'ABNB', 'BKNG', 'MAR',
-]  # gesamt: 120
+    # Mega-Cap Tech (6) — META/CSCO/IBM/DELL gestrichen (kein Delayed-Datenstrom)
+    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'AMAT',
+    # Halbleiter (7)
+    'AMD', 'AVGO', 'QCOM', 'MU', 'LRCX', 'KLAC', 'MRVL',
+    # Software & Cloud (8)
+    'CRM', 'ORCL', 'NOW', 'ADBE', 'PLTR', 'PANW', 'CRWD', 'FTNT',
+    # Consumer Tech / EV (4)
+    'TSLA', 'NFLX', 'UBER', 'SHOP',
+    # Fintech & Krypto (4)
+    'COIN', 'PYPL', 'V', 'MA',
+    # Banken & Finanzen (4)
+    'JPM', 'GS', 'MS', 'BAC',
+    # Pharma / Healthcare (5)
+    'LLY', 'UNH', 'ABBV', 'AMGN', 'VRTX',
+    # Energie (4)
+    'XOM', 'CVX', 'COP', 'OXY',
+    # Retail & Consumer (4)
+    'WMT', 'COST', 'HD', 'CMG',
+    # Industrie (2) — LMT/RTX/BA/GE gestrichen (kein Delayed-Datenstrom)
+    'CAT', 'DE',
+]  # gesamt: 48
 MIN_VOLA         = float(_cfg.get('min_vola', 0.28))   # Hard-Floor IV (PDF: >28%)
 MIN_VOLA_SOFT    = 0.35    # Score-Penalty Zone: IV 28–35 % → -0.10
 IV_SOFT_PENALTY  = 0.10
@@ -670,6 +668,23 @@ def _yf_net_credit(puts, short_strike, long_strike, short_bid_yf):
         pass
     return None
 
+def _bs_iv_from_price(S, K, T, market_price, r=0.045):
+    """Rückrechnung der impliziten Volatilität via Bisektion aus dem Optionspreis (Mid = (Bid+Ask)/2)."""
+    if T <= 0 or market_price <= 0 or S <= 0 or K <= 0:
+        return None
+    lo, hi = 0.01, 5.0
+    for _ in range(60):
+        mid_iv = (lo + hi) / 2
+        bs = _bs_put(S, K, T, mid_iv, r)
+        if bs < market_price:
+            lo = mid_iv
+        else:
+            hi = mid_iv
+        if hi - lo < 0.0001:
+            break
+    iv = (lo + hi) / 2
+    return iv if 0.05 <= iv <= 3.0 else None
+
 def _bs_prob_otm(S, K, T, sigma, r=0.045):
     """Wahrscheinlichkeit, dass Put OTM verfällt = N(d2) = Gewinnwahrscheinlichkeit für Short Put."""
     if T <= 0 or sigma <= 0:
@@ -765,188 +780,147 @@ async def get_market_data(symbol, ib=None):
 
 
 async def _get_market_data_yf(symbol, ib=None):
-    """Kurs + ATM-IV: IB-modelGreeks primär (kein Rate-Limit), yfinance als Fallback."""
-    global _yf_blocked_until
+    """IV via OPRA (Type 1): ATM-Strike aus Cache-Preis, impliedVolatility → modelGreeks → Bid/Ask-Fallback."""
+    import math as _math
 
-    # ── Versuch 1: IB modelGreeks (ATM-Put, '' genTickList → Greeks automatisch) ─
-    if ib is not None and ib.isConnected() and symbol in _strike_map:
+    if ib is None or not ib.isConnected() or symbol not in _strike_map:
+        return None, None
+
+    try:
+        sm = _strike_map[symbol]
+        strikes  = sm.get('strikes', [])
+        expiries = sm.get('expirations', [])
+        if not strikes or not expiries:
+            return None, None
+
+        # Aktienkurs aus Hintergrund-Cache (Type-4-Stream) — kein Extra-API-Call
+        price = None
+        for t in ib.tickers():
+            if t.contract and t.contract.symbol == symbol and t.contract.secType == 'STK':
+                for val in [t.last, t.close,
+                            getattr(t, 'delayedLast',  None),
+                            getattr(t, 'delayedClose', None)]:
+                    if val is not None and val > 0 and not _math.isnan(val):
+                        price = float(val)
+                        break
+                if price:
+                    break
+        if not price or price <= 0:
+            return None, None
+
+        # Echter ATM-Strike: nächster Strike zum aktuellen Kurs
+        strike = min(strikes, key=lambda s: abs(s - price))
+
+        # Expiry ~38 DTE
+        today = datetime.now()
+        exp = min(expiries, key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38))
+        if (datetime.strptime(exp, '%Y%m%d') - today).days < 7:
+            return None, None
+
+        opt_con = Option(symbol, exp, strike, 'P', 'SMART')
+        await ib.qualifyContractsAsync(opt_con)
+
+        # Wenn ATM-Strike für diese Expiry nicht existiert → bis zu 4 nächste Strikes versuchen
+        if not opt_con.conId:
+            alt_strikes = sorted(strikes, key=lambda s: abs(s - price))[:5]
+            for alt_s in alt_strikes:
+                if alt_s == strike:
+                    continue
+                opt_alt = Option(symbol, exp, alt_s, 'P', 'SMART')
+                await ib.qualifyContractsAsync(opt_alt)
+                if opt_alt.conId:
+                    opt_con = opt_alt
+                    strike = alt_s
+                    break
+
+        if not opt_con.conId:
+            log(f"   [IV-DBG {symbol}] kein Contract: strike={strike} exp={exp} — Strike für diese Expiry nicht verfügbar")
+            return None, None
+
+        ib.reqMarketDataType(1)  # OPRA Echtzeit für Optionen
+        t_opt = ib.reqMktData(opt_con, '', False, False)
+
+        def _valid_iv(v) -> bool:
+            try:
+                return v is not None and v > 0 and not _math.isnan(v)
+            except Exception:
+                return False
+
+        iv = None
+        for _ in range(10):  # max 5s — IBKR braucht bei stark gehandelten Symbolen bis 3s
+            await asyncio.sleep(0.5)
+            # Versuch 1: bidGreeks / askGreeks — kommen direkt aus OPRA, kein Underlying nötig
+            for grk_attr in ('bidGreeks', 'askGreeks'):
+                grk = getattr(t_opt, grk_attr, None)
+                if grk:
+                    iv_raw = getattr(grk, 'impliedVol', None)
+                    if _valid_iv(iv_raw):
+                        iv = float(iv_raw)
+                        break
+            if iv:
+                break
+            # Versuch 2: modelGreeks (wird nur geliefert wenn IBKR Underlying-Preis kennt)
+            mg = getattr(t_opt, 'modelGreeks', None)
+            if mg:
+                iv_raw = getattr(mg, 'impliedVol', None)
+                if _valid_iv(iv_raw):
+                    iv = float(iv_raw)
+                    break
+            # Versuch 3: OPRA Bid/Ask vorhanden → echte IV per BS-Bisektion rückrechnen
+            bid = getattr(t_opt, 'bid', None)
+            ask = getattr(t_opt, 'ask', None)
+            if _valid_iv(bid) and _valid_iv(ask):
+                mid_price = (bid + ask) / 2.0
+                T_years   = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
+                iv_bs = _bs_iv_from_price(price, strike, T_years, mid_price)
+                if iv_bs:
+                    iv = iv_bs
+                    break
+
+        await asyncio.sleep(0.2)  # Puffer vor Cancel — verhindert Error 300
         try:
-            sm = _strike_map[symbol]
-            price_ref = None
-            # Kurs aus ib_price_data wenn vorhanden, sonst None (wird im Optionspfad nicht gebraucht)
-            strikes   = sm.get('strikes', [])
-            expiries  = sm.get('expirations', [])
-            if strikes and expiries:
-                today = datetime.now()
-                # Nächste Expiry mit ~30-45 DTE
-                exp = min(
-                    expiries,
-                    key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38)
-                )
-                dte_e = (datetime.strptime(exp, '%Y%m%d') - today).days
-                if dte_e >= 7:
-                    # ATM-Strike: wähle den Mittleren der sortierten Strikes als Näherung
-                    atm_strike = sorted(strikes)[len(strikes) // 2]
-                    opt_con = Option(symbol, exp, atm_strike, 'P', 'SMART')
-                    await ib.qualifyContractsAsync(opt_con)
-                    if opt_con.conId:
-                        t_opt = None
-                        try:
-                            t_opt = ib.reqMktData(opt_con, '', False, False)  # '' → Greeks automatisch
-                            iv_ib = None
-                            for _ in range(8):   # max 4s warten
-                                await asyncio.sleep(0.5)
-                                mg = getattr(t_opt, 'modelGreeks', None)
-                                if mg and getattr(mg, 'impliedVol', None) and mg.impliedVol > 0:
-                                    iv_ib = float(mg.impliedVol)
-                                    break
-                            if iv_ib and iv_ib > 0:
-                                return None, iv_ib   # Preis kommt aus ib_price_data, IV ist das Ziel
-                        finally:
-                            try:
-                                ib.cancelMktData(opt_con)  # Contract, nicht Ticker
-                            except Exception:
-                                pass
+            ib.cancelMktData(t_opt)
         except Exception:
             pass
 
-    # ── Versuch 2: yfinance (Fallback — übersprungen wenn Cooldown aktiv) ──────
-    import time as _t2
-    if _t2.time() < _yf_blocked_until:
-        return None, None   # Cooldown aktiv → kein yfinance-Versuch
+        if not iv:
+            _bid = getattr(t_opt, 'bid', None)
+            _ask = getattr(t_opt, 'ask', None)
+            log(f"   [IV-DBG {symbol}] Stream offen, kein Tick: bid={_bid} ask={_ask} "
+                f"(strike={strike} exp={exp})")
 
-    def _fetch():
-        import yfinance as yf
-        import time as _time
-        def _yf_call(fn, retries=3):
-            for i in range(retries):
-                try:
-                    return fn()
-                except Exception as e:
-                    if i < retries - 1 and ('Too Many Requests' in str(e) or 'Rate limited' in str(e)):
-                        _time.sleep(3 * (2 ** i))
-                        continue
-                    raise
-        ticker = yf.Ticker(symbol)
-        try:
-            price = ticker.fast_info['last_price']
-        except Exception:
-            hist = ticker.history(period='1d')
-            price = float(hist['Close'].iloc[-1]) if not hist.empty else None
-        if not price or price != price:
-            return None, None
-        expirations = _yf_call(lambda: ticker.options)
-        if not expirations:
-            return price, None
-        today = datetime.now()
-        dte_map = [(e, (datetime.strptime(e, '%Y-%m-%d') - today).days) for e in expirations]
-        valid = [e for e, d in dte_map if MIN_DTE <= d <= MAX_DTE]
-        if not valid:
-            candidates = [(e, d) for e, d in dte_map if d >= 14]
-            expiry = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0] if candidates else expirations[-1]
-        else:
-            expiry = valid[0]
-        puts = _yf_call(lambda: ticker.option_chain(expiry).puts)
-        if puts.empty:
-            return price, None
-        atm_idx = (puts['strike'] - price).abs().idxmin()
-        iv = puts.loc[atm_idx, 'impliedVolatility']
-        return price, float(iv) if iv == iv else None
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25)
-    except asyncio.TimeoutError:
-        log(f"   [{symbol}] ⏱️  yfinance Timeout — überspringe")
-        return None, None
-    except Exception as e:
-        if 'Rate limit' in str(e) or 'Too Many Requests' in str(e):
-            import time as _t3
-            _yf_blocked_until = _t3.time() + _YF_COOLDOWN
-        return None, None
+        return (None, iv) if (iv and iv > 0) else (None, None)
+
+    except Exception:
+        pass
+
+    return None, None
 
 async def _yf_stock_scan(symbols: list, ib=None) -> dict:
-    """Aktienpreise: yfinance Bulk-Download primär, IB-Streaming als Fallback.
-    Bei Rate-Limit: 10-Minuten-Cooldown → sofort zu IB, kein 27s-Timeout."""
-    import time as _t
-    global _yf_blocked_until
-
-    results = {}
-
-    # ── Versuch 1: yfinance Bulk-Download (übersprungen wenn Cooldown aktiv) ──
-    if _t.time() < _yf_blocked_until:
-        remaining = int(_yf_blocked_until - _t.time())
-        log(f"   ⏭️  yfinance Cooldown noch {remaining}s — direkt zu IB")
-    else:
-        def _fetch_yf():
-            import yfinance as yf
-            import pandas as pd
-            df = yf.download(
-                tickers=' '.join(symbols),
-                period='1d', interval='1m',
-                progress=False, auto_adjust=True,
-            )
-            if df is None or df.empty:
-                return {}
-            out = {}
-            close = df.get('Close', df.get('close'))
-            if close is None:
-                return {}
-            if isinstance(close, pd.Series):
-                last = close.dropna()
-                if len(last) > 0 and len(symbols) == 1:
-                    out[symbols[0]] = (float(last.iloc[-1]), None)
-            else:
-                for sym in symbols:
-                    if sym in close.columns:
-                        last = close[sym].dropna()
-                        if len(last) > 0:
-                            out[sym] = (float(last.iloc[-1]), None)
-            return out
-
-        try:
-            results = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=30)
-            if len(results) >= len(symbols) * 0.5:
-                return results
-            log(f"   ⚠️  yfinance: nur {len(results)}/{len(symbols)} Preise — wechsle zu IB")
-        except Exception:
-            results = {}
-            _yf_blocked_until = _t.time() + _YF_COOLDOWN
-            log(f"   ⚠️  yfinance Rate-Limit — Cooldown {_YF_COOLDOWN//60}min, wechsle zu IB")
-
-    # ── Fallback: IB-Streaming + sofort Cancel (kein snapshot=True → kein Error 10213) ─
-    # Semaphore(15): max 15 offene Subscriptions gleichzeitig — weit unter dem 100er-Limit.
-    # Cancel läuft noch innerhalb des Semaphores → Subscription-Count bleibt sauber.
+    """Liest Aktienkurse aus dem Hintergrund-Cache — kein API-Aufruf, <0.1s."""
+    import math as _math
     if ib is None or not ib.isConnected():
-        log(f"   ⚠️  IB nicht verbunden — kein Fallback verfügbar")
-        return results
-
-    missing = [s for s in symbols if s not in results]
-    log(f"   📡 IB-Streaming für {len(missing)} Symbole (Schlusskurs) ...")
-    sem_ib = asyncio.Semaphore(8)  # max 8 gleichzeitig — weit unter 100er-Limit
-
-    async def _fetch_ib(sym):
-        async with sem_ib:
-            con = Stock(sym, 'SMART', 'USD')
-            try:
-                await ib.qualifyContractsAsync(con)
-                if not con.conId:
-                    return
-                t = ib.reqMktData(con, '', False, False)
-                for _ in range(4):                         # max 0.8s warten
-                    await asyncio.sleep(0.2)
-                    price = (t.close if (t.close and t.close > 0) else
-                             t.last  if (t.last  and t.last  > 0) else None)
-                    if price and price > 0:
-                        results[sym] = (float(price), None)
-                        break
-            except Exception:
-                pass
-            finally:
-                try:
-                    ib.cancelMktData(con)  # Contract übergeben, nicht Ticker!
-                except Exception:
-                    pass
-
-    await asyncio.gather(*[_fetch_ib(s) for s in missing], return_exceptions=True)
+        return {}
+    results = {}
+    try:
+        cache = {t.contract.symbol: t for t in ib.tickers()
+                 if t.contract and t.contract.secType == 'STK'}
+        for sym in symbols:
+            t = cache.get(sym)
+            if t is None:
+                continue
+            # Live-Felder zuerst (falls vorhanden), dann Delayed-Felder (Type 4 liefert delayedLast/delayedClose)
+            price = None
+            for val in [t.last, t.close,
+                        getattr(t, 'delayedLast',  None),
+                        getattr(t, 'delayedClose', None)]:
+                if val is not None and val > 0 and not _math.isnan(val):
+                    price = float(val)
+                    break
+            if price:
+                results[sym] = (price, None)
+    except Exception:
+        pass
     return results
 
 
@@ -1027,69 +1001,61 @@ _vix_cache_val: float = 0.0
 _vix_cache_ts:  float = 0.0
 _VIX_CACHE_TTL = 120  # VIX max alle 2 Minuten neu holen
 
-async def get_vix(ib=None) -> float:
-    """VIX primär via IB-Snapshot (CBOE), Fallback yfinance, dann Cache."""
-    import time as _t
-    import math
-    global _vix_cache_val, _vix_cache_ts
-    if _vix_cache_val > 0 and _t.time() - _vix_cache_ts < _VIX_CACHE_TTL:
-        return _vix_cache_val
+async def start_background_streaming(symbols: list, ib) -> None:
+    """Einmalig beim Start: VIX (Type 3) + alle Watchlist-Aktien (Type 4) als Dauer-Stream."""
+    log(f"   ⚙️  Starte Hintergrund-Streams für {len(symbols)} Symbole + VIX ...")
 
-    val = 0.0
+    # VIX: Type 3 — CBOE-Index, kein Live-Abo nötig
+    try:
+        ib.reqMarketDataType(3)
+        vix_con = Index('VIX', 'CBOE')
+        await ib.qualifyContractsAsync(vix_con)
+        if vix_con.conId:
+            ib.reqMktData(vix_con, '', False, False)
+            log("   ✅ VIX-Stream gestartet (Type 3 Delayed)")
+    except Exception as e:
+        log(f"   ⚠️  VIX-Stream fehlgeschlagen: {e}")
 
-    # ── Versuch 1: IB-Streaming primär (kein snapshot=True → kein Error 10213) ────
-    if ib is not None and ib.isConnected():
-        t_vix = None
+    # Aktien: Type 4 (Delayed-Frozen) — robuster als Type 3, vermeidet Error 322 'bM'
+    # Type 4 gibt immer den letzten bekannten Kurs zurück (Delayed während Handelszeiten,
+    # Frozen nach Börsenschluss) — kein separates US-Aktien-Abo nötig
+    ib.reqMarketDataType(4)
+    count = 0
+    for sym in symbols:
         try:
-            vix_con = Index('VIX', 'CBOE')
-            await ib.qualifyContractsAsync(vix_con)
-            if vix_con.conId:
-                t_vix = ib.reqMktData(vix_con, '', False, False)  # Streaming
-                for _ in range(6):                                  # max 3s
-                    await asyncio.sleep(0.5)
-                    v = (t_vix.last  if (t_vix.last  and t_vix.last  > 0 and not math.isnan(t_vix.last))  else
-                         t_vix.close if (t_vix.close and t_vix.close > 0 and not math.isnan(t_vix.close)) else None)
-                    if v and v > 0:
-                        val = float(v)
-                        break
+            con = Stock(sym, 'SMART', 'USD')
+            await ib.qualifyContractsAsync(con)
+            if con.conId:
+                ib.reqMktData(con, '', False, False)
+                count += 1
+                await asyncio.sleep(0.1)  # 100ms — gibt dem Server Luft zwischen Anfragen
         except Exception:
             pass
-        finally:
-            try:
-                ib.cancelMktData(vix_con)  # Contract, nicht Ticker
-            except Exception:
-                pass
 
-    # ── Versuch 2: yfinance (Fallback wenn IB nichts liefert) ───────────────
-    if val <= 0:
-        def _fetch_yf():
-            import yfinance as yf
-            try:
-                fi = yf.Ticker('^VIX').fast_info
-                v = getattr(fi, 'last_price', None) or getattr(fi, 'lastPrice', None)
-                if v and float(v) > 0:
-                    return float(v)
-            except Exception:
-                pass
-            try:
-                df = yf.download('^VIX', period='1d', interval='1m',
-                                 progress=False, auto_adjust=True)
-                if not df.empty and 'Close' in df.columns:
-                    last = df['Close'].dropna()
-                    if len(last) > 0:
-                        return float(last.iloc[-1])
-            except Exception:
-                pass
-            return 0.0
-        try:
-            val = await asyncio.wait_for(asyncio.to_thread(_fetch_yf), timeout=15) or 0.0
-        except Exception:
-            val = 0.0
+    log(f"   ✅ {count}/{len(symbols)} Aktien-Streams geöffnet — warte 10s auf erste Daten ...")
+    await asyncio.sleep(10)  # Warm-up: letzte Symbole in der Liste brauchen mehr Zeit
+    log(f"   ✅ Daten-Pool bereit")
+    ib.reqMarketDataType(1)  # Für Options-Scan (OPRA) zurück auf Live
 
-    if val > 0:
-        _vix_cache_val = val
-        _vix_cache_ts  = _t.time()
-    return val if val > 0 else _vix_cache_val
+
+async def get_vix(ib=None) -> float:
+    """Liest VIX direkt aus dem Hintergrund-Cache — kein API-Aufruf im Zyklus."""
+    import math
+    global _vix_cache_val
+    if ib is None or not ib.isConnected():
+        return _vix_cache_val
+    try:
+        for t in ib.tickers():
+            if t.contract and t.contract.symbol == 'VIX' and t.contract.secType == 'IND':
+                for val in [t.last, t.close,
+                            getattr(t, 'delayedLast',  None),
+                            getattr(t, 'delayedClose', None)]:
+                    if val is not None and val > 0 and not math.isnan(val):
+                        _vix_cache_val = float(val)
+                        return _vix_cache_val
+    except Exception:
+        pass
+    return _vix_cache_val
 
 
 def vix_regime(vix: float) -> tuple:
@@ -2100,15 +2066,22 @@ def print_ranking(signals, selected):
     log(f"{'─'*100}")
 
 async def configure_environment(ib) -> None:
-    """Verbindet mit Live-Konto, setzt Echtzeit-Marktdaten."""
-    global ACCOUNT_ID
+    """Verbindet mit IB-Konto, setzt Marktdaten-Typ und loggt Modus."""
+    global ACCOUNT_ID, AUTO_TRADE
     accounts = ib.managedAccounts()
     ACCOUNT_ID = accounts[0] if accounts else _cfg.get('ib_account', '')
-    ib.reqMarketDataType(1)  # Immer Echtzeit-Daten (Live-Konto)
+    is_paper = ACCOUNT_ID.upper().startswith('DU')
+    # Paper → Auto-Trade aktiv; Live → nur Empfehlungen (Sicherheitsnetz)
+    AUTO_TRADE = is_paper
+    ib.reqMarketDataType(1)  # Typ 1 = Live-Echtzeit (OPRA + US Real-Time Abo aktiv)
     log("=" * 60)
-    log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
-    log("  Echtzeit-Daten aktiv — nur echtes Bid/Ask akzeptiert")
-    log("  Empfehlungs-Modus — kein Auto-Trade")
+    if is_paper:
+        log("  MODUS: PAPER  (Konto: " + ACCOUNT_ID + ")")
+        log("  Simuliertes Konto — Auto-Trade AKTIV")
+    else:
+        log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
+        log("  Echtzeit-Marktdaten aktiv (OPRA + US Real-Time)")
+        log("  Empfehlungs-Modus — kein Auto-Trade (Sicherheitsnetz)")
     log("=" * 60)
 
 
@@ -2258,6 +2231,9 @@ async def run_bot(stop_event: threading.Event = None):
 
         # IB Strike-Map einmalig laden — valide Strikes/Expiries für alle Watchlist-Symbole
         await build_strike_map(ib)
+
+        # Hintergrund-Streams aufbauen: VIX + alle Watchlist-Aktien dauerhaft registrieren
+        await start_background_streaming(WATCHLIST, ib)
 
         # Gespeicherten State vom letzten Lauf laden (heute gecancelte Symbole sperren)
         _load_state()
@@ -2451,14 +2427,13 @@ async def run_bot(stop_event: threading.Event = None):
                     p, _ = ib_price_data[sym]
                     ib_price_data[sym] = (p, cached[0])
                     no_iv.remove(sym)
-            # Nur abgelaufene / unbekannte IV per yfinance holen
+            # Nur abgelaufene / unbekannte IV via OPRA holen
             if no_iv:
-                log(f"   IV für {len(no_iv)} Symbole (IB-Greeks primär, yfinance Fallback) ...")
-                _sem_iv = asyncio.Semaphore(3)
+                log(f"   IV für {len(no_iv)} Symbole (OPRA ATM-Put, Type 1) ...")
+                _sem_iv = asyncio.Semaphore(5)
                 async def _iv_fill(sym):
                     async with _sem_iv:
                         _, yf_iv = await _get_market_data_yf(sym, ib)
-                        await asyncio.sleep(0.4)  # Pause zwischen IV-Anfragen (yfinance Rate-Limit)
                     if yf_iv is not None:
                         p, _ = ib_price_data[sym]
                         ib_price_data[sym] = (p, yf_iv)
@@ -2607,6 +2582,10 @@ async def run_bot(stop_event: threading.Event = None):
                         continue
                     selected.append(sig)
                     sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+            elif not AUTO_TRADE and tradeable:
+                # Empfehlungs-Modus: beste qualifizierte Signale ohne Auto-Trade auswählen
+                selected = tradeable[:MAX_POSITIONS]
 
             # ── Ranking-Tabelle ausgeben ──────────────────────────────────────
             if all_signals:
