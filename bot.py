@@ -1935,15 +1935,17 @@ async def place_order(ib, sig):
                 _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                 return
             sig_prob = sig.get('prob_otm', 0)
-            credit_ok, req_credit, req_pwin = _check_credit(market_credit, sig['breite'], sig_prob)
-            if not credit_ok:
-                spread_risk = sig['breite'] * 100
-                if market_credit >= req_credit:
-                    log(f"  ✗ [{sym}] Credit ${market_credit:.0f} OK aber P(Win) {sig_prob:.1%} < {req_pwin:.0%} — Trade abgebrochen")
-                else:
-                    log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < erforderlich ${req_credit:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${spread_risk:.0f} Risiko) — Trade abgebrochen")
-                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
-                return
+            # Paper: Credit-Recheck überspringen — Scan-Net ≠ IBKR-Net (Scan-Bug: nur Short-Bid)
+            if not _is_paper_rr:
+                credit_ok, req_credit, req_pwin = _check_credit(market_credit, sig['breite'], sig_prob)
+                if not credit_ok:
+                    spread_risk = sig['breite'] * 100
+                    if market_credit >= req_credit:
+                        log(f"  ✗ [{sym}] Credit ${market_credit:.0f} OK aber P(Win) {sig_prob:.1%} < {req_pwin:.0%} — Trade abgebrochen")
+                    else:
+                        log(f"  ✗ [{sym}] Credit ${market_credit:.0f} < erforderlich ${req_credit:.0f} ({MIN_CREDIT_PERCENT:.0%} von ${spread_risk:.0f} Risiko) — Trade abgebrochen")
+                    _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                    return
 
             expiry_yf = sig['expiry_ib'][:4] + '-' + sig['expiry_ib'][4:6] + '-' + sig['expiry_ib'][6:]
 
