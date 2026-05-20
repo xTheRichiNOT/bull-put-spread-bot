@@ -571,10 +571,12 @@ class UpdateDialog(ctk.CTkToplevel):
 class SetupWizard(ctk.CTkToplevel):
     """Erststart-Wizard: führt den Kunden durch Platform / Software / Modus / Account."""
 
-    # Port-Matrix: software → port (Live only)
+    # Port-Matrix: (software, modus) → port
     _PORTS = {
-        "TWS":     7496,
-        "Gateway": 4001,
+        ("TWS",     "Live"):  7496,
+        ("TWS",     "Paper"): 7497,
+        ("Gateway", "Live"):  4001,
+        ("Gateway", "Paper"): 4002,
     }
 
     def __init__(self, parent: ctk.CTk, cfg: dict, on_done):
@@ -593,6 +595,7 @@ class SetupWizard(ctk.CTkToplevel):
         # Wizard-State
         self._platform  = ctk.StringVar(value="Desktop")
         self._software  = ctk.StringVar(value="TWS")
+        self._modus     = ctk.StringVar(value="Live")
         self._account   = ctk.StringVar(value=cfg.get("ib_account", ""))
         self._host      = ctk.StringVar(value=cfg.get("ib_host", "127.0.0.1"))
 
@@ -679,14 +682,14 @@ class SetupWizard(ctk.CTkToplevel):
             ctk.CTkEntry(self._content, textvariable=self._host,
                          width=200, placeholder_text="z.B. 192.168.1.10").pack(anchor="w")
 
-    # ── Step 2: Software ──────────────────────────────────────────────────────
+    # ── Step 2: Software + Modus ──────────────────────────────────────────────
     def _step_software(self):
         ctk.CTkLabel(self._content,
                      text="Welche IB-Software verwendest du?",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
         ctk.CTkLabel(self._content,
                      text="Beide funktionieren mit dem Bot. IB Gateway empfohlen für Hintergrundbetrieb.",
-                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 16))
+                     text_color="#94a3b8", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 8))
 
         for val, title, desc in [
             ("TWS",
@@ -701,8 +704,25 @@ class SetupWizard(ctk.CTkToplevel):
             f = ctk.CTkFrame(self._content,
                              fg_color=("#1e293b", "#1e293b"),
                              corner_radius=8)
-            f.pack(fill="x", pady=4)
+            f.pack(fill="x", pady=3)
             rb = ctk.CTkRadioButton(f, text=title, variable=self._software, value=val,
+                                    font=ctk.CTkFont(size=13, weight="bold"))
+            rb.pack(anchor="w", padx=14, pady=(10, 2))
+            ctk.CTkLabel(f, text=desc, text_color="#64748b",
+                         font=ctk.CTkFont(size=11), justify="left").pack(anchor="w", padx=32, pady=(0, 10))
+
+        ctk.CTkLabel(self._content,
+                     text="Konto-Modus:",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(10, 4))
+        for val, title, desc in [
+            ("Live",  "Live Trading",   "Echtes Konto — Orders werden als Empfehlungen angezeigt."),
+            ("Paper", "Paper Trading",  "Simuliertes Konto — Orders werden automatisch platziert."),
+        ]:
+            f = ctk.CTkFrame(self._content,
+                             fg_color=("#1e293b", "#1e293b"),
+                             corner_radius=8)
+            f.pack(fill="x", pady=3)
+            rb = ctk.CTkRadioButton(f, text=title, variable=self._modus, value=val,
                                     font=ctk.CTkFont(size=13, weight="bold"))
             rb.pack(anchor="w", padx=14, pady=(10, 2))
             ctk.CTkLabel(f, text=desc, text_color="#64748b",
@@ -710,27 +730,31 @@ class SetupWizard(ctk.CTkToplevel):
 
     # ── Step 3: Account ───────────────────────────────────────────────────────
     def _step_account(self):
-        sw   = self._software.get()
-        port = self._PORTS[sw]
+        sw    = self._software.get()
+        modus = self._modus.get()
+        port  = self._PORTS[(sw, modus)]
+        is_paper = modus == "Paper"
 
         ctk.CTkLabel(self._content,
                      text="Deine IB Account-Nummer",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(8, 4))
 
         # Summary box
-        summary = (f"  Software:  {sw}   |   Modus: Live Trading   |   Port: {port}\n"
+        summary = (f"  Software:  {sw}   |   Modus: {modus} Trading   |   Port: {port}\n"
                    f"  Host:  {self._host.get()}")
         sf = ctk.CTkFrame(self._content, fg_color=("#0f172a", "#0f172a"), corner_radius=6)
-        sf.pack(fill="x", pady=(0, 16))
+        sf.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(sf, text=summary, font=ctk.CTkFont(family="Courier", size=11),
                      text_color="#38bdf8", justify="left").pack(padx=12, pady=8)
 
+        hint = "DUxxxxxxx  (Paper-Konto beginnt mit DU)" if is_paper else "Uxxxxxxx  (Live-Konto beginnt mit U)"
+        ph   = "DU1234567" if is_paper else "U1234567"
         ctk.CTkLabel(self._content,
-                     text="Account-Nummer  (Uxxxxxxx):",
+                     text=f"Account-Nummer  ({hint}):",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(4, 2))
         e = ctk.CTkEntry(self._content, textvariable=self._account,
                          width=200, font=ctk.CTkFont(size=13),
-                         placeholder_text="U1234567")
+                         placeholder_text=ph)
         e.pack(anchor="w")
         e.focus()
 
@@ -761,10 +785,11 @@ class SetupWizard(ctk.CTkToplevel):
             self._err_lbl.configure(text="⚠  Bitte Account-Nummer eingeben.")
             return
 
-        sw = self._software.get()
+        sw    = self._software.get()
+        modus = self._modus.get()
         self._cfg["ib_account"] = acct
         self._cfg["ib_host"]    = self._host.get().strip() or "127.0.0.1"
-        self._cfg["ib_port"]    = self._PORTS[sw]
+        self._cfg["ib_port"]    = self._PORTS[(sw, modus)]
         save_config(self._cfg)
 
         self._done()
@@ -1639,7 +1664,9 @@ class BotLauncher(ctk.CTk):
                 row=self._row, column=0, sticky="w", padx=(6, 16), pady=3)
             options = [
                 "7496  (TWS Live Trading)",
+                "7497  (TWS Paper Trading)",
                 "4001  (IB Gateway Live)",
+                "4002  (IB Gateway Paper)",
             ]
             cur = str(self.cfg.get(key, 7496))
             default = next((o for o in options if o.startswith(cur)), options[0])
@@ -1919,7 +1946,9 @@ class BotLauncher(ctk.CTk):
         """Füllt alle Einstellungsfelder mit Standardwerten (ohne Speichern)."""
         _port_options = [
             "7496  (TWS Live Trading)",
+            "7497  (TWS Paper Trading)",
             "4001  (IB Gateway Live)",
+            "4002  (IB Gateway Paper)",
         ]
         for key, widget in self._fields.items():
             val = DEFAULT_CONFIG.get(key)
