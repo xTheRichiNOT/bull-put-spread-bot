@@ -2656,8 +2656,37 @@ async def run_bot(stop_event: threading.Event = None):
                     _shadow_from_sig(_s, 'blocked', 'exit_retry', f"EXIT_RETRY: {_retry_syms}")
                 selected = []
 
-            # ── EMPFEHLUNGS-MODUS: kein Auto-Trade — menschlicher Filter ────────
-            if selected:
+            # ── Phase 4b: Auto-Trade (Paper) oder Empfehlungs-Modus (Live) ─────
+            if selected and AUTO_TRADE:
+                # Paper-Konto: Orders direkt platzieren
+                log(f"\n{'═'*54}")
+                log(f"  AUTO-TRADE — {len(selected)} Order(s) werden platziert")
+                log(f"{'═'*54}")
+                _write_recommendations_file(selected)
+                for sig in selected:
+                    exp_raw = sig.get('expiry_ib', '')
+                    try:
+                        exp_fmt = f"{exp_raw[:4]}-{exp_raw[4:6]}-{exp_raw[6:]}"
+                    except Exception:
+                        exp_fmt = exp_raw
+                    log(f"  📤 Platziere: {sig['symbol']} "
+                        f"{sig['short_strike']:.0f}/{sig['long_strike']:.0f}P  "
+                        f"{exp_fmt}  Credit ${sig['credit']:.0f}")
+                    try:
+                        ok = await place_order(ib, sig)
+                        if ok:
+                            log(f"  ✅ [{sig['symbol']}] Order übermittelt")
+                            _shadow_from_sig(sig, 'taken', 'auto_trade', 'Auto-Trade platziert')
+                        else:
+                            log(f"  ❌ [{sig['symbol']}] Order fehlgeschlagen")
+                            _shadow_from_sig(sig, 'blocked', 'order_failed', 'place_order returned False')
+                    except Exception as _oe:
+                        log(f"  ❌ [{sig['symbol']}] Order-Fehler: {_oe}")
+                        _shadow_from_sig(sig, 'blocked', 'order_error', str(_oe))
+                log(f"{'═'*54}")
+
+            elif selected:
+                # Live-Konto: nur Empfehlungen anzeigen — kein Auto-Trade
                 log(f"\n{'═'*54}")
                 log(f"  EMPFEHLUNGEN — BITTE MANUELL PRÜFEN UND PLATZIEREN")
                 log(f"{'═'*54}")
@@ -2681,9 +2710,9 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"{'═'*54}")
                 _write_recommendations_file(selected)
                 log(f"  Gespeichert: {_RECOMMENDATIONS_FILE}")
-                # Shadow-Log: als 'watch' markieren (kein echter Trade)
                 for sig in selected:
                     _shadow_from_sig(sig, 'watch', 'recommendation', 'Empfehlung — manueller Trade erforderlich')
+
             else:
                 log("  Keine Empfehlungen in diesem Zyklus.")
                 _write_recommendations_file([])
