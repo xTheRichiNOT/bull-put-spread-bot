@@ -804,10 +804,11 @@ class BotLauncher(ctk.CTk):
         self.minsize(820, 620)
 
         self.cfg           = load_config()
-        self._stop_event   = None
-        self._bot_thread   = None
-        self._queue        = queue_module.Queue()
-        self._running      = False
+        self._stop_event      = None
+        self._bot_thread      = None
+        self._queue           = queue_module.Queue()
+        self._running         = False
+        self._intentional_stop = False
         self._start_time   = None   # für Uptime-Counter
         self._pulse_state  = False
 
@@ -2035,6 +2036,7 @@ class BotLauncher(ctk.CTk):
     def _stop_bot(self):
         if not self._running or self._stop_event is None:
             return
+        self._intentional_stop = True
         self._log_append(f"[{datetime.now():%H:%M:%S}]  Stoppe Bot...\n")
         self._stop_event.set()
 
@@ -2089,18 +2091,42 @@ class BotLauncher(ctk.CTk):
         self.after(1000, self._tick_uptime)
 
     def _on_bot_stopped(self):
-        self._running     = False
-        self._start_time  = None
-        self._stop_event  = None
-        self._bot_thread  = None
-        self._status_dot.configure(text="⏹  BOT GESTOPPT", text_color=C["red"])
+        was_intentional = getattr(self, '_intentional_stop', False)
+        self._intentional_stop = False
+
+        self._running    = False
+        self._start_time = None
+        self._stop_event = None
+        self._bot_thread = None
         self._sb_broker_lbl.configure(text="⚫  Broker: —", text_color=C["muted"])
         self._sb_funds_lbl.configure(text="")
         self._card_broker.configure(text="—", text_color=C["muted"])
         self._uptime_lbl.configure(text="")
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
-        self._log_append(f"[{datetime.now():%H:%M:%S}]  Bot gestoppt.\n")
+
+        if was_intentional:
+            self._status_dot.configure(text="⏹  BOT GESTOPPT", text_color=C["red"])
+            self._log_append(f"[{datetime.now():%H:%M:%S}]  Bot gestoppt.\n")
+        else:
+            self._status_dot.configure(text="⚠️  BOT ABGESTÜRZT", text_color=C["amber"])
+            self._log_append(
+                f"[{datetime.now():%H:%M:%S}]  ⚠️  Bot unerwartet beendet — "
+                f"automatischer Neustart in 30 Sekunden...\n")
+            self._auto_restart_countdown(30)
+
+    def _auto_restart_countdown(self, secs: int):
+        if not hasattr(self, '_intentional_stop') or getattr(self, '_intentional_stop', False):
+            return  # Benutzer hat manuell gestoppt — kein Neustart
+        if self._running:
+            return  # Wurde bereits neu gestartet
+        if secs <= 0:
+            self._log_append(f"[{datetime.now():%H:%M:%S}]  🔄  Automatischer Neustart...\n")
+            self._start_bot()
+            return
+        self._status_dot.configure(
+            text=f"🔄  NEUSTART in {secs}s", text_color=C["amber"])
+        self.after(1000, lambda: self._auto_restart_countdown(secs - 1))
 
     # Log-Zeile analysieren und passende Farbe wählen
     _LOG_TAGS = [
