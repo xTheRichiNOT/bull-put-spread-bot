@@ -1718,8 +1718,15 @@ async def monitor_exits(ib=None):
         if not info.get('expiry_yf'):
             continue
 
-        # 21-DTE-Exit: nur schließen wenn Kurs nah am Short Strike (Gamma-Gefahr)
+        # 0-DTE-Exit: immer schließen am Verfallstag (Assignment-Risiko)
         dte_remaining = (datetime.strptime(info['expiry_yf'], '%Y-%m-%d') - datetime.now()).days
+        if dte_remaining <= 0:
+            log(f"  ⏰ [{symbol}] 0-DTE — Verfallstag, schließe Position (Assignment-Risiko)")
+            async with _sym_lock(symbol):
+                await close_spread(ib, symbol, info, 'EXPIRY_EXIT')
+            continue
+
+        # 21-DTE-Exit: nur schließen wenn Kurs nah am Short Strike (Gamma-Gefahr)
         if dte_remaining <= DTE_EXIT:
             preis, _ = await get_market_data(symbol)
             if preis is not None and info.get('short_strike'):
@@ -2586,6 +2593,7 @@ async def run_bot(stop_event: threading.Event = None):
             open_count   = count_bot_orders()
             slots        = MAX_POSITIONS - open_count
             selected     = []
+            _margin_stop = False
 
             if AUTO_TRADE and slots > 0:
                 # Sektor-Exposure nur aus echten Spread-Positionen zählen
@@ -2596,7 +2604,6 @@ async def run_bot(stop_event: threading.Event = None):
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
                 # Margin-Check: reqAccountSummaryAsync → Cache → Paper-Fallback
-                _margin_stop = False
                 _is_paper_acct = ACCOUNT_ID.upper().startswith('DU')
                 available = 0.0
                 try:
