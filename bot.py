@@ -1752,23 +1752,44 @@ async def monitor_exits(ib=None):
                     log(f"  ✅ [{symbol}] 21-DTE erreicht — Puffer {puffer:.1%} > {BUFFER_MIN_PCT:.0%} "
                         f"— tief OTM, verfallen lassen")
 
-        # P&L abrufen für Logging und Breakeven-Management
-        current = await get_spread_value(
-            symbol, info['expiry_yf'], info['short_strike'], info['long_strike'], ib
-        )
-        if current is None:
-            continue
-        current = max(0.0, current)   # IB/yfinance kann negative Werte liefern wenn long > short
-
         entry = info['entry_per_share']
         if not entry or entry <= 0:
             log(f"  ⚠️  [{symbol}] Einstiegspreis nicht bekannt — P&L-Anzeige deaktiviert "
                 f"(Bot-Neustart während offener Position?)")
             continue
 
-        pnl_share  = entry - current
-        pnl_dollar = pnl_share * 100
-        pnl_pct    = (pnl_share / entry * 100) if entry > 0 else 0
+        # P&L: primär direkt aus ib.portfolio() — identisch mit CapTrader
+        pnl_dollar = None
+        if ib is not None:
+            try:
+                expiry_ib_pfx = info['expiry_yf'].replace('-', '')
+                _pf = ib.portfolio()
+                _legs = [p for p in _pf
+                         if p.contract.symbol == symbol
+                         and p.contract.secType == 'OPT'
+                         and p.contract.right == 'P'
+                         and p.contract.lastTradeDateOrContractMonth.startswith(expiry_ib_pfx)
+                         and (abs(p.contract.strike - info['short_strike']) < 0.5
+                              or abs(p.contract.strike - info['long_strike']) < 0.5)
+                         and p.unrealizedPNL is not None
+                         and not math.isnan(p.unrealizedPNL)]
+                if len(_legs) >= 2:
+                    pnl_dollar = round(sum(p.unrealizedPNL for p in _legs), 2)
+            except Exception:
+                pass
+
+        # Fallback: eigene Berechnung aus Marktpreisen
+        if pnl_dollar is None:
+            current = await get_spread_value(
+                symbol, info['expiry_yf'], info['short_strike'], info['long_strike'], ib
+            )
+            if current is None:
+                continue
+            current    = max(0.0, current)
+            pnl_dollar = round((entry - current) * 100, 2)
+
+        pnl_share = pnl_dollar / 100
+        pnl_pct   = (pnl_dollar / (entry * 100) * 100) if entry > 0 else 0
 
         # Breakeven: bestehende SL-Order auf Breakeven-Preis modifizieren (Modify, kein Cancel)
         # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put

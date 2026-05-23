@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.43": [
+        "🆕  Portfolio Chart-Tab: Zeitraum-Filter + Stats jetzt auch im Chart-Tab sichtbar",
+        "🐛  Akt. P&L jetzt direkt aus IB Portfolio-Daten (identisch mit CapTrader) statt eigener Berechnung",
+    ],
     "1.0.42": [
         "🐛  OTM-verfallene Positionen landen jetzt korrekt in der Trades-Tabelle (als 'OTM verfallen')",
         "🐛  Expired-Positionen werden komplett aus dem State entfernt statt nur als 'done' markiert",
@@ -1251,17 +1255,53 @@ class BotLauncher(ctk.CTk):
             btn.pack(side="left")
             self._portfolio_tab_refs[key] = btn
 
-        # Trennlinie unter Tab-Leiste
+        # ── Content-Bereich (drei austauschbare Frames) ───────────────────────
         ctk.CTkFrame(parent, height=2, corner_radius=0,
                      fg_color=C["border"]).pack(fill="x")
-
-        # ── Content-Bereich (drei austauschbare Frames) ───────────────────────
         content_area = ctk.CTkFrame(parent, fg_color=C["bg"], corner_radius=0)
         content_area.pack(fill="both", expand=True)
 
         for key in ["positions", "chart", "trades"]:
             f = ctk.CTkFrame(content_area, fg_color=C["bg"], corner_radius=0)
             self._portfolio_sub_frames[key] = f
+
+        # ── Hilfsfunktion: Zeitraum+Stats-Leiste bauen ────────────────────────
+        def build_ctrl_bar(parent, period_refs: dict, lbl_refs: dict):
+            bar = ctk.CTkFrame(parent, fg_color=C["surface2"], corner_radius=8)
+            bar.pack(fill="x", padx=10, pady=(10, 0))
+            pr = ctk.CTkFrame(bar, fg_color="transparent")
+            pr.pack(fill="x", padx=8, pady=(8, 4))
+            ctk.CTkLabel(pr, text="Zeitraum:", font=ctk.CTkFont(size=11),
+                         text_color=C["muted"]).pack(side="left", padx=(0, 8))
+            for lbl in ["1W", "1M", "3M", "6M", "Gesamt"]:
+                active = lbl == "Gesamt"
+                b = ctk.CTkButton(
+                    pr, text=lbl, width=46, height=26,
+                    fg_color=C["accent"] if active else C["surface"],
+                    hover_color="#009e78" if active else C["border"],
+                    text_color="#000000" if active else C["text"],
+                    font=ctk.CTkFont(size=11),
+                    command=lambda l=lbl: self._set_period(l))
+                b.pack(side="left", padx=2)
+                period_refs[lbl] = b
+            ctk.CTkButton(pr, text="↻", width=30, height=26,
+                          fg_color=C["surface"], hover_color=C["border"],
+                          text_color=C["muted"],
+                          command=self._refresh_history).pack(side="right", padx=4)
+            sr = ctk.CTkFrame(bar, fg_color="transparent")
+            sr.pack(fill="x", padx=10, pady=(0, 8))
+            lbl_refs["total"]   = ctk.CTkLabel(sr, text="Gesamt: —",
+                font=ctk.CTkFont(size=13, weight="bold"), text_color=C["text"])
+            lbl_refs["total"].pack(side="left", padx=(0, 18))
+            lbl_refs["trades"]  = ctk.CTkLabel(sr, text="0 Trades",
+                font=ctk.CTkFont(size=11), text_color=C["muted"])
+            lbl_refs["trades"].pack(side="left", padx=(0, 18))
+            lbl_refs["winrate"] = ctk.CTkLabel(sr, text="Win: —",
+                font=ctk.CTkFont(size=11), text_color=C["muted"])
+            lbl_refs["winrate"].pack(side="left", padx=(0, 18))
+            lbl_refs["avg"]     = ctk.CTkLabel(sr, text="⌀ P&L: —",
+                font=ctk.CTkFont(size=11), text_color=C["muted"])
+            lbl_refs["avg"].pack(side="left")
 
         # ── Tab 1: Offene Positionen ──────────────────────────────────────────
         pos_frame = self._portfolio_sub_frames["positions"]
@@ -1290,11 +1330,14 @@ class BotLauncher(ctk.CTk):
             border_width=1, border_color=C["border"])
         self._pos_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # ── Tab 2: Chart (nur Canvas, Zeitraum-Steuerung ist im Trades-Tab) ──
+        # ── Tab 2: Chart (Zeitraum + Stats + Canvas) ──────────────────────────
         chart_frame = self._portfolio_sub_frames["chart"]
+        self._chart_period_btn_refs: dict[str, ctk.CTkButton] = {}
+        self._chart_stat_lbl_refs:   dict[str, ctk.CTkLabel]  = {}
+        build_ctrl_bar(chart_frame, self._chart_period_btn_refs, self._chart_stat_lbl_refs)
 
         perf = ctk.CTkFrame(chart_frame, fg_color=C["surface2"], corner_radius=8)
-        perf.pack(fill="both", expand=True, padx=10, pady=10)
+        perf.pack(fill="both", expand=True, padx=10, pady=(6, 10))
 
         self._chart_canvas = tk.Canvas(perf, bg=C["bg"], highlightthickness=0)
         self._chart_canvas.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1303,51 +1346,14 @@ class BotLauncher(ctk.CTk):
 
         # ── Tab 3: Trades (Zeitraum + Stats + Tabelle) ────────────────────────
         hist_frame = self._portfolio_sub_frames["trades"]
-
-        ctrl_bar = ctk.CTkFrame(hist_frame, fg_color=C["surface2"], corner_radius=8)
-        ctrl_bar.pack(fill="x", padx=10, pady=(10, 0))
-
-        period_row = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
-        period_row.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(period_row, text="Zeitraum:",
-                     font=ctk.CTkFont(size=11),
-                     text_color=C["muted"]).pack(side="left", padx=(0, 8))
-
-        for label in ["1W", "1M", "3M", "6M", "Gesamt"]:
-            active = label == "Gesamt"
-            btn = ctk.CTkButton(
-                period_row, text=label, width=46, height=26,
-                fg_color=C["accent"] if active else C["surface"],
-                hover_color="#009e78" if active else C["border"],
-                text_color="#000000" if active else C["text"],
-                font=ctk.CTkFont(size=11),
-                command=lambda l=label: self._set_period(l))
-            btn.pack(side="left", padx=2)
-            self._period_btn_refs[label] = btn
-
-        ctk.CTkButton(period_row, text="↻", width=30, height=26,
-                      fg_color=C["surface"], hover_color=C["border"],
-                      text_color=C["muted"],
-                      command=self._refresh_history).pack(side="right", padx=4)
-
-        stats_row = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
-        stats_row.pack(fill="x", padx=10, pady=(0, 8))
-        self._lbl_total = ctk.CTkLabel(stats_row, text="Gesamt: —",
-                                        font=ctk.CTkFont(size=13, weight="bold"),
-                                        text_color=C["text"])
-        self._lbl_total.pack(side="left", padx=(0, 18))
-        self._lbl_trades = ctk.CTkLabel(stats_row, text="0 Trades",
-                                         font=ctk.CTkFont(size=11),
-                                         text_color=C["muted"])
-        self._lbl_trades.pack(side="left", padx=(0, 18))
-        self._lbl_winrate = ctk.CTkLabel(stats_row, text="Win: —",
-                                          font=ctk.CTkFont(size=11),
-                                          text_color=C["muted"])
-        self._lbl_winrate.pack(side="left", padx=(0, 18))
-        self._lbl_avg = ctk.CTkLabel(stats_row, text="⌀ P&L: —",
-                                      font=ctk.CTkFont(size=11),
-                                      text_color=C["muted"])
-        self._lbl_avg.pack(side="left")
+        self._period_btn_refs:   dict[str, ctk.CTkButton] = {}
+        self._trades_stat_lbl_refs: dict[str, ctk.CTkLabel]  = {}
+        build_ctrl_bar(hist_frame, self._period_btn_refs, self._trades_stat_lbl_refs)
+        # Haupt-Label-Refs zeigen auf Trades-Tab (Kompatibilität mit _refresh_history)
+        self._lbl_total   = self._trades_stat_lbl_refs["total"]
+        self._lbl_trades  = self._trades_stat_lbl_refs["trades"]
+        self._lbl_winrate = self._trades_stat_lbl_refs["winrate"]
+        self._lbl_avg     = self._trades_stat_lbl_refs["avg"]
 
         hist_hdr = ctk.CTkFrame(hist_frame, fg_color=C["header"], corner_radius=0)
         hist_hdr.pack(fill="x", padx=10, pady=(4, 0))
@@ -1407,12 +1413,14 @@ class BotLauncher(ctk.CTk):
 
     def _set_period(self, period: str):
         self._current_period = period
-        for label, btn in self._period_btn_refs.items():
-            active = label == period
-            btn.configure(
-                fg_color=C["accent"] if active else C["surface"],
-                hover_color="#009e78" if active else C["border"],
-                text_color="#000000" if active else C["text"])
+        for refs in (self._period_btn_refs,
+                     getattr(self, '_chart_period_btn_refs', {})):
+            for label, btn in refs.items():
+                active = label == period
+                btn.configure(
+                    fg_color=C["accent"] if active else C["surface"],
+                    hover_color="#009e78" if active else C["border"],
+                    text_color="#000000" if active else C["text"])
         self._refresh_history()
 
     # ── P&L-Chart auf Canvas zeichnen ─────────────────────────────────────────
@@ -1588,13 +1596,21 @@ class BotLauncher(ctk.CTk):
         pnl_col = "#4ade80" if total_pnl >= 0 else "#ef4444"
         sign = "+" if total_pnl >= 0 else ""
 
-        self._lbl_total.configure(
-            text=f"Gesamt: {sign}${total_pnl:,.0f}", text_color=pnl_col)
-        self._lbl_trades.configure(text=f"{len(trades)} Trades")
-        self._lbl_winrate.configure(
-            text=f"Win: {win_rate:.0f}%" if trades else "Win: —")
-        self._lbl_avg.configure(
-            text=f"⌀ ${avg_pnl:+.0f}" if trades else "⌀ P&L: —")
+        _stat_vals = {
+            "total":   (f"Gesamt: {sign}${total_pnl:,.0f}", pnl_col),
+            "trades":  (f"{len(trades)} Trades", None),
+            "winrate": (f"Win: {win_rate:.0f}%" if trades else "Win: —", None),
+            "avg":     (f"⌀ ${avg_pnl:+.0f}" if trades else "⌀ P&L: —", None),
+        }
+        for refs in (self._trades_stat_lbl_refs,
+                     getattr(self, '_chart_stat_lbl_refs', {})):
+            for key, (txt, col) in _stat_vals.items():
+                lbl = refs.get(key)
+                if lbl:
+                    kw = {"text": txt}
+                    if col:
+                        kw["text_color"] = col
+                    lbl.configure(**kw)
 
         self._draw_chart(trades)
 
