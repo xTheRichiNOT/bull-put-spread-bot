@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.44": [
+        "🐛  Akt. P&L Crash behoben (UnboundLocalError 'current' wenn IB-Portfolio-Daten vorhanden)",
+        "🐛  CI-Workflow: Release-Build toleriert bereits existierende Releases",
+    ],
     "1.0.43": [
         "🆕  Portfolio Chart-Tab: Zeitraum-Filter + Stats jetzt auch im Chart-Tab sichtbar",
         "🐛  Akt. P&L jetzt direkt aus IB Portfolio-Daten (identisch mit CapTrader) statt eigener Berechnung",
