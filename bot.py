@@ -1759,6 +1759,7 @@ async def monitor_exits(ib=None):
             continue
 
         # P&L: primär direkt aus ib.portfolio() — identisch mit CapTrader
+        current = None
         pnl_dollar = None
         if ib is not None:
             try:
@@ -1837,9 +1838,10 @@ async def monitor_exits(ib=None):
         sl_pct  = STOP_LOSS_MULT  * 100
         arrow   = '📈' if pnl_pct >= 0 else '📉'
         be_flag = '  🔒 Breakeven aktiv' if info.get('at_breakeven') else f'  (BE bei +{be_pct:.0f}%)'
+        _current_disp = f"${current*100:.0f}" if current is not None else "IB-Portfolio"
         log(f"  {arrow} [{symbol}] {pnl_pct:+.1f}% (${pnl_dollar:+.0f})"
             f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
-            f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
+            f"  |  Entry ${entry*100:.0f} → jetzt {_current_disp}")
 
 async def place_order(ib, sig):
     """Platziert eine Combo-Order auf IB für ein gegebenes Signal-Dict."""
