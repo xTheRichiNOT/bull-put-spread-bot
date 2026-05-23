@@ -1651,11 +1651,12 @@ async def close_spread(ib, symbol, info, reason):
             await asyncio.sleep(1.5)    # Extra-Puffer: IB-interne Propagierung abwarten
             log(f"  ✅ [{symbol}] Alle alten Orders storniert — sende Exit-Order")
 
+        # BUY-Order auf diesem Bag kehrt Legs um → SELL short_put (deckt Short) + BUY long_put (schließt Long)
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
-                ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=info['short_conid'], ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=info['long_conid'],  ratio=1, action='BUY',  exchange='SMART'),
             ]
         )
         entry = info['entry_per_share']
@@ -2040,7 +2041,9 @@ async def place_order(ib, sig):
 
             _is_paper = ACCOUNT_ID.upper().startswith('DU')
 
-            entry_order = LimitOrder('BUY', n_contracts, -limit_price, tif='GTC')
+            # SELL-Order: IBKR führt ComboLeg-Aktionen exakt aus (SELL short put, BUY long put = Bull Put Spread)
+            # BUY-Order würde Legs umkehren → Bear Put Spread (falsches Ergebnis)
+            entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='GTC')
             # Paper: transmit=True (kein Bracket) — IBKR lehnt Combo-Child-Orders ab (Error 201)
             entry_order.transmit = _is_paper
             entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
@@ -2074,10 +2077,10 @@ async def place_order(ib, sig):
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
             if _is_paper:
                 log(f"  ✅ [{sym}] ENTRY-ORDER PLATZIERT (Paper — kein Bracket) × {n_contracts} Kontrakt(e)")
-                log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+                log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
             else:
                 log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
-                log(f"     Entry  #{parent_id}:  -${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+                log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
                 log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
                 log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
             return True
