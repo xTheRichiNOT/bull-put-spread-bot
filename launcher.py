@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.42": [
+        "🐛  OTM-verfallene Positionen landen jetzt korrekt in der Trades-Tabelle (als 'OTM verfallen')",
+        "🐛  Expired-Positionen werden komplett aus dem State entfernt statt nur als 'done' markiert",
+    ],
     "1.0.41": [
         "🆕  Portfolio: Zeitraum-Filter + Stats jetzt im Trades-Tab (wo man die Tabelle sieht)",
         "🆕  Portfolio: Metric-Cards (Broker / Margin / Positionen / P&L) oben in jedem Tab sichtbar",
@@ -1643,7 +1647,13 @@ class BotLauncher(ctk.CTk):
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:,.0f}"
             lbl(row, pnl_str, 75, "#4ade80" if pnl >= 0 else "#ef4444")
             status = t.get("status", "–")
-            lbl(row, status, 70, "#4ade80" if status == "done" else "#f59e0b")
+            if status == "expired_otm":
+                status_txt, status_col = "OTM verfallen", "#4ade80"
+            elif status == "done":
+                status_txt, status_col = "Gewinn", "#4ade80"
+            else:
+                status_txt, status_col = status, "#f59e0b"
+            lbl(row, status_txt, 70, status_col)
 
     # ── Auto-Refresh alle 15s ─────────────────────────────────────────────────
 

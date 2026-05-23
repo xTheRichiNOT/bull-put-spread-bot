@@ -1720,12 +1720,13 @@ async def monitor_exits(ib=None):
 
         dte_remaining = (datetime.strptime(info['expiry_yf'], '%Y-%m-%d') - datetime.now()).days
 
-        # Bereits abgelaufen (DTE < 0): Position ist wertlos verfallen → als done markieren
+        # Bereits abgelaufen (DTE < 0): OTM verfallen → History schreiben, aus State löschen
         if dte_remaining < 0:
-            log(f"  🗑️  [{symbol}] Verfallen am {info['expiry_yf']} — entferne aus State")
+            log(f"  🗑️  [{symbol}] Verfallen am {info['expiry_yf']} (OTM) — schreibe History, entferne State")
             async with _sym_lock(symbol):
-                info['status'] = 'done'
-                info['exit_reason'] = 'EXPIRED_OTM'
+                info['status'] = 'expired_otm'
+                _append_history(symbol, info, exit_per_share=0.0)
+                _bot_trades.pop(symbol, None)
                 _save_state()
             continue
 
