@@ -1,18 +1,17 @@
 [Unit]
 Description=Bull Put Spread Trading Bot
 After=network.target ibgateway.service
-StartLimitIntervalSec=120
-StartLimitBurst=3
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=DEIN_LINUX_BENUTZER
 WorkingDirectory=/opt/trading-bot
 ExecStart=/usr/bin/python3 /opt/trading-bot/bot.py
-# 60 Sekunden warten bis IB Gateway eingeloggt ist
 ExecStartPre=/bin/sleep 60
-Restart=on-failure
-RestartSec=30
+Restart=always
+RestartSec=20
 StandardOutput=append:/opt/trading-bot/trades.log
 StandardError=append:/opt/trading-bot/trades.log
 

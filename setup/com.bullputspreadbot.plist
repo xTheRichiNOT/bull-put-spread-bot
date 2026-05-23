@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent — startet den Bot automatisch und hält ihn am Laufen.
+
+  Installation:
+    cp setup/com.bullputspreadbot.plist ~/Library/LaunchAgents/
+    # Pfad in der Datei anpassen (WorkingDirectory + ProgramArguments)
+    launchctl load ~/Library/LaunchAgents/com.bullputspreadbot.plist
+
+  Deinstallation:
+    launchctl unload ~/Library/LaunchAgents/com.bullputspreadbot.plist
+
+  Log prüfen:
+    tail -f /tmp/bullputbot.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bullputspreadbot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <!-- Pfad zum Bot anpassen: -->
+        <string>/Users/DEIN_BENUTZERNAME/Library/Mobile Documents/com~apple~CloudDocs/VSC/trading bot/bot.py</string>
+        <string>--config</string>
+        <string>config.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <!-- Pfad zum Bot-Verzeichnis anpassen: -->
+    <string>/Users/DEIN_BENUTZERNAME/Library/Mobile Documents/com~apple~CloudDocs/VSC/trading bot</string>
+
+    <!-- Automatisch neu starten wenn der Prozess endet -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 30 Sekunden warten bevor Neustart (IB Gateway Zeit zum Starten geben) -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Beim Login starten -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/tmp/bullputbot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/bullputbot.log</string>
+
+    <!-- Umgebungsvariablen -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

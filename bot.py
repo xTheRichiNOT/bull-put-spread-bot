@@ -2053,8 +2053,36 @@ async def place_order(ib, sig):
 
             _bot_trades[sym]['entry_order_id'] = parent_id
 
-            if not _is_paper:
-                # Live-Konto: Bracket mit TP + SL
+            if _is_paper:
+                # Paper-Konto: OCA-Gruppe als Bracket-Ersatz (Error 201 verhindert parentId)
+                # Beide Orders stehen in IBKR auch wenn der Bot abstürzt
+                import random as _rnd
+                _oca = f"BPS_{sym}_{int(time.time())}_{_rnd.randint(100,999)}"
+                tp_trade = sl_trade = None
+                try:
+                    tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
+                    tp_order.ocaGroup = _oca
+                    tp_order.ocaType  = 1  # Cancel remaining with block
+                    tp_order.transmit = False
+                    tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+                    tp_order.account = _cfg.get('ib_account', '')
+                    tp_trade = ib.placeOrder(bag, tp_order)
+
+                    sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
+                    sl_order.ocaGroup = _oca
+                    sl_order.ocaType  = 1
+                    sl_order.transmit = True
+                    sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+                    sl_order.account = _cfg.get('ib_account', '')
+                    sl_trade = ib.placeOrder(bag, sl_order)
+
+                    _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+                    _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+                    log(f"  ✅ [{sym}] OCA-BRACKET (Paper) platziert — TP #{tp_trade.order.orderId} / SL #{sl_trade.order.orderId}")
+                except Exception as _oca_err:
+                    log(f"  ⚠️  [{sym}] OCA-Bracket fehlgeschlagen ({_oca_err}) — nur Software-Monitor aktiv")
+            else:
+                # Live-Konto: klassisches Bracket mit TP + SL
                 tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
                 tp_order.parentId = parent_id
                 tp_order.transmit = False
@@ -2076,8 +2104,11 @@ async def place_order(ib, sig):
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
             if _is_paper:
-                log(f"  ✅ [{sym}] ENTRY-ORDER PLATZIERT (Paper — kein Bracket) × {n_contracts} Kontrakt(e)")
+                log(f"  ✅ [{sym}] ENTRY-ORDER PLATZIERT (Paper — OCA-Bracket) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
+                if tp_trade and sl_trade:
+                    log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
+                    log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
             else:
                 log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
