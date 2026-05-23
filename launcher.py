@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "1.0.41": [
+        "🆕  Portfolio: Zeitraum-Filter + Stats jetzt im Trades-Tab (wo man die Tabelle sieht)",
+        "🆕  Portfolio: Metric-Cards (Broker / Margin / Positionen / P&L) oben in jedem Tab sichtbar",
+        "🐛  Abgelaufene Positionen (DTE < 0) werden jetzt automatisch aus dem State entfernt",
+    ],
     "1.0.40": [
         "🆕  Portfolio: drei Tabs oben (Positionen / Chart / Trades) statt geteilter Ansicht",
         "🐛  0-DTE-Exit: Bot schließt Positionen jetzt automatisch am Verfallstag (Assignment-Risiko vermeiden)",
@@ -1197,6 +1202,33 @@ class BotLauncher(ctk.CTk):
         self._portfolio_tab_refs: dict[str, ctk.CTkButton] = {}
         self._portfolio_sub_frames: dict[str, ctk.CTkFrame] = {}
 
+        # ── Metric-Cards (gleiche Karten wie Dashboard) ───────────────────────
+        def make_pf_card(parent, title, icon, sub=False):
+            card = ctk.CTkFrame(parent, fg_color=C["surface2"], corner_radius=10)
+            card.pack(side="left", fill="both", expand=True, padx=4)
+            ctk.CTkLabel(card, text=f"{icon}  {title}",
+                         font=ctk.CTkFont(size=9, weight="bold"),
+                         text_color=C["muted"]).pack(anchor="w", padx=10, pady=(8, 0))
+            val_lbl = ctk.CTkLabel(card, text="—",
+                                   font=ctk.CTkFont(size=16, weight="bold"),
+                                   text_color=C["text"])
+            val_lbl.pack(anchor="w", padx=10, pady=(2, 0 if sub else 8))
+            if sub:
+                sub_lbl = ctk.CTkLabel(card, text="",
+                                       font=ctk.CTkFont(size=9),
+                                       text_color=C["muted"])
+                sub_lbl.pack(anchor="w", padx=10, pady=(0, 8))
+                return val_lbl, sub_lbl
+            return val_lbl
+
+        cards_row = ctk.CTkFrame(parent, fg_color="transparent")
+        cards_row.pack(fill="x", padx=10, pady=(10, 6))
+        self._pf_card_broker = make_pf_card(cards_row, "BROKER",          "🔌")
+        self._pf_card_funds  = make_pf_card(cards_row, "MARGIN GEBUNDEN", "💰")
+        self._pf_card_pos    = make_pf_card(cards_row, "POSITIONEN",      "📋")
+        self._pf_card_pnl, self._pf_card_pnl_sub = make_pf_card(
+            cards_row, "P&L GESAMT", "📈", sub=True)
+
         # ── Tab-Leiste ────────────────────────────────────────────────────────
         tab_bar = ctk.CTkFrame(parent, fg_color=C["header"], corner_radius=0, height=44)
         tab_bar.pack(fill="x")
@@ -1254,13 +1286,24 @@ class BotLauncher(ctk.CTk):
             border_width=1, border_color=C["border"])
         self._pos_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # ── Tab 2: Chart ──────────────────────────────────────────────────────
+        # ── Tab 2: Chart (nur Canvas, Zeitraum-Steuerung ist im Trades-Tab) ──
         chart_frame = self._portfolio_sub_frames["chart"]
 
         perf = ctk.CTkFrame(chart_frame, fg_color=C["surface2"], corner_radius=8)
         perf.pack(fill="both", expand=True, padx=10, pady=10)
 
-        period_row = ctk.CTkFrame(perf, fg_color="transparent")
+        self._chart_canvas = tk.Canvas(perf, bg=C["bg"], highlightthickness=0)
+        self._chart_canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self._chart_canvas.bind("<Configure>", lambda e: self._draw_chart(
+            getattr(self, '_last_chart_trades', [])))
+
+        # ── Tab 3: Trades (Zeitraum + Stats + Tabelle) ────────────────────────
+        hist_frame = self._portfolio_sub_frames["trades"]
+
+        ctrl_bar = ctk.CTkFrame(hist_frame, fg_color=C["surface2"], corner_radius=8)
+        ctrl_bar.pack(fill="x", padx=10, pady=(10, 0))
+
+        period_row = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
         period_row.pack(fill="x", padx=8, pady=(8, 4))
         ctk.CTkLabel(period_row, text="Zeitraum:",
                      font=ctk.CTkFont(size=11),
@@ -1283,35 +1326,27 @@ class BotLauncher(ctk.CTk):
                       text_color=C["muted"],
                       command=self._refresh_history).pack(side="right", padx=4)
 
-        stats_row = ctk.CTkFrame(perf, fg_color="transparent")
-        stats_row.pack(fill="x", padx=10, pady=(0, 4))
-        self._lbl_total    = ctk.CTkLabel(stats_row, text="Gesamt: —",
-                                           font=ctk.CTkFont(size=13, weight="bold"),
-                                           text_color=C["text"])
+        stats_row = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
+        stats_row.pack(fill="x", padx=10, pady=(0, 8))
+        self._lbl_total = ctk.CTkLabel(stats_row, text="Gesamt: —",
+                                        font=ctk.CTkFont(size=13, weight="bold"),
+                                        text_color=C["text"])
         self._lbl_total.pack(side="left", padx=(0, 18))
-        self._lbl_trades   = ctk.CTkLabel(stats_row, text="0 Trades",
-                                           font=ctk.CTkFont(size=11),
-                                           text_color=C["muted"])
+        self._lbl_trades = ctk.CTkLabel(stats_row, text="0 Trades",
+                                         font=ctk.CTkFont(size=11),
+                                         text_color=C["muted"])
         self._lbl_trades.pack(side="left", padx=(0, 18))
-        self._lbl_winrate  = ctk.CTkLabel(stats_row, text="Win: —",
-                                           font=ctk.CTkFont(size=11),
-                                           text_color=C["muted"])
+        self._lbl_winrate = ctk.CTkLabel(stats_row, text="Win: —",
+                                          font=ctk.CTkFont(size=11),
+                                          text_color=C["muted"])
         self._lbl_winrate.pack(side="left", padx=(0, 18))
-        self._lbl_avg      = ctk.CTkLabel(stats_row, text="⌀ P&L: —",
-                                           font=ctk.CTkFont(size=11),
-                                           text_color=C["muted"])
+        self._lbl_avg = ctk.CTkLabel(stats_row, text="⌀ P&L: —",
+                                      font=ctk.CTkFont(size=11),
+                                      text_color=C["muted"])
         self._lbl_avg.pack(side="left")
 
-        self._chart_canvas = tk.Canvas(perf, bg=C["bg"], highlightthickness=0)
-        self._chart_canvas.pack(fill="both", expand=True, padx=8, pady=(2, 8))
-        self._chart_canvas.bind("<Configure>", lambda e: self._draw_chart(
-            getattr(self, '_last_chart_trades', [])))
-
-        # ── Tab 3: Trades ─────────────────────────────────────────────────────
-        hist_frame = self._portfolio_sub_frames["trades"]
-
-        hist_hdr = ctk.CTkFrame(hist_frame, fg_color=C["surface2"], corner_radius=0)
-        hist_hdr.pack(fill="x", padx=10, pady=(10, 0))
+        hist_hdr = ctk.CTkFrame(hist_frame, fg_color=C["header"], corner_radius=0)
+        hist_hdr.pack(fill="x", padx=10, pady=(4, 0))
         for col, w in [("Datum", 130), ("Symbol", 70), ("Expiry", 90),
                        ("Short", 65), ("Long", 65),
                        ("Credit", 70), ("Exit", 70), ("P&L", 75), ("Status", 70)]:
@@ -1330,6 +1365,13 @@ class BotLauncher(ctk.CTk):
         self._refresh_history()
         self._refresh_positions()
         self._auto_refresh_history()
+
+    def _set_card(self, name: str, **kw):
+        """Aktualisiert Dashboard- und Portfolio-Card gleichzeitig."""
+        for attr in (f'_card_{name}', f'_pf_card_{name}'):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.configure(**kw)
 
     def _show_portfolio_tab(self, key: str):
         for k, f in self._portfolio_sub_frames.items():
@@ -1462,7 +1504,7 @@ class BotLauncher(ctk.CTk):
 
         # ── Metric-Karten aus positions.json befüllen ─────────────────────────
         open_pos = [p for p in positions if p.get("status") != "done"]
-        self._card_pos.configure(
+        self._set_card('pos',
             text=str(len(open_pos)) if open_pos else "0",
             text_color=C["accent"] if open_pos else C["muted"])
 
@@ -1471,11 +1513,9 @@ class BotLauncher(ctk.CTk):
                     - p.get("entry_per_share", 0))) * 100
             for p in open_pos)
         if open_pos:
-            self._card_funds.configure(
-                text=f"${margin_used:,.0f}",
-                text_color=C["amber"])
+            self._set_card('funds', text=f"${margin_used:,.0f}", text_color=C["amber"])
         else:
-            self._card_funds.configure(text="$0", text_color=C["muted"])
+            self._set_card('funds', text="$0", text_color=C["muted"])
 
         # Unrealized P&L aus positions.json (vom Bot in monitor_exits berechnet)
         upnl_vals = [p.get("unrealized_pnl") for p in open_pos if p.get("unrealized_pnl") is not None]
@@ -1562,19 +1602,17 @@ class BotLauncher(ctk.CTk):
 
         sign_c = "+" if total_combined >= 0 else ""
         col_c  = "#4ade80" if total_combined >= 0 else "#ef4444"
-        self._card_pnl.configure(
-            text=f"{sign_c}${total_combined:,.0f}",
-            text_color=col_c)
+        self._set_card('pnl', text=f"{sign_c}${total_combined:,.0f}", text_color=col_c)
 
         if has_unreal:
             sign_r = "+" if total_real >= 0 else ""
             sign_u = "+" if unrealized >= 0 else ""
-            self._card_pnl_sub.configure(
+            self._set_card('pnl_sub',
                 text=f"Real: {sign_r}${total_real:,.0f}  |  Offen: {sign_u}${unrealized:,.0f}",
                 text_color=C["muted"])
         else:
             sign_r = "+" if total_real >= 0 else ""
-            self._card_pnl_sub.configure(
+            self._set_card('pnl_sub',
                 text=f"Real: {sign_r}${total_real:,.0f}  |  Offen: —",
                 text_color=C["muted"])
 
@@ -2092,12 +2130,12 @@ class BotLauncher(ctk.CTk):
         if any(k in tl for k in ("verbunden", "connected", "ib-verbindung hergestellt")):
             self._sb_broker_lbl.configure(text="🟢  Broker: Verbunden",
                                            text_color=C["green"])
-            self._card_broker.configure(text="Verbunden", text_color=C["green"])
+            self._set_card('broker', text="Verbunden", text_color=C["green"])
         elif any(k in tl for k in ("getrennt", "disconnect", "timeout auf port",
                                    "connection refused")):
             self._sb_broker_lbl.configure(text="🔴  Broker: Getrennt",
                                            text_color=C["red"])
-            self._card_broker.configure(text="Getrennt", text_color=C["red"])
+            self._set_card('broker', text="Getrennt", text_color=C["red"])
         # Verfügbare Mittel → nur Sidebar-Label (Karten werden aus positions.json befüllt)
         m = re.search(r'Verfügbare Mittel:\s*\$([\d,]+)', text)
         if m:
@@ -2131,7 +2169,7 @@ class BotLauncher(ctk.CTk):
         self._bot_thread = None
         self._sb_broker_lbl.configure(text="⚫  Broker: —", text_color=C["muted"])
         self._sb_funds_lbl.configure(text="")
-        self._card_broker.configure(text="—", text_color=C["muted"])
+        self._set_card('broker', text="—", text_color=C["muted"])
         self._uptime_lbl.configure(text="")
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")

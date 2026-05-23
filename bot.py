@@ -1718,9 +1718,19 @@ async def monitor_exits(ib=None):
         if not info.get('expiry_yf'):
             continue
 
-        # 0-DTE-Exit: immer schließen am Verfallstag (Assignment-Risiko)
         dte_remaining = (datetime.strptime(info['expiry_yf'], '%Y-%m-%d') - datetime.now()).days
-        if dte_remaining <= 0:
+
+        # Bereits abgelaufen (DTE < 0): Position ist wertlos verfallen → als done markieren
+        if dte_remaining < 0:
+            log(f"  🗑️  [{symbol}] Verfallen am {info['expiry_yf']} — entferne aus State")
+            async with _sym_lock(symbol):
+                info['status'] = 'done'
+                info['exit_reason'] = 'EXPIRED_OTM'
+                _save_state()
+            continue
+
+        # 0-DTE-Exit: immer schließen am Verfallstag (Assignment-Risiko)
+        if dte_remaining == 0:
             log(f"  ⏰ [{symbol}] 0-DTE — Verfallstag, schließe Position (Assignment-Risiko)")
             async with _sym_lock(symbol):
                 await close_spread(ib, symbol, info, 'EXPIRY_EXIT')
