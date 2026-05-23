@@ -142,17 +142,14 @@ jobs:
           ---
           Bereits installierte Apps erhalten dieses Update automatisch beim naechsten Start.
           EOF
-          if gh release view "$VERSION" > /dev/null 2>&1; then
-            gh release upload "$VERSION" \
-              artifacts/BullPutSpreadBot-v*.dmg \
-              artifacts/BullPutSpreadBot.exe \
-              artifacts/BullPutSpreadBot-v*-linux.tar.gz \
-              --clobber
-          else
-            gh release create "$VERSION" \
-              --title "BullPutSpreadBot $VERSION" \
-              --notes-file notes.md \
-              artifacts/BullPutSpreadBot-v*.dmg \
-              artifacts/BullPutSpreadBot.exe \
-              artifacts/BullPutSpreadBot-v*-linux.tar.gz
-          fi
+          gh release create "$VERSION" \
+            --title "BullPutSpreadBot $VERSION" \
+            --notes-file notes.md \
+            artifacts/BullPutSpreadBot-v*.dmg \
+            artifacts/BullPutSpreadBot.exe \
+            artifacts/BullPutSpreadBot-v*-linux.tar.gz \
+          || gh release upload "$VERSION" \
+            artifacts/BullPutSpreadBot-v*.dmg \
+            artifacts/BullPutSpreadBot.exe \
+            artifacts/BullPutSpreadBot-v*-linux.tar.gz \
+            --clobber
