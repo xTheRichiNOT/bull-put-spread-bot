@@ -539,6 +539,7 @@ def _append_history(symbol: str, info: dict, exit_per_share: float = 0.0):
             'exit_per_share':  round(exit_per_share, 2),
             'pnl':             pnl,
             'status':          info.get('status', 'done'),
+            'close_reason':    info.get('close_reason', ''),
             'closed_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
         })
         with open(_HISTORY_FILE, 'w') as f:
@@ -1661,6 +1662,7 @@ async def close_spread(ib, symbol, info, reason):
         )
         entry = info['entry_per_share']
         info['status'] = 'closing'
+        info['close_reason'] = reason
 
         # Weicher Exit: 60% des Entry-Credits als Limit — GTC wartet auf Füllung
         close_limit = round(entry * 0.60, 2)

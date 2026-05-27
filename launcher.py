@@ -1571,9 +1571,20 @@ class BotLauncher(ctk.CTk):
             else:
                 upnl_col, upnl_txt = C["dim"], "—"
             lbl(row, upnl_txt, 80, upnl_col)
-            status_col = "#4ade80" if status == "open" else "#f59e0b"
-            status_txt = "Aktiv" if status == "open" else "Schließt"
-            lbl(row, status_txt, 80, status_col)
+            close_reason = p.get("close_reason", "")
+            if status == "open":
+                status_txt, status_col = "Aktiv", "#4ade80"
+            elif status == "exit_retry":
+                status_txt, status_col = "Fehler…", "#ef4444"
+            elif close_reason == "TP_HIT":
+                status_txt, status_col = "TP erreicht", "#34d399"
+            elif "SL" in close_reason:
+                status_txt, status_col = "SL aktiv", "#ef4444"
+            elif any(x in close_reason for x in ("DTE", "EXPIRY")):
+                status_txt, status_col = "DTE Exit", "#f59e0b"
+            else:
+                status_txt, status_col = "Schließt…", "#f59e0b"
+            lbl(row, status_txt, 95, status_col)
 
     # ── Trade-History aktualisieren ───────────────────────────────────────────
 
@@ -1666,14 +1677,28 @@ class BotLauncher(ctk.CTk):
             lbl(row, f"${t.get('exit_per_share', 0):.2f}", 70, "#f87171")
             pnl_str = f"{'+'if pnl>=0 else ''}${pnl:,.0f}"
             lbl(row, pnl_str, 75, "#4ade80" if pnl >= 0 else "#ef4444")
-            status = t.get("status", "–")
+            status       = t.get("status", "–")
+            close_reason = t.get("close_reason", "")
+            entry_h      = t.get("entry_per_share", 0)
+            pnl_h        = t.get("pnl", 0)
+            pnl_pct_h    = round(pnl_h / (entry_h * 100) * 100) if entry_h > 0 else 0
+            pct_sign     = "+" if pnl_pct_h >= 0 else ""
             if status == "expired_otm":
-                status_txt, status_col = "OTM verfallen", "#4ade80"
-            elif status == "done":
-                status_txt, status_col = "Gewinn", "#4ade80"
+                status_txt, status_col = "Verfallen", "#4ade80"
+            elif close_reason == "TP_HIT":
+                status_txt = f"TP {pct_sign}{pnl_pct_h:.0f}%"
+                status_col = "#4ade80"
+            elif "SL" in close_reason:
+                status_txt = f"SL {pct_sign}{pnl_pct_h:.0f}%"
+                status_col = "#ef4444"
+            elif any(x in close_reason for x in ("DTE", "EXPIRY", "RETRY")):
+                status_txt = f"DTE {pct_sign}{pnl_pct_h:.0f}%"
+                status_col = "#f59e0b"
+            elif pnl_h >= 0:
+                status_txt, status_col = f"+{pnl_pct_h:.0f}%", "#4ade80"
             else:
-                status_txt, status_col = status, "#f59e0b"
-            lbl(row, status_txt, 70, status_col)
+                status_txt, status_col = f"{pnl_pct_h:.0f}%", "#ef4444"
+            lbl(row, status_txt, 80, status_col)
 
     # ── Auto-Refresh alle 15s ─────────────────────────────────────────────────
 
