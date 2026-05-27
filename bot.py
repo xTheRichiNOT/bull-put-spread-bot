@@ -1758,9 +1758,9 @@ async def monitor_exits(ib=None):
                 f"(Bot-Neustart während offener Position?)")
             continue
 
-        # P&L: primär direkt aus ib.portfolio() — identisch mit CapTrader
-        current = None
-        pnl_dollar = None
+        # ── Anzeige-P&L aus ib.portfolio() (gleicher Wert wie CapTrader) ────────────
+        # Nur für die UI-Anzeige — IB cached Combo-Werte und friert manchmal ein.
+        _pnl_display = None
         if ib is not None:
             try:
                 expiry_ib_pfx = info['expiry_yf'].replace('-', '')
@@ -1775,22 +1775,38 @@ async def monitor_exits(ib=None):
                          and p.unrealizedPNL is not None
                          and not math.isnan(p.unrealizedPNL)]
                 if len(_legs) >= 2:
-                    pnl_dollar = round(sum(p.unrealizedPNL for p in _legs), 2)
+                    _pnl_display = round(sum(p.unrealizedPNL for p in _legs), 2)
             except Exception:
                 pass
 
-        # Fallback: eigene Berechnung aus Marktpreisen
-        if pnl_dollar is None:
-            current = await get_spread_value(
-                symbol, info['expiry_yf'], info['short_strike'], info['long_strike'], ib
-            )
-            if current is None:
-                continue
-            current    = max(0.0, current)
-            pnl_dollar = round((entry - current) * 100, 2)
+        # ── Aktueller Spread-Preis aus Einzel-Legs (immer frisch, nie eingefroren) ──
+        # IB berechnet Combo-Preise aus dem letzten Combo-Trade — der kann stundenlang
+        # eingefroren sein. Einzel-Legs liefern immer echte Live-Bid/Ask-Kurse.
+        current = await get_spread_value(
+            symbol, info['expiry_yf'], info['short_strike'], info['long_strike'], ib
+        )
+        if current is None:
+            log(f"  ⚠️  [{symbol}] Kein Marktpreis verfügbar — überspringe")
+            continue
+        current = max(0.0, current)
 
-        pnl_share = pnl_dollar / 100
-        pnl_pct   = (pnl_dollar / (entry * 100) * 100) if entry > 0 else 0
+        n_contracts = max(1, info.get('n_contracts', 1))
+        pnl_per_ctr = round((entry - current) * 100, 2)   # 1 Kontrakt, preis-basiert
+        pnl_dollar  = _pnl_display if _pnl_display is not None \
+                      else round(pnl_per_ctr * n_contracts, 2)
+        pnl_share   = pnl_per_ctr / 100
+        pnl_pct     = (pnl_per_ctr / (entry * 100) * 100) if entry > 0 else 0
+
+        # ── Software-TP: preis-basiert aus Einzel-Legs — kein IB-Portfolio-Cache ──
+        tp_close_price = round(entry * (1 - TAKE_PROFIT_PCT), 2)
+        if current <= tp_close_price and not info.get('tp_hit'):
+            log(f"  🎯 [{symbol}] Software-TP: ${current*100:.0f} <= ${tp_close_price*100:.0f}"
+                f" ({pnl_pct:+.1f}%) — schließe Position")
+            async with _sym_lock(symbol):
+                info['tp_hit'] = True
+                _save_state()
+                await close_spread(ib, symbol, info, 'TP_HIT')
+            continue
 
         # Breakeven: bestehende SL-Order auf Breakeven-Preis modifizieren (Modify, kein Cancel)
         # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put
@@ -1838,10 +1854,9 @@ async def monitor_exits(ib=None):
         sl_pct  = STOP_LOSS_MULT  * 100
         arrow   = '📈' if pnl_pct >= 0 else '📉'
         be_flag = '  🔒 Breakeven aktiv' if info.get('at_breakeven') else f'  (BE bei +{be_pct:.0f}%)'
-        _current_disp = f"${current*100:.0f}" if current is not None else "IB-Portfolio"
         log(f"  {arrow} [{symbol}] {pnl_pct:+.1f}% (${pnl_dollar:+.0f})"
             f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
-            f"  |  Entry ${entry*100:.0f} → jetzt {_current_disp}")
+            f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
 
 async def place_order(ib, sig):
     """Platziert eine Combo-Order auf IB für ein gegebenes Signal-Dict."""
@@ -2071,6 +2086,7 @@ async def place_order(ib, sig):
                 'at_breakeven':    False,
                 'tp_order_id':     0,
                 'sl_order_id':     0,
+                'n_contracts':     n_contracts,
                 'opened_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
                 'fill_confirmed':  False,          # wird True wenn Entry-Fill-Event feuert
                 'fill_deadline':   _fill_deadline, # Timeout für Entry-Fill
