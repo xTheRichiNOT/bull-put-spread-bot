@@ -309,6 +309,30 @@ DTE_EXIT              = int(_cfg['dte_exit'])
 BUFFER_MIN_PCT        = 0.05
 # -----------------------
 
+def _reload_cfg():
+    """Lädt config.json neu — aktualisiert Exit-/Trade-Parameter ohne Bot-Neustart."""
+    global TAKE_PROFIT_PCT, STOP_LOSS_MULT, BREAKEVEN_TRIGGER_PCT, DTE_EXIT
+    global AUTO_TRADE, MAX_POSITIONS, MAX_PER_SECTOR, SCAN_INTERVALL
+    global MIN_CREDIT_ABS, MIN_RISK_REWARD, MAX_DELTA
+    try:
+        if not os.path.exists(_cfg_path):
+            return
+        import json as _json2
+        with open(_cfg_path) as _f:
+            updated = {**_cfg_defaults, **_json2.load(_f)}
+        TAKE_PROFIT_PCT       = float(updated['take_profit_pct'])
+        STOP_LOSS_MULT        = float(updated['stop_loss_mult'])
+        DTE_EXIT              = int(updated['dte_exit'])
+        AUTO_TRADE            = bool(updated['auto_trade'])
+        MAX_POSITIONS         = int(updated['max_positions'])
+        MAX_PER_SECTOR        = int(updated['max_per_sector'])
+        SCAN_INTERVALL        = int(updated['scan_intervall'])
+        MIN_CREDIT_ABS        = float(updated.get('min_credit_abs', 80))
+        MIN_RISK_REWARD       = float(updated['min_risk_reward'])
+        MAX_DELTA             = float(updated['max_delta'])
+    except Exception:
+        pass   # Bei Fehler alte Werte behalten
+
 # Schlüsselwörter für Gewinnwarnung in News-Headlines
 WARNING_KEYWORDS = [
     'profit warning', 'earnings warning', 'guidance cut', 'lowers guidance',
@@ -417,7 +441,7 @@ def _write_positions_file():
                 'short_strike':    info.get('short_strike', 0),
                 'long_strike':     info.get('long_strike', 0),
                 'entry_per_share': round(entry, 2),
-                'tp_target':       round(entry * 0.5, 2),
+                'tp_target':       round(entry * (1 - TAKE_PROFIT_PCT), 2),
                 'status':          info.get('status', 'open'),
                 'opened_at':       info.get('opened_at', ''),
                 'unrealized_pnl':  info.get('unrealized_pnl'),  # None wenn noch nicht berechnet
@@ -2530,6 +2554,7 @@ async def run_bot(stop_event: threading.Event = None):
 
     try:
         while not (stop_event and stop_event.is_set()):
+            _reload_cfg()   # Einstellungen aus config.json aktualisieren (Hot-Reload)
             market_open = is_market_open()
             now_et = datetime.now(ZoneInfo('America/New_York'))
             log(f"\n{'═'*72}")
