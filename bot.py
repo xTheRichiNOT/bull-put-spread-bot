@@ -1540,28 +1540,28 @@ async def close_spread(ib, symbol, info, reason):
     try:
         if ib is not None:
             # ── Globaler BAG-Pre-Sweep ──────────────────────────────────────────────
-            # IBKR limitiert simultane Combo-Exit-Orders auf ~3-5 Stück. Hängende GTC-
-            # Orders anderer Symbole (z.B. von fehlgeschlagenen Massen-TP-Exits) storno-
-            # ieren, damit das Limit nicht beim aktuellen Exit ausgelöst wird.
+            # IB zählt ALLE aktiven + Inactive BAG-Orders gegen das Combo-Limit.
+            # Fehlgeschlagene Exit-Orders bleiben als 'Inactive' bei IB hängen.
+            # → Alle BAG-Orders aller Symbole (inkl. Inactive) vor dem Exit löschen.
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
+            _sweep_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'Inactive'}
             _pre_cancelled: set = set()
-            for _ot in list(ib.openTrades()):
+            for _ot in list(ib.trades()):   # ib.trades() statt openTrades() → auch Inactive
                 if (_ot.contract.secType == 'BAG'
-                        and _ot.contract.symbol != symbol
-                        and _ot.orderStatus.status in {'Submitted', 'PreSubmitted', 'PendingSubmit'}):
+                        and _ot.orderStatus.status in _sweep_statuses):
                     _oid = _ot.order.orderId or 0
                     if _oid > 0 and _oid not in _pre_cancelled:
                         try:
                             _expected_cancels.add(_oid)
                             ib.client.cancelOrder(_oid, '')
                             _pre_cancelled.add(_oid)
-                            log(f"  🧹 [{symbol}] Globaler Pre-Sweep: "
-                                f"BAG #{_oid} ({_ot.contract.symbol}) storniert")
+                            log(f"  🧹 [{symbol}] Pre-Sweep: "
+                                f"BAG #{_oid} ({_ot.contract.symbol} {_ot.orderStatus.status}) storniert")
                         except Exception:
                             pass
             if _pre_cancelled:
-                await asyncio.sleep(1.0)   # IB-Propagierung abwarten
+                await asyncio.sleep(1.5)   # IB-Propagierung abwarten
 
             # Alle offenen Orders für dieses Symbol abräumen bevor neue Exit-Order gesendet wird
             # (verhindert Error 201 — entgegengesetzte Orders auf selben Contract verboten)
@@ -1719,16 +1719,23 @@ async def close_spread(ib, symbol, info, reason):
         info['status'] = 'closing'
         info['close_reason'] = reason
 
-        # Limit = Spread-Breite (max. möglicher Spread-Wert) mit IOC.
-        # Liegt immer über dem Marktpreis → kein "Guaranteed-to-Lose".
-        # BAG-Orders benötigen zwingend einen Limitpreis (MKT wird von IB abgelehnt).
-        spread_width = abs(info.get('short_strike', 0) - info.get('long_strike', 0))
-        close_limit  = round(max(spread_width, entry * 2.0, 0.10), 2)
+        # Live-Kurs holen → Limit knapp über Ask (5%) → IB akzeptiert als marktgerecht.
+        # Spread-Breite als Limit war "Guaranteed-to-Lose" (Überzahlung ×5-10).
+        _cur_exit = await get_spread_value(
+            symbol, info.get('expiry_yf', ''),
+            info.get('short_strike', 0), info.get('long_strike', 0), ib)
+        if _cur_exit and _cur_exit >= 0.02:
+            close_limit = round(_cur_exit * 1.05, 2)
+            src = f'live ${_cur_exit*100:.0f}¢ +5%'
+        else:
+            close_limit = round(entry * 1.20, 2)
+            src = f'fallback entry×1.2'
+        close_limit = max(close_limit, 0.01)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
         trade = ib.placeOrder(bag, order)
-        log(f"  ⏰ [{symbol}] EXIT {reason} @ ${close_limit:.2f} IOC (Spread-Breite ${spread_width:.0f}) | Order ID: {trade.order.orderId}")
+        log(f"  ⏰ [{symbol}] EXIT {reason} @ ${close_limit:.2f} DAY ({src}) | Order ID: {trade.order.orderId}")
     except Exception as e:
         import traceback
         log(f"  ❌ [{symbol}] Exit-Fehler: {e}\n{traceback.format_exc()}")
