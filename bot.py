@@ -1719,10 +1719,21 @@ async def close_spread(ib, symbol, info, reason):
         info['status'] = 'closing'
         info['close_reason'] = reason
 
-        # Weicher Exit: 60% des Entry-Credits als Limit — GTC wartet auf Füllung
-        close_limit = round(entry * 0.60, 2)
-        icon, label = '⏰', f'21-DTE-EXIT (soft) @ ${close_limit:.2f} GTC'
-        order = LimitOrder('BUY', 1, close_limit, tif='GTC')
+        # Live-Kurs für Limit holen — IB lehnt ab wenn Limit weit unter Marktpreis (Error 201)
+        _cur_price = await get_spread_value(
+            symbol, info.get('expiry_yf', ''),
+            info.get('short_strike', 0), info.get('long_strike', 0), ib)
+        if _cur_price and _cur_price >= 0.02:
+            # 15% Aufschlag → IB akzeptiert als marktgerechten Kurs, Füllung trotzdem zum Ask
+            close_limit = round(_cur_price * 1.15, 2)
+            src = f'live ${_cur_price*100:.0f}¢'
+        else:
+            # Fallback: Entry × 1.50 — deckt auch Verlustpositionen ab
+            close_limit = round(entry * 1.50, 2)
+            src = f'fallback entry×1.5'
+        close_limit = max(close_limit, 0.01)
+        icon, label = '⏰', f'{reason} @ ${close_limit:.2f} IOC ({src})'
+        order = LimitOrder('BUY', 1, close_limit, tif='IOC')
 
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')

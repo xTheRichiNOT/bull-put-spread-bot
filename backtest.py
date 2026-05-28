@@ -27,51 +27,43 @@ from collections import defaultdict
 
 # ── Parameter (identisch zu bot.py) ──────────────────────────────────────────
 WATCHLIST = [
-    'AAPL','MSFT','NVDA','GOOGL','AMZN','META','CSCO','IBM','DELL','AMAT',
-    'AMD','AVGO','QCOM','MU','TSM','INTC','TXN','LRCX','KLAC','MRVL','ON','ARM',
-    'CRM','ORCL','NOW','ADBE','PLTR','WDAY','SNOW','PANW','CRWD','FTNT','DDOG','APP',
-    'TSLA','NFLX','UBER','SHOP','LYFT','PINS','DASH','RBLX',
-    'COIN','PYPL','V','MA','AFRM','SOFI',
-    'JPM','GS','MS','BAC','WFC','C','AXP','SCHW','BLK','BX','USB',
-    'LLY','JNJ','UNH','ABBV','PFE','MRK','BMY','AMGN','MDT','ABT','CVS','GILD','VRTX',
-    'XOM','CVX','COP','EOG','SLB','OXY','MPC','VLO',
-    'WMT','COST','TGT','HD','LOW','NKE','SBUX','MCD','CMG','DG','LULU',
-    'CAT','DE','HON','GE','LMT','RTX','BA','NOC','EMR','MMM',
-    'T','VZ','TMUS',
-    'NEE','AMT','PLD','DUK',
-    'LIN','NEM','FCX','AA',
-    'KO','PEP','PM','MO',
-    'ABNB','BKNG','MAR',
-]
+    # Mega-Cap Tech (6)
+    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'AMAT',
+    # Halbleiter (7)
+    'AMD', 'AVGO', 'QCOM', 'MU', 'LRCX', 'KLAC', 'MRVL',
+    # Software & Cloud (8)
+    'CRM', 'ORCL', 'NOW', 'ADBE', 'PLTR', 'PANW', 'CRWD', 'FTNT',
+    # Consumer Tech / EV (4)
+    'TSLA', 'NFLX', 'UBER', 'SHOP',
+    # Fintech & Krypto (4)
+    'COIN', 'PYPL', 'V', 'MA',
+    # Banken & Finanzen (4)
+    'JPM', 'GS', 'MS', 'BAC',
+    # Pharma / Healthcare (5)
+    'LLY', 'UNH', 'ABBV', 'AMGN', 'VRTX',
+    # Energie (4)
+    'XOM', 'CVX', 'COP', 'OXY',
+    # Retail & Consumer (4)
+    'WMT', 'COST', 'HD', 'CMG',
+    # Industrie (2)
+    'CAT', 'DE',
+]  # 48 Symbole — identisch zu bot.py v2.7
 
 SECTOR_MAP = {
-    'AAPL':'Tech','MSFT':'Tech','GOOGL':'Tech','AMZN':'Tech','META':'Tech',
-    'CSCO':'Tech','IBM':'Tech','DELL':'Tech','AMAT':'Tech',
-    'NVDA':'Halbleiter','AMD':'Halbleiter','AVGO':'Halbleiter','QCOM':'Halbleiter',
-    'MU':'Halbleiter','TSM':'Halbleiter','INTC':'Halbleiter','TXN':'Halbleiter',
-    'LRCX':'Halbleiter','KLAC':'Halbleiter','MRVL':'Halbleiter','ON':'Halbleiter','ARM':'Halbleiter',
-    'CRM':'Software','ORCL':'Software','NOW':'Software','ADBE':'Software','PLTR':'Software',
-    'WDAY':'Software','SNOW':'Software','PANW':'Software','CRWD':'Software',
-    'FTNT':'Software','DDOG':'Software','APP':'Software',
-    'TSLA':'ConsumerTech','NFLX':'ConsumerTech','UBER':'ConsumerTech','SHOP':'ConsumerTech',
-    'LYFT':'ConsumerTech','PINS':'ConsumerTech','DASH':'ConsumerTech','RBLX':'ConsumerTech',
-    'COIN':'Fintech','PYPL':'Fintech','V':'Fintech','MA':'Fintech','AFRM':'Fintech','SOFI':'Fintech',
-    'JPM':'Banken','GS':'Banken','MS':'Banken','BAC':'Banken','WFC':'Banken','C':'Banken',
-    'AXP':'Banken','SCHW':'Banken','BLK':'Banken','BX':'Banken','USB':'Banken',
-    'LLY':'Healthcare','JNJ':'Healthcare','UNH':'Healthcare','ABBV':'Healthcare',
-    'PFE':'Healthcare','MRK':'Healthcare','BMY':'Healthcare','AMGN':'Healthcare',
-    'MDT':'Healthcare','ABT':'Healthcare','CVS':'Healthcare','GILD':'Healthcare','VRTX':'Healthcare',
-    'XOM':'Energie','CVX':'Energie','COP':'Energie','EOG':'Energie',
-    'SLB':'Energie','OXY':'Energie','MPC':'Energie','VLO':'Energie',
-    'WMT':'Retail','COST':'Retail','TGT':'Retail','HD':'Retail','LOW':'Retail',
-    'NKE':'Retail','SBUX':'Retail','MCD':'Retail','CMG':'Retail','DG':'Retail','LULU':'Retail',
-    'CAT':'Industrie','DE':'Industrie','HON':'Industrie','GE':'Industrie','LMT':'Industrie',
-    'RTX':'Industrie','BA':'Industrie','NOC':'Industrie','EMR':'Industrie','MMM':'Industrie',
-    'T':'Telecom','VZ':'Telecom','TMUS':'Telecom',
-    'NEE':'Versorger','AMT':'Versorger','PLD':'Versorger','DUK':'Versorger',
-    'LIN':'Rohstoffe','NEM':'Rohstoffe','FCX':'Rohstoffe','AA':'Rohstoffe',
-    'KO':'Food','PEP':'Food','PM':'Food','MO':'Food',
-    'ABNB':'Travel','BKNG':'Travel','MAR':'Travel',
+    'AAPL':'Tech',      'MSFT':'Tech',      'NVDA':'Tech',      'GOOGL':'Tech',
+    'AMZN':'Tech',      'AMAT':'Halbleiter',
+    'AMD':'Halbleiter', 'AVGO':'Halbleiter', 'QCOM':'Halbleiter','MU':'Halbleiter',
+    'LRCX':'Halbleiter','KLAC':'Halbleiter', 'MRVL':'Halbleiter',
+    'CRM':'Software',   'ORCL':'Software',   'NOW':'Software',   'ADBE':'Software',
+    'PLTR':'Software',  'PANW':'Software',   'CRWD':'Software',  'FTNT':'Software',
+    'TSLA':'Consumer',  'NFLX':'Consumer',   'UBER':'Consumer',  'SHOP':'Consumer',
+    'COIN':'Fintech',   'PYPL':'Fintech',    'V':'Fintech',      'MA':'Fintech',
+    'JPM':'Banken',     'GS':'Banken',       'MS':'Banken',      'BAC':'Banken',
+    'LLY':'Healthcare', 'UNH':'Healthcare',  'ABBV':'Healthcare','AMGN':'Healthcare',
+    'VRTX':'Healthcare',
+    'XOM':'Energie',    'CVX':'Energie',     'COP':'Energie',    'OXY':'Energie',
+    'WMT':'Retail',     'COST':'Retail',     'HD':'Retail',      'CMG':'Retail',
+    'CAT':'Industrie',  'DE':'Industrie',
 }
 
 # Bot-Parameter (PDF-konform)
@@ -87,7 +79,7 @@ MIN_RISK_REWARD    = 0.22   # PDF: >0.22
 MAX_PROBABILITY    = 0.85
 MAX_LOSS_PROB      = 0.20
 MIN_EV_RATIO       = 0.005
-ENTRY_THRESHOLD    = 0.70   # PDF-konform (war 0.60)
+ENTRY_THRESHOLD    = 0.60   # identisch zu bot.py
 TAKE_PROFIT_PCT    = 0.70   # Szenario D: 70% (war 0.50)
 STOP_LOSS_MULT     = 2.0
 DTE_EXIT           = 0      # deaktiviert (war 21) — Positionen laufen natürlich aus
@@ -97,7 +89,7 @@ MAX_PER_SECTOR     = 2
 
 # Backtest-spezifisch
 HV_WINDOW       = 20     # Tage Rolling-HV (20d reaktiver, 30d=PDF-Methodik)
-IV_VRP_FACTOR   = 1.30   # Volatility-Risk-Premium: IV ≈ HV × 1.30
+IV_VRP_FACTOR   = 1.80   # Volatility-Risk-Premium: IV ≈ HV × 1.80 (realistischer für volatile Perioden)
 SLIPPAGE        = 0.82   # yfinance-Bid-Faktor (realistische Simulation)
 FIXED_DTE       = 52     # Mittelpunkt DTE 45–60
 
@@ -157,12 +149,37 @@ def load_data(start_date: str, end_date: str):
         sys.exit(1)
 
     fetch_from = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=60)).strftime('%Y-%m-%d')
-    print(f"📥 Lade Kursdaten für {len(WATCHLIST)} Symbole ({start_date} – {end_date}) ...")
-    raw = yf.download(WATCHLIST, start=fetch_from, end=end_date, auto_adjust=True, progress=False)
-    if raw.empty:
-        print("❌ Keine Daten"); sys.exit(1)
+    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              f'backtest_cache_{fetch_from}_{end_date}.pkl')
 
-    close = raw['Close'] if 'Close' in raw.columns else raw.xs('Close', axis=1, level=0)
+    import pickle, time
+    if os.path.exists(cache_file):
+        print(f"📦 Cache geladen: {os.path.basename(cache_file)}")
+        with open(cache_file, 'rb') as f:
+            close = pickle.load(f)
+    else:
+        print(f"📥 Lade Kursdaten einzeln ({start_date} – {end_date}) ...")
+        frames = {}
+        for sym in WATCHLIST:
+            for attempt in range(3):
+                try:
+                    h = yf.Ticker(sym).history(start=fetch_from, end=end_date, auto_adjust=True)
+                    if not h.empty:
+                        frames[sym] = h['Close']
+                        print(f"   ✓ {sym}", end='  ', flush=True)
+                    time.sleep(0.4)
+                    break
+                except Exception:
+                    wait = 10 * (attempt + 1)
+                    print(f"\n   ⚠️  {sym} — warte {wait}s")
+                    time.sleep(wait)
+        print()
+        if not frames:
+            print("❌ Keine Daten"); sys.exit(1)
+        close = pd.DataFrame(frames)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(close, f)
+        print(f"💾 Cache gespeichert: {os.path.basename(cache_file)}")
 
     sym_data = {}  # sym → {date: (price, iv)}
     ok = 0
@@ -543,7 +560,8 @@ def print_results(trades, daily_pnl, filter_stats, start_date, end_date):
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     args       = sys.argv[1:]
-    start_date = args[0] if len(args) >= 1 else '2023-01-01'
+    _one_year_ago = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    start_date = args[0] if len(args) >= 1 else _one_year_ago
     end_date   = args[1] if len(args) >= 2 else datetime.now().strftime('%Y-%m-%d')
 
     print(f"🔬 Bull-Put-Spread Backtest  |  {start_date} – {end_date}")
