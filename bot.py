@@ -635,10 +635,10 @@ def _on_order_status(trade):
         current_st = _bot_trades[sym].get('status', '')
         if current_st in ('open', 'closing', 'recovery_pending'):
             # Position war offen — Exit gescheitert → in 60s nochmal versuchen
-            retry_ts = (datetime.now() + timedelta(seconds=60)).timestamp()
+            retry_ts = (datetime.now() + timedelta(minutes=30)).timestamp()
             _bot_trades[sym]['status']   = 'exit_retry'
             _bot_trades[sym]['retry_at'] = retry_ts
-            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY geplant in 60s")
+            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY geplant in 30min")
         else:
             # Kein offener Trade (Entry-Order gecancelt) — nur überspringen
             _bot_trades[sym]['status'] = 'cancelled'
@@ -1697,8 +1697,8 @@ async def close_spread(ib, symbol, info, reason):
                         final_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
                                      for t in final_active]
                         log(f"  ❌ [{symbol}] Hard-Sweep fehlgeschlagen: {len(final_active)} Orders "
-                            f"noch aktiv {final_ids} — EXIT_RETRY in 60s. Bitte ggf. in TWS prüfen!")
-                        retry_ts = (datetime.now() + timedelta(seconds=60)).timestamp()
+                            f"noch aktiv {final_ids} — EXIT_RETRY in 30min. Bitte ggf. in TWS prüfen!")
+                        retry_ts = (datetime.now() + timedelta(minutes=30)).timestamp()
                         info['status']   = 'exit_retry'
                         info['retry_at'] = retry_ts
                         return
