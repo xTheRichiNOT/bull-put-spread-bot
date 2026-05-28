@@ -1538,9 +1538,33 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
 async def close_spread(ib, symbol, info, reason):
     """Storniert bestehende Bracket-Orders und platziert einen manuellen Exit (DTE-Exit)."""
     try:
-        # Alle offenen Orders für dieses Symbol abräumen bevor neue Exit-Order gesendet wird
-        # (verhindert Error 201 — entgegengesetzte Orders auf selben Contract verboten)
         if ib is not None:
+            # ── Globaler BAG-Pre-Sweep ──────────────────────────────────────────────
+            # IBKR limitiert simultane Combo-Exit-Orders auf ~3-5 Stück. Hängende GTC-
+            # Orders anderer Symbole (z.B. von fehlgeschlagenen Massen-TP-Exits) storno-
+            # ieren, damit das Limit nicht beim aktuellen Exit ausgelöst wird.
+            await ib.reqAllOpenOrdersAsync()
+            await asyncio.sleep(0.5)
+            _pre_cancelled: set = set()
+            for _ot in list(ib.openTrades()):
+                if (_ot.contract.secType == 'BAG'
+                        and _ot.contract.symbol != symbol
+                        and _ot.orderStatus.status in {'Submitted', 'PreSubmitted', 'PendingSubmit'}):
+                    _oid = _ot.order.orderId or 0
+                    if _oid > 0 and _oid not in _pre_cancelled:
+                        try:
+                            _expected_cancels.add(_oid)
+                            ib.client.cancelOrder(_oid, '')
+                            _pre_cancelled.add(_oid)
+                            log(f"  🧹 [{symbol}] Globaler Pre-Sweep: "
+                                f"BAG #{_oid} ({_ot.contract.symbol}) storniert")
+                        except Exception:
+                            pass
+            if _pre_cancelled:
+                await asyncio.sleep(1.0)   # IB-Propagierung abwarten
+
+            # Alle offenen Orders für dieses Symbol abräumen bevor neue Exit-Order gesendet wird
+            # (verhindert Error 201 — entgegengesetzte Orders auf selben Contract verboten)
             log(f"  🧹 [{symbol}] Bereinige offene Orders vor Exit ...")
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
