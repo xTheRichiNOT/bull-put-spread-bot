@@ -1719,14 +1719,16 @@ async def close_spread(ib, symbol, info, reason):
         info['status'] = 'closing'
         info['close_reason'] = reason
 
-        # Market-Order: IB lehnt Limit-Orders bei Combo-Exits mit Error 201 ab
-        # ("Guaranteed-to-Lose") sobald der Limitpreis nicht zum Markt passt.
-        # MarketOrder hat kein Limit → keine IB-Preisvalidierung → sofortige Füllung.
-        order = MarketOrder('BUY', 1)
+        # Limit = Spread-Breite (max. möglicher Spread-Wert) mit IOC.
+        # Liegt immer über dem Marktpreis → kein "Guaranteed-to-Lose".
+        # BAG-Orders benötigen zwingend einen Limitpreis (MKT wird von IB abgelehnt).
+        spread_width = abs(info.get('short_strike', 0) - info.get('long_strike', 0))
+        close_limit  = round(max(spread_width, entry * 2.0, 0.10), 2)
+        order = LimitOrder('BUY', 1, close_limit, tif='IOC')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
         trade = ib.placeOrder(bag, order)
-        log(f"  ⏰ [{symbol}] EXIT {reason} @ MKT | Order ID: {trade.order.orderId}")
+        log(f"  ⏰ [{symbol}] EXIT {reason} @ ${close_limit:.2f} IOC (Spread-Breite ${spread_width:.0f}) | Order ID: {trade.order.orderId}")
     except Exception as e:
         import traceback
         log(f"  ❌ [{symbol}] Exit-Fehler: {e}\n{traceback.format_exc()}")
@@ -2457,9 +2459,9 @@ async def run_bot(stop_event: threading.Event = None):
             log("  ⚠️  IB-Verbindung getrennt — nächster Zyklus: Reconnect-Versuch")
         ib.disconnectedEvent += _on_ib_disconnected
 
-        # Event-Handler: IBKR-Fehler prominent loggen (insb. Error 201)
+        # Event-Handler: IBKR-Fehler loggen — alle Codes außer reine Info-Meldungen
         def _on_ib_error(reqId, errorCode, errorString, _contract):
-            if errorCode in (201, 202, 399, 10147):
+            if errorCode < 2000:   # <2000 = echte Fehler/Warnungen, >=2000 = Info/System
                 log(f"  ⚠️  IBKR Error {errorCode} (reqId={reqId}): {errorString}")
         ib.errorEvent += _on_ib_error
 
