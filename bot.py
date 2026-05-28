@@ -2459,9 +2459,12 @@ async def run_bot(stop_event: threading.Event = None):
             log("  ⚠️  IB-Verbindung getrennt — nächster Zyklus: Reconnect-Versuch")
         ib.disconnectedEvent += _on_ib_disconnected
 
-        # Event-Handler: IBKR-Fehler loggen — alle Codes außer reine Info-Meldungen
+        # Event-Handler: IBKR-Fehler loggen
+        # 200 = "No security definition" — normal beim Optionsscan, unterdrücken
+        # >=2000 = reine Info/System-Meldungen, nicht relevant
+        _SUPPRESS_CODES = {200, 354, 10167}
         def _on_ib_error(reqId, errorCode, errorString, _contract):
-            if errorCode < 2000:   # <2000 = echte Fehler/Warnungen, >=2000 = Info/System
+            if errorCode < 2000 and errorCode not in _SUPPRESS_CODES:
                 log(f"  ⚠️  IBKR Error {errorCode} (reqId={reqId}): {errorString}")
         ib.errorEvent += _on_ib_error
 
