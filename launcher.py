@@ -1582,9 +1582,43 @@ class BotLauncher(ctk.CTk):
                 status_txt, status_col = "SL aktiv", "#ef4444"
             elif any(x in close_reason for x in ("DTE", "EXPIRY")):
                 status_txt, status_col = "DTE Exit", "#f59e0b"
+            elif close_reason == "MANUAL_EXIT":
+                status_txt, status_col = "Manuell", "#a78bfa"
             else:
                 status_txt, status_col = "Schließt…", "#f59e0b"
             lbl(row, status_txt, 95, status_col)
+
+            # Exit-Button: nur für aktive Positionen
+            if status == "open":
+                sym_ref = p.get("symbol", "")
+                def _make_exit_fn(sym):
+                    def _do_exit():
+                        import tkinter.messagebox as mb
+                        if not mb.askyesno(
+                                "Position schließen",
+                                f"{sym}: Position jetzt manuell schließen?\n\n"
+                                f"Der Bot sendet eine Exit-Order an IB.",
+                                icon="warning"):
+                            return
+                        cmd_file = os.path.join(_BASE, "close_commands.json")
+                        try:
+                            cmds = []
+                            if os.path.exists(cmd_file):
+                                with open(cmd_file) as _f:
+                                    cmds = json.load(_f)
+                            if sym not in cmds:
+                                cmds.append(sym)
+                            with open(cmd_file, "w") as _f:
+                                json.dump(cmds, _f)
+                        except Exception as _e:
+                            mb.showerror("Fehler", f"Befehl konnte nicht geschrieben werden:\n{_e}")
+                    return _do_exit
+                ctk.CTkButton(
+                    row, text="✕ Exit", width=72, height=22,
+                    fg_color="#7f1d1d", hover_color="#991b1b",
+                    text_color="white", font=ctk.CTkFont(size=10, weight="bold"),
+                    command=_make_exit_fn(sym_ref)
+                ).pack(side="left", padx=(4, 2), pady=3)
 
     # ── Trade-History aktualisieren ───────────────────────────────────────────
 
@@ -1694,6 +1728,9 @@ class BotLauncher(ctk.CTk):
             elif any(x in close_reason for x in ("DTE", "EXPIRY", "RETRY")):
                 status_txt = f"DTE {pct_sign}{pnl_pct_h:.0f}%"
                 status_col = "#f59e0b"
+            elif close_reason == "MANUAL_EXIT":
+                status_txt = f"Manuell {pct_sign}{pnl_pct_h:.0f}%"
+                status_col = "#a78bfa"
             elif pnl_h >= 0:
                 status_txt, status_col = f"+{pnl_pct_h:.0f}%", "#4ade80"
             else:

@@ -393,6 +393,7 @@ _vix_regime: str   = 'unknown'
 _STATE_FILE          = os.path.join(_BASE, '.bot_state.json')
 _HISTORY_FILE        = os.path.join(_BASE, 'trade_history.json')
 _POSITIONS_FILE      = os.path.join(_BASE, 'positions.json')
+_CLOSE_CMD_FILE      = os.path.join(_BASE, 'close_commands.json')
 _SHADOW_FILE         = os.path.join(_BASE, 'shadow_trades.jsonl')
 _RECOMMENDATIONS_FILE = os.path.join(_BASE, 'recommendations.json')
 
@@ -1683,8 +1684,31 @@ async def close_spread(ib, symbol, info, reason):
         import traceback
         log(f"  ❌ [{symbol}] Exit-Fehler: {e}\n{traceback.format_exc()}")
 
+async def _process_close_commands(ib):
+    """Verarbeitet manuelle Exit-Befehle die das Frontend in close_commands.json schreibt."""
+    if not os.path.exists(_CLOSE_CMD_FILE):
+        return
+    try:
+        with open(_CLOSE_CMD_FILE) as f:
+            cmds = json.load(f)
+        if not cmds:
+            return
+        os.remove(_CLOSE_CMD_FILE)   # sofort löschen → kein Doppel-Exit
+        for sym in cmds:
+            info = _bot_trades.get(sym)
+            if info and info.get('status') == 'open':
+                log(f"  🖱️  [{sym}] Manueller Exit via Frontend")
+                async with _sym_lock(sym):
+                    await close_spread(ib, sym, info, 'MANUAL_EXIT')
+            elif info:
+                log(f"  ⚠️  [{sym}] Manueller Exit ignoriert — Status: {info.get('status')}")
+    except Exception as e:
+        log(f"  ⚠️  Close-Command Fehler: {e}")
+
 async def monitor_exits(ib=None):
     """DTE-Exit und Breakeven-Update. TP/SL werden von IBKR-Bracket-Orders verwaltet."""
+    if ib:
+        await _process_close_commands(ib)
     if not _bot_trades:
         return
     for symbol, info in list(_bot_trades.items()):
