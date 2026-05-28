@@ -337,17 +337,20 @@ def is_market_open() -> bool:
     return open_t <= now_et < close_t
 
 def seconds_until_market_open() -> tuple:
-    """Gibt (Sekunden, nächste Öffnungszeit ET) bis zur nächsten NYSE-Öffnung zurück."""
+    """Nächste NYSE-Öffnungszeit — datetime wird neu konstruiert statt per .replace()
+    um Timezone-Fold-Probleme auf Windows/ZoneInfo zu vermeiden."""
     now_et = _now_et()
-    days_ahead = 0
-    while True:
-        check = (now_et + timedelta(days=days_ahead)).replace(
-            hour=9, minute=30, second=0, microsecond=0)
-        if check.weekday() < 5 and check > now_et:
-            break
-        days_ahead += 1
-    secs = max(60, int((check - now_et).total_seconds()))
-    return secs, check
+    tz     = now_et.tzinfo
+    for delta in range(8):   # max 7 Tage vorausschauen
+        d    = (now_et + timedelta(days=delta)).date()
+        cand = datetime(d.year, d.month, d.day, 9, 30, 0, tzinfo=tz)
+        if cand.weekday() >= 5:   # Wochenende überspringen
+            continue
+        secs = int((cand - now_et).total_seconds())
+        if secs > 0:
+            return max(30, secs), cand
+    fallback = now_et + timedelta(days=3)
+    return 259200, fallback
 
 # Speichert IV vom letzten Scan pro Symbol — für Spike-Erkennung
 _iv_memory: dict = {}
