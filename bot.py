@@ -1724,7 +1724,7 @@ async def close_spread(ib, symbol, info, reason):
         # BAG-Orders benötigen zwingend einen Limitpreis (MKT wird von IB abgelehnt).
         spread_width = abs(info.get('short_strike', 0) - info.get('long_strike', 0))
         close_limit  = round(max(spread_width, entry * 2.0, 0.10), 2)
-        order = LimitOrder('BUY', 1, close_limit, tif='IOC')
+        order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
         trade = ib.placeOrder(bag, order)
