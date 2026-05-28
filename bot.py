@@ -1498,7 +1498,10 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
         long_bid  = puts[puts['strike'] == long_strike]['bid'].values
         if not len(short_ask) or not len(long_bid):
             return None
-        return max(0.0, float(short_ask[0]) - float(long_bid[0]))
+        s_ask_val = float(short_ask[0])
+        if s_ask_val <= 0:
+            return None   # kein valider Marktpreis (Markt geschlossen / yfinance-Cache)
+        return max(0.0, s_ask_val - float(long_bid[0]))
     try:
         return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=20)
     except (asyncio.TimeoutError, Exception):
@@ -1691,6 +1694,21 @@ async def monitor_exits(ib=None):
             if remaining > 0:
                 log(f"  ⏳ [{symbol}] EXIT_RETRY: Warte noch {remaining}s bis Retry")
                 continue
+            # Self-Healing: TP-Exit wegen $0-Daten (Markt geschlossen) → zurück auf 'open'
+            if info.get('close_reason') == 'TP_HIT':
+                _entry_h = info.get('entry_per_share', 0)
+                _tp_h    = round(_entry_h * (1 - TAKE_PROFIT_PCT), 2)
+                _cur_h   = await get_spread_value(
+                    symbol, info.get('expiry_yf',''), info.get('short_strike',0),
+                    info.get('long_strike',0), ib)
+                if _cur_h is None or _cur_h < 0.02 or _cur_h > _tp_h:
+                    log(f"  🔄 [{symbol}] EXIT_RETRY-Reset: TP-Trigger war ungültig "
+                        f"(Markt war geschlossen) — zurück auf 'open'")
+                    info['status']       = 'open'
+                    info['close_reason'] = ''
+                    info.pop('tp_hit', None)
+                    _save_state()
+                    continue
             log(f"  🔁 [{symbol}] EXIT_RETRY: Cooldown abgelaufen — erneuter Schließ-Versuch")
             info['status'] = 'closing'   # kurz auf 'closing' für close_spread
             async with _sym_lock(symbol):
@@ -1794,6 +1812,15 @@ async def monitor_exits(ib=None):
 
         n_contracts = max(1, info.get('n_contracts', 1))
         pnl_per_ctr = round((entry - current) * 100, 2)   # 1 Kontrakt, preis-basiert
+        # Daten-Qualitätsprüfung: current < $0.02 bedeutet Markt geschlossen oder stale Daten
+        # (ein aktiver Options-Spread kann nicht legitim $0 wert sein wenn DTE > 0)
+        if current < 0.02:
+            log(f"  ⏸  [{symbol}] Marktpreis ${current*100:.1f}¢ — kein valider Kurs "
+                f"(Markt geschlossen?), überspringe TP/SL-Check")
+            if _pnl_display is not None:
+                info['unrealized_pnl'] = round(_pnl_display, 2)
+            continue
+
         pnl_dollar  = _pnl_display if _pnl_display is not None \
                       else round(pnl_per_ctr * n_contracts, 2)
         pnl_share   = pnl_per_ctr / 100
