@@ -1722,25 +1722,37 @@ async def close_spread(ib, symbol, info, reason):
             ]
         )
         entry = info['entry_per_share']
-        info['status'] = 'closing'
         info['close_reason'] = reason
 
+        # Kein Exit außerhalb der Handelszeiten — DAY-Orders werden sonst mit
+        # veraltetem Preis über Nacht gehalten und füllen nie.
+        if not is_market_open():
+            _secs, _open_et = seconds_until_market_open()
+            info['status']   = 'exit_retry'
+            info['retry_at'] = (datetime.now() + timedelta(seconds=_secs + 30)).timestamp()
+            log(f"  ⏸️  [{symbol}] Markt geschlossen — Exit bei Öffnung ({_open_et.strftime('%H:%M ET')})")
+            _save_state()
+            return
+
+        info['status'] = 'closing'
+        info['close_initiated_at'] = datetime.now().timestamp()
+
         # Live-Kurs holen → Limit knapp über Ask (5%) → IB akzeptiert als marktgerecht.
-        # Spread-Breite als Limit war "Guaranteed-to-Lose" (Überzahlung ×5-10).
         _cur_exit = await get_spread_value(
             symbol, info.get('expiry_yf', ''),
             info.get('short_strike', 0), info.get('long_strike', 0), ib)
         if _cur_exit and _cur_exit >= 0.02:
-            close_limit = round(_cur_exit * 1.05, 2)
-            src = f'live ${_cur_exit*100:.0f}¢ +5%'
+            close_limit = round(_cur_exit * 2.0, 2)
+            src = f'live ${_cur_exit*100:.0f}¢ ×2 (sofort-Fill)'
         else:
-            close_limit = round(entry * 1.20, 2)
-            src = f'fallback entry×1.2'
+            close_limit = round(entry * 2.0, 2)
+            src = f'fallback entry×2'
         close_limit = max(close_limit, 0.01)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
         trade = ib.placeOrder(bag, order)
+        info['exit_order_id'] = trade.order.orderId
         log(f"  ⏰ [{symbol}] EXIT {reason} @ ${close_limit:.2f} DAY ({src}) | Order ID: {trade.order.orderId}")
     except Exception as e:
         import traceback
@@ -1802,6 +1814,25 @@ async def monitor_exits(ib=None):
             info['status'] = 'closing'   # kurz auf 'closing' für close_spread
             async with _sym_lock(symbol):
                 await close_spread(ib, symbol, info, 'RETRY_EXIT')
+            continue
+
+        # Stale-Closing: Exit-Order hängt >20 Min ohne Fill → stornieren und sofort neu
+        if info.get('status') == 'closing' and ib and is_market_open():
+            initiated = info.get('close_initiated_at', 0)
+            if initiated and (datetime.now().timestamp() - initiated) > 1200:
+                stale_oid = info.get('exit_order_id', 0)
+                if stale_oid:
+                    try:
+                        _expected_cancels.add(stale_oid)
+                        ib.client.cancelOrder(stale_oid, '')
+                    except Exception:
+                        pass
+                info['status']   = 'exit_retry'
+                info['retry_at'] = datetime.now().timestamp()  # sofort
+                info.pop('close_initiated_at', None)
+                info.pop('exit_order_id', None)
+                _save_state()
+                log(f"  🔄 [{symbol}] Stale Exit-Order #{stale_oid} >20min ohne Fill — sofort neu")
             continue
 
         if info.get('status') != 'open':
