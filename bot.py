@@ -1575,8 +1575,13 @@ async def close_spread(ib, symbol, info, reason):
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
 
-            blocking_statuses = {'Submitted', 'PreSubmitted', 'PendingSubmit'}
-            active_statuses   = blocking_statuses | {'PendingCancel'}
+            # PendingCancel + ApiPending müssen als blockierend gelten:
+            # IB zählt diese Orders noch gegen das Combo-Limit bis sie Cancelled werden.
+            blocking_statuses = {
+                'Submitted', 'PreSubmitted', 'PendingSubmit',
+                'PendingCancel', 'ApiPending'
+            }
+            active_statuses   = blocking_statuses
             cancelled_ids: set = set()
 
             # Schritt 1: Direkt mit gespeicherten TP/SL-IDs stornieren via ib.client.cancelOrder().
@@ -1608,22 +1613,26 @@ async def close_spread(ib, symbol, info, reason):
                 cancelled_ids.add(oid)
                 log(f"  🗑  [{symbol}] Order #{oid} storniert (Sweep)")
 
-            # Polling-Loop: warten bis IB Cancel wirklich bestätigt — 20 × 0.5s = 10s Timeout.
-            # Frische reqAllOpenOrdersAsync()-Antwort verwenden (NICHT ib.trades()-Cache).
-            # orderId=0-Orders (aus alter Session) werden EINGESCHLOSSEN — kein Filter.
+            # Polling-Loop: warten bis IB alle BAG-Orders account-weit bestätigt hat.
+            # IB zählt das Combo-Limit GLOBAL — auch PendingCancel-Orders anderer Symbole
+            # blockieren einen neuen Exit. Daher prüfen wir ALLE BAG-Orders, nicht nur symbol.
             cancel_confirmed = False
             still_active: list = []
-            for _attempt in range(40):          # 40 × 0.5s = 20s Timeout
+            for _attempt in range(60):          # 60 × 0.5s = 30s Timeout
                 await asyncio.sleep(0.5)
                 fresh = await ib.reqAllOpenOrdersAsync()
                 still_active = [
                     t for t in (fresh if fresh else ib.openTrades())
-                    if t.contract.symbol == symbol
+                    if t.contract.secType == 'BAG'
                     and t.orderStatus.status in blocking_statuses
                 ]
                 if not still_active:
                     cancel_confirmed = True
                     break
+                _sa_info = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
+                            for t in still_active]
+                if _attempt % 6 == 0:
+                    log(f"  ⏳ [{symbol}] Warte auf Cancel-Bestätigung: {_sa_info}")
                 # Erneut stornieren falls noch offen
                 for t in still_active:
                     oid = t.order.orderId or 0
@@ -1631,8 +1640,8 @@ async def close_spread(ib, symbol, info, reason):
                         _expected_cancels.add(oid)
                         ib.client.cancelOrder(oid, '')
                         cancelled_ids.add(oid)
-                # Alle 2 Sekunden: gespeicherte TP/SL-IDs nochmals direkt senden
-                if _attempt % 4 == 1:
+                # Alle 3 Sekunden: gespeicherte TP/SL-IDs nochmals direkt senden
+                if _attempt % 6 == 1:
                     for _, stored_oid in [('TP', info.get('tp_order_id', 0)),
                                           ('SL', info.get('sl_order_id', 0))]:
                         if stored_oid and stored_oid > 0:
@@ -1642,16 +1651,17 @@ async def close_spread(ib, symbol, info, reason):
                 # Reconciliation: lokaler Cache kann veraltet sein — IB-Server-Wahrheit prüfen.
                 # Manchmal bestätigt IB serversseitig einen Cancel, aber ib_insync hat es noch
                 # nicht verarbeitet. 2s extra warten und nochmals frisch abfragen.
-                log(f"  🔄 [{symbol}] Timeout (20s) — Reconciliation-Check (5s Extra-Puffer) ...")
+                log(f"  🔄 [{symbol}] Timeout (30s) — Reconciliation-Check (5s Extra-Puffer) ...")
                 info['status'] = 'recovery_pending'
                 await asyncio.sleep(5.0)
                 fresh_recon = await ib.reqAllOpenOrdersAsync()
+                # Account-weit prüfen: alle BAG-Orders (IB-Combo-Limit ist global)
                 recon_active = [
                     t for t in (fresh_recon if fresh_recon else ib.openTrades())
-                    if t.contract.symbol == symbol
+                    if t.contract.secType == 'BAG'
                     and t.orderStatus.status in blocking_statuses
                 ]
-                # Position-Check: Nettoposition = 0 → nur verwaiste Orders, kein echtes Risiko mehr
+                # Position-Check für dieses Symbol: Nettoposition = 0 → verwaiste Orders bereinigen
                 if recon_active:
                     _sym_opts = [p for p in ib.portfolio()
                                  if p.contract.symbol == symbol
@@ -1669,11 +1679,11 @@ async def close_spread(ib, symbol, info, reason):
                         cancel_confirmed = True
                         recon_active = []
                 if recon_active:
-                    remaining_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
+                    remaining_ids = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
                                      for t in recon_active]
-                    log(f"  🔁 [{symbol}] Reconciliation: {len(recon_active)} Order(s) noch aktiv {remaining_ids}"
+                    log(f"  🔁 [{symbol}] Reconciliation: {len(recon_active)} BAG-Order(s) noch aktiv {remaining_ids}"
                         f" — Hard-Sweep + 5s Extra-Wartezeit ...")
-                    # Hard-Sweep: ALLE aktiven Orders für dieses Symbol nochmals korrekt stornieren
+                    # Hard-Sweep: ALLE aktiven BAG-Orders nochmals stornieren
                     for t in recon_active:
                         oid = t.order.orderId or 0
                         if oid > 0:
@@ -1695,13 +1705,13 @@ async def close_spread(ib, symbol, info, reason):
                     final_check = await ib.reqAllOpenOrdersAsync()
                     final_active = [
                         t for t in (final_check if final_check else ib.openTrades())
-                        if t.contract.symbol == symbol
+                        if t.contract.secType == 'BAG'
                         and t.orderStatus.status in blocking_statuses
                     ]
                     if final_active:
-                        final_ids = [t.order.orderId or getattr(t.order, 'permId', '?')
+                        final_ids = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
                                      for t in final_active]
-                        log(f"  ❌ [{symbol}] Hard-Sweep fehlgeschlagen: {len(final_active)} Orders "
+                        log(f"  ❌ [{symbol}] Hard-Sweep fehlgeschlagen: {len(final_active)} BAG-Orders "
                             f"noch aktiv {final_ids} — EXIT_RETRY in 30min. Bitte ggf. in TWS prüfen!")
                         retry_ts = (datetime.now() + timedelta(minutes=30)).timestamp()
                         info['status']   = 'exit_retry'
