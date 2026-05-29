@@ -1539,30 +1539,35 @@ async def close_spread(ib, symbol, info, reason):
     """Storniert bestehende Bracket-Orders und platziert einen manuellen Exit (DTE-Exit)."""
     try:
         if ib is not None:
-            # ── Globaler BAG-Pre-Sweep ──────────────────────────────────────────────
-            # IB zählt akkumulierte Combo-Exit-Orders gegen sein internes Limit.
-            # Längere Wartezeit damit reqAllOpenOrders auch Vorjahr-Sitzungen lädt.
-            await ib.reqAllOpenOrdersAsync()
+            # ── Globaler BAG-Pre-Sweep + reqGlobalCancel ────────────────────────────
+            # Cross-Session-Orders (andere clientId) tauchen nicht in ib.trades() auf.
+            # reqGlobalCancel löscht ALLE offenen Orders im Account → Counter = 0.
+            # Danach 2s warten damit IB die Stornierungen propagiert.
+            log(f"  🧹 [{symbol}] Global-Cancel: alle offenen Orders stornieren ...")
+            try:
+                ib.client.reqGlobalCancel()
+            except Exception as _ge:
+                log(f"  ⚠️  [{symbol}] reqGlobalCancel Fehler: {_ge}")
             await asyncio.sleep(2.0)
+            # Zusätzlich: bekannte BAG-Orders aus lokalem Cache stornieren
+            await ib.reqAllOpenOrdersAsync()
+            await asyncio.sleep(1.0)
             _terminal = {'Filled', 'Cancelled', 'ApiCancelled'}
-            _all_bag = [t for t in ib.trades() if t.contract.secType == 'BAG']
-            _non_terminal_bag = [t for t in _all_bag if t.orderStatus.status not in _terminal]
-            log(f"  🔍 [{symbol}] Pre-Sweep: {len(_all_bag)} BAG-Orders total, "
-                f"{len(_non_terminal_bag)} aktiv/Inactive")
-            _pre_cancelled: set = set()
+            _non_terminal_bag = [t for t in ib.trades()
+                                  if t.contract.secType == 'BAG'
+                                  and t.orderStatus.status not in _terminal]
+            log(f"  🔍 [{symbol}] Pre-Sweep: {len(_non_terminal_bag)} BAG-Orders noch aktiv")
             for _ot in _non_terminal_bag:
                 _oid = _ot.order.orderId or 0
-                if _oid > 0 and _oid not in _pre_cancelled:
+                if _oid > 0:
                     try:
                         _expected_cancels.add(_oid)
                         ib.client.cancelOrder(_oid, '')
-                        _pre_cancelled.add(_oid)
                         log(f"  🧹 [{symbol}] Pre-Sweep: "
-                            f"BAG #{_oid} ({_ot.contract.symbol} {_ot.orderStatus.status}) storniert")
+                            f"BAG #{_oid} ({_ot.contract.symbol}) storniert")
                     except Exception:
                         pass
-            if _pre_cancelled:
-                await asyncio.sleep(1.5)   # IB-Propagierung abwarten
+            await asyncio.sleep(1.0)
 
             # Alle offenen Orders für dieses Symbol abräumen bevor neue Exit-Order gesendet wird
             # (verhindert Error 201 — entgegengesetzte Orders auf selben Contract verboten)
