@@ -1574,6 +1574,8 @@ class BotLauncher(ctk.CTk):
             close_reason = p.get("close_reason", "")
             if status == "open":
                 status_txt, status_col = "Aktiv", "#4ade80"
+            elif status == "error":
+                status_txt, status_col = "⛔ Manuell!", "#ff0000"
             elif status == "exit_retry":
                 status_txt, status_col = "Fehler…", "#ef4444"
             elif close_reason == "TP_HIT":

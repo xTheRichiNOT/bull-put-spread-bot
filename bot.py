@@ -1625,18 +1625,31 @@ async def close_spread(ib, symbol, info, reason):
                 log(f"  🗑  [{symbol}] Order #{oid} storniert (Sweep)")
 
             # Polling-Loop: warten bis IB alle BAG-Orders account-weit bestätigt hat.
-            # IB zählt das Combo-Limit GLOBAL — auch PendingCancel-Orders anderer Symbole
-            # blockieren einen neuen Exit. Daher prüfen wir ALLE BAG-Orders, nicht nur symbol.
+            # IB zählt das Combo-Limit GLOBAL — auch PendingCancel/Inactive-Orders anderer
+            # Symbole blockieren einen neuen Exit. WICHTIG: reqAllOpenOrdersAsync gibt
+            # Inactive-Orders (Error-201-Ablehnungen) NICHT zurück → ib.trades() Cache
+            # muss gesondert geprüft werden.
             cancel_confirmed = False
             still_active: list = []
             for _attempt in range(60):          # 60 × 0.5s = 30s Timeout
                 await asyncio.sleep(0.5)
                 fresh = await ib.reqAllOpenOrdersAsync()
-                still_active = [
-                    t for t in (fresh if fresh else ib.openTrades())
+                # Orders aus reqAllOpenOrders (Submitted/PendingCancel etc.)
+                _from_fresh = [
+                    t for t in (fresh if fresh is not None else ib.openTrades())
                     if t.contract.secType == 'BAG'
                     and t.orderStatus.status in blocking_statuses
                 ]
+                # Inactive-Orders aus ib.trades()-Cache (werden nicht von reqAllOpenOrders erfasst,
+                # zählen aber trotzdem gegen das IB Combo-Limit bis sie Cancelled sind)
+                _fresh_oids = {t.order.orderId for t in _from_fresh}
+                _inactive_extra = [
+                    t for t in ib.trades()
+                    if t.contract.secType == 'BAG'
+                    and t.orderStatus.status == 'Inactive'
+                    and t.order.orderId not in _fresh_oids
+                ]
+                still_active = _from_fresh + _inactive_extra
                 if not still_active:
                     cancel_confirmed = True
                     break
@@ -1644,7 +1657,7 @@ async def close_spread(ib, symbol, info, reason):
                             for t in still_active]
                 if _attempt % 6 == 0:
                     log(f"  ⏳ [{symbol}] Warte auf Cancel-Bestätigung: {_sa_info}")
-                # Erneut stornieren falls noch offen
+                # Erneut stornieren falls noch offen (inkl. Inactive)
                 for t in still_active:
                     oid = t.order.orderId or 0
                     if oid > 0 and oid not in cancelled_ids:
@@ -1834,7 +1847,16 @@ async def monitor_exits(ib=None):
                     info.pop('retry_count', None)
                     _save_state()
                     continue
-            log(f"  🔁 [{symbol}] EXIT_RETRY: Cooldown abgelaufen — erneuter Schließ-Versuch")
+            # Dead-State: nach 5 erfolglosen Versuchen manuellen Eingriff verlangen.
+            # Verhindert Endlos-Loop der das IB-Combo-Limit dauerhaft blockiert.
+            if info.get('retry_count', 0) > len(_EXIT_RETRY_BACKOFF):
+                log(f"  🛑 [{symbol}] EXIT_RETRY: {info['retry_count']} Versuche alle fehlgeschlagen "
+                    f"— manueller Eingriff erforderlich! Position in CapTrader prüfen und schließen.")
+                info['status'] = 'error'
+                _save_state()
+                continue
+            log(f"  🔁 [{symbol}] EXIT_RETRY: Cooldown abgelaufen — erneuter Schließ-Versuch "
+                f"(#{info.get('retry_count', 0) + 1}/{len(_EXIT_RETRY_BACKOFF)})")
             info['status'] = 'closing'   # kurz auf 'closing' für close_spread
             async with _sym_lock(symbol):
                 await close_spread(ib, symbol, info, 'RETRY_EXIT')
