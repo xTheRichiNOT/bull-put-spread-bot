@@ -351,6 +351,15 @@ def _now_et() -> datetime:
         edt = timezone(timedelta(hours=-4))
         return datetime.now(edt)
 
+_EXIT_RETRY_BACKOFF = [15, 30, 60, 120, 300]  # Sekunden: 15s → 30s → 1min → 2min → 5min
+
+def _exit_retry_delay(info: dict) -> int:
+    """Exponentieller Backoff für Exit-Retries. Gibt Wartezeit in Sekunden zurück."""
+    count = info.get('retry_count', 0)
+    delay = _EXIT_RETRY_BACKOFF[min(count, len(_EXIT_RETRY_BACKOFF) - 1)]
+    info['retry_count'] = count + 1
+    return delay
+
 def is_market_open() -> bool:
     """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ)."""
     now_et = _now_et()
@@ -634,11 +643,13 @@ def _on_order_status(trade):
             return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
         current_st = _bot_trades[sym].get('status', '')
         if current_st in ('open', 'closing', 'recovery_pending'):
-            # Position war offen — Exit gescheitert → in 60s nochmal versuchen
-            retry_ts = (datetime.now() + timedelta(minutes=30)).timestamp()
+            # Position war offen — Exit gescheitert → Backoff-Retry
+            _delay = _exit_retry_delay(_bot_trades[sym])
+            retry_ts = (datetime.now() + timedelta(seconds=_delay)).timestamp()
             _bot_trades[sym]['status']   = 'exit_retry'
             _bot_trades[sym]['retry_at'] = retry_ts
-            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY geplant in 30min")
+            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY in {_delay}s "
+                f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
         else:
             # Kein offener Trade (Entry-Order gecancelt) — nur überspringen
             _bot_trades[sym]['status'] = 'cancelled'
@@ -1711,9 +1722,11 @@ async def close_spread(ib, symbol, info, reason):
                     if final_active:
                         final_ids = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
                                      for t in final_active]
+                        _delay = _exit_retry_delay(info)
+                        retry_ts = (datetime.now() + timedelta(seconds=_delay)).timestamp()
                         log(f"  ❌ [{symbol}] Hard-Sweep fehlgeschlagen: {len(final_active)} BAG-Orders "
-                            f"noch aktiv {final_ids} — EXIT_RETRY in 30min. Bitte ggf. in TWS prüfen!")
-                        retry_ts = (datetime.now() + timedelta(minutes=30)).timestamp()
+                            f"noch aktiv {final_ids} — EXIT_RETRY in {_delay}s "
+                            f"(Versuch #{info.get('retry_count', 1)}). Ggf. in TWS prüfen!")
                         info['status']   = 'exit_retry'
                         info['retry_at'] = retry_ts
                         return
@@ -1818,6 +1831,7 @@ async def monitor_exits(ib=None):
                     info['status']       = 'open'
                     info['close_reason'] = ''
                     info.pop('tp_hit', None)
+                    info.pop('retry_count', None)
                     _save_state()
                     continue
             log(f"  🔁 [{symbol}] EXIT_RETRY: Cooldown abgelaufen — erneuter Schließ-Versuch")
