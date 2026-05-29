@@ -353,18 +353,60 @@ def _now_et() -> datetime:
 
 _EXIT_RETRY_BACKOFF = [15, 30, 60, 120, 300]  # Sekunden: 15s → 30s → 1min → 2min → 5min
 
-_ib_last_cancel_ts: float = 0.0
-_IB_CANCEL_SPACING = 0.30  # Mindestabstand zwischen cancelOrder-Calls (IB pacing safe zone)
+class _IBOrderQueue:
+    """Globale serielle Pipeline für alle IB Order-Mutations (cancel + place).
+
+    Alle cancelOrder- und placeOrder-Calls laufen durch diese einzige Lane:
+    - verhindert Race Conditions zwischen parallelen Symbol-Exits
+    - garantiert 250ms IB-Pacing zwischen Calls
+    - macht das Execution-Verhalten deterministisch
+
+    Read-only Queries (reqAllOpenOrders, reqPositions) laufen direkt — kein Queue.
+    """
+    _IB_PACING = 0.25  # Mindestabstand zwischen IB Order-Mutations
+
+    def __init__(self):
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.ensure_future(self._worker())
+
+    async def cancel(self, ib, oid: int) -> None:
+        await self._submit(ib.client.cancelOrder, oid, '')
+
+    async def place(self, ib, contract, order):
+        return await self._submit(ib.placeOrder, contract, order)
+
+    async def _submit(self, fn, *args):
+        loop = asyncio.get_event_loop()
+        fut  = loop.create_future()
+        await self._q.put((fn, args, fut))
+        return await fut
+
+    async def _worker(self):
+        while True:
+            fn, args, fut = await self._q.get()
+            try:
+                await asyncio.sleep(self._IB_PACING)
+                result = fn(*args)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                fut.set_result(result)
+            except Exception as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+            finally:
+                self._q.task_done()
+
+_ibq: _IBOrderQueue | None = None  # wird in run_bot() initialisiert
 
 async def _ib_cancel_paced(ib, oid: int) -> None:
-    """Sendet cancelOrder mit Pacing-Guard — verhindert burst-Cancels und IB-Rate-Limits."""
-    global _ib_last_cancel_ts
-    now = asyncio.get_event_loop().time()
-    gap = now - _ib_last_cancel_ts
-    if gap < _IB_CANCEL_SPACING:
-        await asyncio.sleep(_IB_CANCEL_SPACING - gap)
-    _ib_last_cancel_ts = asyncio.get_event_loop().time()
-    ib.client.cancelOrder(oid, '')
+    """Compat-Wrapper: leitet an _ibq weiter falls verfügbar, sonst direkter Call."""
+    if _ibq is not None:
+        await _ibq.cancel(ib, oid)
+    else:
+        ib.client.cancelOrder(oid, '')
 
 def _exit_retry_delay(info: dict) -> int:
     """Exponentieller Backoff für Exit-Retries. Gibt Wartezeit in Sekunden zurück."""
@@ -669,6 +711,11 @@ def _on_order_status(trade):
             log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — kein offener Spread, Symbol übersprungen")
         _save_state()
     elif status == 'Filled':
+        filled_qty = trade.orderStatus.filled or 0
+        total_qty  = trade.order.totalQuantity or 1
+        if 0 < filled_qty < total_qty:
+            log(f"  ⚠️  [{sym}] PARTIAL FILL: {filled_qty}/{total_qty} Kontrakte — "
+                f"Order #{order_id} noch aktiv. Position prüfen!")
         if _bot_trades[sym].get('status') == 'closing':
             exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
@@ -1710,7 +1757,10 @@ async def close_spread(ib, symbol, info, reason):
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
-        trade = ib.placeOrder(bag, order)
+        if _ibq is not None:
+            trade = await _ibq.place(ib, bag, order)
+        else:
+            trade = ib.placeOrder(bag, order)
         info['exit_order_id'] = trade.order.orderId
         log(f"  ⏰ [{symbol}] EXIT {reason} @ ${close_limit:.2f} DAY ({src}) | Order #{trade.order.orderId}")
     except Exception as e:
@@ -2223,7 +2273,10 @@ async def place_order(ib, sig):
             entry_order.transmit = _is_paper
             entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
             entry_order.account = _cfg.get('ib_account', '')
-            entry_trade = ib.placeOrder(bag, entry_order)
+            if _ibq is not None:
+                entry_trade = await _ibq.place(ib, bag, entry_order)
+            else:
+                entry_trade = ib.placeOrder(bag, entry_order)
             parent_id = entry_trade.order.orderId
 
             _bot_trades[sym]['entry_order_id'] = parent_id
@@ -2241,7 +2294,10 @@ async def place_order(ib, sig):
                     tp_order.transmit = False
                     tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                     tp_order.account = _cfg.get('ib_account', '')
-                    tp_trade = ib.placeOrder(bag, tp_order)
+                    if _ibq is not None:
+                        tp_trade = await _ibq.place(ib, bag, tp_order)
+                    else:
+                        tp_trade = ib.placeOrder(bag, tp_order)
 
                     sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
                     sl_order.ocaGroup = _oca
@@ -2249,7 +2305,10 @@ async def place_order(ib, sig):
                     sl_order.transmit = True
                     sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                     sl_order.account = _cfg.get('ib_account', '')
-                    sl_trade = ib.placeOrder(bag, sl_order)
+                    if _ibq is not None:
+                        sl_trade = await _ibq.place(ib, bag, sl_order)
+                    else:
+                        sl_trade = ib.placeOrder(bag, sl_order)
 
                     _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
                     _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
@@ -2263,14 +2322,20 @@ async def place_order(ib, sig):
                 tp_order.transmit = False
                 tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                 tp_order.account = _cfg.get('ib_account', '')
-                tp_trade = ib.placeOrder(bag, tp_order)
+                if _ibq is not None:
+                    tp_trade = await _ibq.place(ib, bag, tp_order)
+                else:
+                    tp_trade = ib.placeOrder(bag, tp_order)
 
                 sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
                 sl_order.parentId = parent_id
                 sl_order.transmit = True
                 sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                 sl_order.account = _cfg.get('ib_account', '')
-                sl_trade = ib.placeOrder(bag, sl_order)
+                if _ibq is not None:
+                    sl_trade = await _ibq.place(ib, bag, sl_order)
+                else:
+                    sl_trade = ib.placeOrder(bag, sl_order)
 
                 _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
                 _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
@@ -2383,6 +2448,64 @@ def _print_shadow_summary(days: int = 30) -> None:
         log(f"  ⚠️  Shadow-Analytics fehlgeschlagen: {e}")
 
 
+async def _reconciliation_loop(ib, stop_event=None) -> None:
+    """Background-Reconciliation: prüft alle 60s auf Orphan-BAG-Orders und Ghost-Positionen.
+
+    Läuft als Hintergrund-Task. Ergänzt den Startup-Sweep um kontinuierliche Bereinigung:
+    - Orphan BAG Orders: offen ohne 'closing'-Position → canceln
+    - Ghost Positionen: bot-State sagt 'open' aber IB hat keine OPT-Position → entfernen
+    """
+    await asyncio.sleep(45)  # Startup-Phase abwarten
+    while not (stop_event and stop_event.is_set()):
+        try:
+            await asyncio.sleep(60)
+            if not ib or not ib.isConnected():
+                continue
+
+            open_orders = await ib.reqAllOpenOrdersAsync()
+
+            # Orphan BAG Orders: BAG offen aber kein 'closing' State → stornieren
+            _closing_syms = {s for s, v in _bot_trades.items() if v.get('status') == 'closing'}
+            orphan_bags   = [
+                t for t in open_orders
+                if t.contract.secType == 'BAG'
+                and t.contract.symbol not in _closing_syms
+            ]
+            if orphan_bags:
+                log(f"  🔄 [RECON] {len(orphan_bags)} Orphan-BAG(s) entdeckt — stornieren ...")
+                for _ot in orphan_bags:
+                    _oid = _ot.order.orderId or 0
+                    if _oid > 0:
+                        _expected_cancels.add(_oid)
+                        try:
+                            await _ib_cancel_paced(ib, _oid)
+                            log(f"     → #{_oid} ({_ot.contract.symbol} {_ot.orderStatus.status}) storniert")
+                        except Exception as _ce:
+                            log(f"     ⚠️  #{_oid}: {_ce}")
+
+            # Ghost Positionen: bot denkt 'open'/'closing'/'exit_retry' aber IB hat keine OPT-Pos
+            _ib_opt_syms   = {p.contract.symbol for p in ib.positions()
+                              if p.contract.secType == 'OPT' and p.position != 0}
+            _ib_order_syms = {t.contract.symbol for t in open_orders
+                              if t.contract.secType in ('OPT', 'BAG')}
+            _ghost = [
+                s for s, v in list(_bot_trades.items())
+                if v.get('status') in ('open', 'closing', 'exit_retry')
+                and s not in _ib_opt_syms
+                and s not in _ib_order_syms
+            ]
+            for _gs in _ghost:
+                log(f"  🧹 [RECON] [{_gs}] Ghost-Position — kein IB-Pendant → entfernt")
+                del _bot_trades[_gs]
+            if _ghost:
+                _save_state()
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _re:
+            log(f"  ⚠️  [RECON] Fehler: {_re}")
+
+
 async def _reconnect_ib(ib: 'IB', host: str, port: int,
                          stop_event: 'threading.Event | None' = None) -> bool:
     """Versucht die IB-Verbindung nach Trennung wiederherzustellen (exp. Backoff)."""
@@ -2407,9 +2530,15 @@ async def _reconnect_ib(ib: 'IB', host: str, port: int,
 
 
 async def run_bot(stop_event: threading.Event = None):
+    global _ibq
     ib = IB()
     log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7496)})")
     _print_shadow_summary(days=30)
+
+    # Global IB Order Queue initialisieren — serialisiert alle cancel/place Calls
+    _ibq = _IBOrderQueue()
+    _ibq.start()
+    log("  ✅ IBOrderQueue gestartet (alle Order-Mutations laufen durch serielle Pipeline)")
 
     try:
         client_id = random.randint(10, 999)
@@ -2600,7 +2729,7 @@ async def run_bot(stop_event: threading.Event = None):
                 if _zoid > 0:
                     try:
                         _expected_cancels.add(_zoid)
-                        ib.client.cancelOrder(_zoid, '')
+                        await _ib_cancel_paced(ib, _zoid)  # über _ibq mit Pacing
                         log(f"     → BAG #{_zoid} ({_zo.contract.symbol}) storniert")
                     except Exception as _ze:
                         log(f"     ⚠️  BAG #{_zoid} Cancel-Fehler: {_ze}")
@@ -2614,6 +2743,9 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"  ⚠️  [{sym}] Split-Leg erkannt — nur {'Short' if short_c else 'Long'}-Leg offen! "
                     f"Bitte in CapTrader manuell prüfen und ggf. schließen.")
 
+        # Background-Reconciliation starten
+        asyncio.ensure_future(_reconciliation_loop(ib, stop_event))
+        log("  ✅ Reconciliation-Loop gestartet (alle 60s: Orphan-BAGs + Ghost-Positionen)")
         log("")
     except TimeoutError:
         port = _cfg.get('ib_port', 7496)
