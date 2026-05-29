@@ -2638,6 +2638,37 @@ async def run_bot(stop_event: threading.Event = None):
             log(f"  🧹 [{sym}] Ghost-Position aus State entfernt — kein echtes IB-Pendant gefunden")
         if ghost_syms:
             _save_state()
+
+        # Startup-BAG-Sweep: alle offenen BAG-Orders stornieren die keiner laufenden
+        # 'closing'-Position entsprechen. Verhindert dass gecrashe Exits das IB-Combo-Limit
+        # beim nächsten Start sofort blockieren.
+        _closing_syms = {s for s, v in _bot_trades.items() if v.get('status') == 'closing'}
+        _zombie_bags  = [
+            o for o in open_orders
+            if o.contract.secType == 'BAG'
+            and o.contract.symbol not in _closing_syms
+        ]
+        if _zombie_bags:
+            log(f"  🧹 Startup-Sweep: {len(_zombie_bags)} zombie BAG-Order(s) canceln ...")
+            for _zo in _zombie_bags:
+                _zoid = _zo.order.orderId or 0
+                if _zoid > 0:
+                    try:
+                        _expected_cancels.add(_zoid)
+                        ib.client.cancelOrder(_zoid, '')
+                        log(f"     → BAG #{_zoid} ({_zo.contract.symbol}) storniert")
+                    except Exception as _ze:
+                        log(f"     ⚠️  BAG #{_zoid} Cancel-Fehler: {_ze}")
+            await asyncio.sleep(2.0)
+
+        # Split-Leg-Check: Symbol mit nur einem OPT-Leg → Spread teilweise geschlossen
+        for sym, legs in put_by_sym.items():
+            short_c = [p for p in legs if p.position < 0]
+            long_c  = [p for p in legs if p.position > 0]
+            if bool(short_c) != bool(long_c):
+                log(f"  ⚠️  [{sym}] Split-Leg erkannt — nur {'Short' if short_c else 'Long'}-Leg offen! "
+                    f"Bitte in CapTrader manuell prüfen und ggf. schließen.")
+
         log("")
     except TimeoutError:
         port = _cfg.get('ib_port', 7496)
