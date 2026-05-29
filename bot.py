@@ -353,6 +353,19 @@ def _now_et() -> datetime:
 
 _EXIT_RETRY_BACKOFF = [15, 30, 60, 120, 300]  # Sekunden: 15s → 30s → 1min → 2min → 5min
 
+_ib_last_cancel_ts: float = 0.0
+_IB_CANCEL_SPACING = 0.30  # Mindestabstand zwischen cancelOrder-Calls (IB pacing safe zone)
+
+async def _ib_cancel_paced(ib, oid: int) -> None:
+    """Sendet cancelOrder mit Pacing-Guard — verhindert burst-Cancels und IB-Rate-Limits."""
+    global _ib_last_cancel_ts
+    now = asyncio.get_event_loop().time()
+    gap = now - _ib_last_cancel_ts
+    if gap < _IB_CANCEL_SPACING:
+        await asyncio.sleep(_IB_CANCEL_SPACING - gap)
+    _ib_last_cancel_ts = asyncio.get_event_loop().time()
+    ib.client.cancelOrder(oid, '')
+
 def _exit_retry_delay(info: dict) -> int:
     """Exponentieller Backoff für Exit-Retries. Gibt Wartezeit in Sekunden zurück."""
     count = info.get('retry_count', 0)
@@ -1564,14 +1577,14 @@ async def close_spread(ib, symbol, info, reason):
             await ib.reqAllOpenOrdersAsync()
             _cancelled_ids: set = set()
 
-            # A: gespeicherte TP/SL-IDs einmalig direkt canceln
+            # A: gespeicherte TP/SL-IDs einmalig direkt canceln (mit Pacing)
             for label, oid in [('TP', info.get('tp_order_id', 0)),
                                 ('SL', info.get('sl_order_id', 0))]:
                 if not oid or oid <= 0 or oid in _cancelled_ids:
                     continue
                 _expected_cancels.add(oid)
                 try:
-                    ib.client.cancelOrder(oid, '')
+                    await _ib_cancel_paced(ib, oid)
                     _cancelled_ids.add(oid)
                     log(f"  🗑  [{symbol}] {label}-Order #{oid} storniert")
                 except Exception as e:
@@ -1588,7 +1601,7 @@ async def close_spread(ib, symbol, info, reason):
                     continue
                 _expected_cancels.add(oid)
                 try:
-                    ib.client.cancelOrder(oid, '')
+                    await _ib_cancel_paced(ib, oid)
                     _cancelled_ids.add(oid)
                     log(f"  🗑  [{symbol}] Order #{oid} ({t.orderStatus.status}) storniert")
                 except Exception:
