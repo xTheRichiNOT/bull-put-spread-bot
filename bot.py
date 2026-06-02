@@ -1765,13 +1765,20 @@ async def close_spread(ib, symbol, info, reason):
         _cur_exit = await get_spread_value(
             symbol, info.get('expiry_yf', ''),
             info.get('short_strike', 0), info.get('long_strike', 0), ib)
+        _spread_width = abs(info.get('short_strike', 0) - info.get('long_strike', 0))
         if _cur_exit and _cur_exit >= 0.02:
             close_limit = round(_cur_exit * 2.0, 2)
             src = f'live ${_cur_exit*100:.0f}¢ ×2 (sofort-Fill)'
-        else:
+        elif entry and entry >= 0.10:
             close_limit = round(entry * 2.0, 2)
-            src = f'fallback entry×2'
-        close_limit = max(close_limit, 0.01)
+            src = f'entry×2 (${entry:.2f})'
+        elif _spread_width > 0:
+            close_limit = round(_spread_width * 0.80, 2)
+            src = f'spread-width fallback (80% von ${_spread_width:.0f})'
+        else:
+            close_limit = 5.00
+            src = 'absolute fallback'
+        close_limit = max(close_limit, 0.05)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         order.account = _cfg.get('ib_account', '')
@@ -1824,7 +1831,7 @@ async def monitor_exits(ib=None):
                         if p.contract.secType == 'OPT' and p.position != 0}
             _ib_order_syms = {t.contract.symbol for t in ib.openTrades()
                               if t.contract.secType in ('OPT', 'BAG')}
-            _active_statuses = ('open', 'closing', 'exit_retry', 'error')
+            _active_statuses = ('open', 'exit_retry', 'error')  # 'closing' nie entfernen — Exit-Order läuft
             _removed = []
             for _sym, _info in list(_bot_trades.items()):
                 if _info.get('status') in _active_statuses:
