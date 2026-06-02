@@ -716,11 +716,25 @@ def _on_order_status(trade):
         if 0 < filled_qty < total_qty:
             log(f"  ⚠️  [{sym}] PARTIAL FILL: {filled_qty}/{total_qty} Kontrakte — "
                 f"Order #{order_id} noch aktiv. Position prüfen!")
+        _tp_oid = _bot_trades[sym].get('tp_order_id', 0)
+        _sl_oid = _bot_trades[sym].get('sl_order_id', 0)
         if _bot_trades[sym].get('status') == 'closing':
             exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
             _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
             log(f"  💰 [{sym}] EXIT AUSGEFÜHRT @ ${exit_fill:.2f}/Share — Position geschlossen!")
+        elif order_id and _tp_oid and order_id == _tp_oid:
+            # IB-Bracket Take-Profit ausgeführt — kein close_spread() nötig
+            exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
+            _bot_trades[sym]['status'] = 'done'
+            _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
+            log(f"  💰 [{sym}] TP AUSGEFÜHRT (IB-Bracket) @ ${exit_fill:.2f}/Share — Position geschlossen!")
+        elif order_id and _sl_oid and order_id == _sl_oid:
+            # IB-Bracket Stop-Loss ausgeführt — kein close_spread() nötig
+            exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
+            _bot_trades[sym]['status'] = 'done'
+            _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
+            log(f"  🛑 [{sym}] SL AUSGEFÜHRT (IB-Bracket) @ ${exit_fill:.2f}/Share — Position geschlossen!")
         else:
             _bot_trades[sym]['status']        = 'open'
             _bot_trades[sym]['fill_confirmed'] = True   # Entry gefüllt — Fill-Timeout deaktiviert
@@ -1965,17 +1979,6 @@ async def monitor_exits(ib=None):
         pnl_share   = pnl_per_ctr / 100
         pnl_pct     = (pnl_per_ctr / (entry * 100) * 100) if entry > 0 else 0
 
-        # ── Software-TP: preis-basiert aus Einzel-Legs — kein IB-Portfolio-Cache ──
-        tp_close_price = round(entry * (1 - TAKE_PROFIT_PCT), 2)
-        if current <= tp_close_price and not info.get('tp_hit'):
-            log(f"  🎯 [{symbol}] Software-TP: ${current*100:.0f} <= ${tp_close_price*100:.0f}"
-                f" ({pnl_pct:+.1f}%) — schließe Position")
-            async with _sym_lock(symbol):
-                info['tp_hit'] = True
-                _save_state()
-                await close_spread(ib, symbol, info, 'TP_HIT')
-            continue
-
         # Breakeven: bestehende SL-Order auf Breakeven-Preis modifizieren (Modify, kein Cancel)
         # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put
         # tritt nur auf wenn neues Bag mit umgekehrten Legs platziert wird)
@@ -1996,7 +1999,10 @@ async def monitor_exits(ib=None):
                         for t in ib.openTrades():
                             if t.order.orderId == sl_order_id:
                                 t.order.lmtPrice = be_close
-                                ib.placeOrder(t.contract, t.order)
+                                if _ibq is not None:
+                                    asyncio.ensure_future(_ibq.place(ib, t.contract, t.order))
+                                else:
+                                    ib.placeOrder(t.contract, t.order)
                                 sl_modified = True
                                 log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC "
                                     f"(Modify #{sl_order_id}) | P&L: +${pnl_dollar:.0f}")
