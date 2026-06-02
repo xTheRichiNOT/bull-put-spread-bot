@@ -1766,11 +1766,11 @@ async def close_spread(ib, symbol, info, reason):
             symbol, info.get('expiry_yf', ''),
             info.get('short_strike', 0), info.get('long_strike', 0), ib)
         if _cur_exit and _cur_exit >= 0.02:
-            close_limit = round(_cur_exit * 2.0, 2)
-            src = f'live ${_cur_exit*100:.0f}¢ ×2 (sofort-Fill)'
+            close_limit = round(_cur_exit * 5.0, 2)
+            src = f'live ${_cur_exit*100:.0f}¢ ×5 (Market-ähnlich)'
         else:
-            close_limit = round(entry * 2.0, 2)
-            src = f'fallback entry×2'
+            close_limit = round(entry * 5.0, 2)
+            src = f'fallback entry×5'
         close_limit = max(close_limit, 0.01)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
         order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
