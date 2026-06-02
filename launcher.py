@@ -277,6 +277,7 @@ DEFAULT_CONFIG = {
     "stop_loss_mult":      2.0,
     "dte_exit":            0,
     "min_available_funds": 2000,
+    "max_daily_loss":      500,
 }
 
 def load_config() -> dict:
@@ -1861,9 +1862,10 @@ class BotLauncher(ctk.CTk):
               tip="z.B. U1234567")
 
         section("Risiko-Management")
-        field("Max. gleichzeitige Positionen",  "max_positions",       tip="Empfohlen: 6–10")
+        field("Max. gleichzeitige Positionen",  "max_positions",       tip="Empfohlen: 4 (IB Combo-Limit)")
         field("Max. Positionen pro Sektor",     "max_per_sector",      tip="Verhindert Klumpenrisiko (empfohlen: 2)")
         field("Min. Kapitalreserve ($)",         "min_available_funds", tip="Kein neuer Trade wenn Konto darunter fällt")
+        field("Max. Tagesverlust ($)",           "max_daily_loss",      tip="Kill-Switch: kein neuer Trade wenn Tages-P&L unter diesen Wert fällt (0 = deaktiviert)")
 
         section("Strategie")
         field("Min. Implied Volatility (IV)",   "min_vola",        tip="0.28 = 28%  — IV-Filter für genug Prämie")
@@ -2072,7 +2074,7 @@ class BotLauncher(ctk.CTk):
                         self.cfg[key] = raw
                     elif key in ("max_positions", "max_per_sector",
                                  "min_available_funds", "scan_intervall",
-                                 "dte_exit", "min_credit"):
+                                 "dte_exit", "min_credit", "max_daily_loss"):
                         self.cfg[key] = int(raw)
                     else:
                         self.cfg[key] = float(raw)
