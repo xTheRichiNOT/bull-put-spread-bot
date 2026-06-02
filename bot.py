@@ -1812,6 +1812,26 @@ async def monitor_exits(ib=None):
         await _process_close_commands(ib)
     if not _bot_trades:
         return
+
+    # IB-Abgleich: Positionen die manuell in CapTrader geschlossen wurden sofort entfernen
+    if ib is not None:
+        try:
+            _ib_syms = {p.contract.symbol for p in ib.positions()
+                        if p.contract.secType == 'OPT' and p.position != 0}
+            _ib_order_syms = {t.contract.symbol for t in ib.openTrades()
+                              if t.contract.secType in ('OPT', 'BAG')}
+            _active_statuses = ('open', 'closing', 'exit_retry', 'error')
+            _removed = []
+            for _sym, _info in list(_bot_trades.items()):
+                if _info.get('status') in _active_statuses:
+                    if _sym not in _ib_syms and _sym not in _ib_order_syms:
+                        _bot_trades.pop(_sym, None)
+                        _removed.append(_sym)
+            if _removed:
+                _save_state()
+                log(f"  🧹 IB-Abgleich: {_removed} manuell geschlossen — aus State entfernt")
+        except Exception:
+            pass
     for symbol, info in list(_bot_trades.items()):
         # EXIT_RETRY: Exit-Order wurde abgelehnt — nach 60s Cooldown erneut versuchen
         if info.get('status') == 'exit_retry':
