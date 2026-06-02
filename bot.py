@@ -2032,6 +2032,30 @@ async def monitor_exits(ib=None):
             f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
             f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
 
+        # ── Software-TP/SL Fallback: nur für Positionen OHNE IB-Bracket-Orders ──
+        # Betrifft Legacy-Positionen (tp_order_id=0) oder wenn Bracket-Platzierung
+        # beim Entry fehlschlug. IB-Bracket-Positionen werden von _on_order_status
+        # behandelt — hier niemals eingreifen wenn tp_order_id gesetzt ist.
+        if not info.get('tp_order_id') and not info.get('sl_order_id') and ib is not None:
+            tp_close_price = round(entry * (1 - TAKE_PROFIT_PCT), 2)
+            sl_close_price = round(entry * STOP_LOSS_MULT, 2)
+            if current <= tp_close_price and not info.get('tp_hit'):
+                log(f"  🎯 [{symbol}] Software-TP (kein Bracket): "
+                    f"${current*100:.0f}¢ ≤ ${tp_close_price*100:.0f}¢ — schließe Position")
+                async with _sym_lock(symbol):
+                    info['tp_hit'] = True
+                    _save_state()
+                    await close_spread(ib, symbol, info, 'TP_HIT')
+                continue
+            if current >= sl_close_price and not info.get('sl_hit'):
+                log(f"  🛑 [{symbol}] Software-SL (kein Bracket): "
+                    f"${current*100:.0f}¢ ≥ ${sl_close_price*100:.0f}¢ — schließe Position")
+                async with _sym_lock(symbol):
+                    info['sl_hit'] = True
+                    _save_state()
+                    await close_spread(ib, symbol, info, 'SL_HIT')
+                continue
+
 async def place_order(ib, sig):
     """Platziert eine Combo-Order auf IB für ein gegebenes Signal-Dict."""
     try:
