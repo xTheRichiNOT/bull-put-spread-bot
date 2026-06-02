@@ -1756,7 +1756,7 @@ class BotLauncher(ctk.CTk):
         parent.configure(fg_color=C["surface"])
 
         # ── Sicherer-Modus Header ─────────────────────────────────────────────
-        self._safe_mode_var = ctk.BooleanVar(value=True)   # default: gesperrt
+        self._safe_mode_var = ctk.BooleanVar(value=False)  # default: entsperrt
         self._input_widgets: list = []
 
         safe_bar = ctk.CTkFrame(parent, fg_color=C["surface2"],
