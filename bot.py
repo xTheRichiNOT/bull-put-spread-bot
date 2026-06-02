@@ -2470,12 +2470,17 @@ async def _reconciliation_loop(ib, stop_event=None) -> None:
 
             open_orders = await ib.reqAllOpenOrdersAsync()
 
-            # Orphan BAG Orders: BAG offen aber kein 'closing' State → stornieren
-            _closing_syms = {s for s, v in _bot_trades.items() if v.get('status') == 'closing'}
+            # Orphan BAG Orders: BAG offen aber kein bekannter State und keine TP/SL-ID → stornieren
+            _recon_protected_syms = {s for s, v in _bot_trades.items()
+                                     if v.get('status') in ('closing', 'open', 'exit_retry')}
+            _recon_protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
+                                  | {v.get('sl_order_id', 0) for v in _bot_trades.values()}
+            _recon_protected_oids.discard(0)
             orphan_bags   = [
                 t for t in open_orders
                 if t.contract.secType == 'BAG'
-                and t.contract.symbol not in _closing_syms
+                and t.contract.symbol not in _recon_protected_syms
+                and (t.order.orderId or 0) not in _recon_protected_oids
             ]
             if orphan_bags:
                 log(f"  🔄 [RECON] {len(orphan_bags)} Orphan-BAG(s) entdeckt — stornieren ...")
@@ -2719,14 +2724,19 @@ async def run_bot(stop_event: threading.Event = None):
         if ghost_syms:
             _save_state()
 
-        # Startup-BAG-Sweep: alle offenen BAG-Orders stornieren die keiner laufenden
-        # 'closing'-Position entsprechen. Verhindert dass gecrashe Exits das IB-Combo-Limit
-        # beim nächsten Start sofort blockieren.
-        _closing_syms = {s for s, v in _bot_trades.items() if v.get('status') == 'closing'}
+        # Startup-BAG-Sweep: zombie BAG-Orders canceln (gecrashe Exits).
+        # Schützt: (a) Symbole mit status='closing', (b) bekannte TP/SL-Bracket-Order-IDs
+        # für 'open'-Positionen — diese sollen auf IB aktiv bleiben.
+        _protected_syms = {s for s, v in _bot_trades.items()
+                           if v.get('status') in ('closing', 'open', 'exit_retry')}
+        _protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
+                        | {v.get('sl_order_id', 0) for v in _bot_trades.values()}
+        _protected_oids.discard(0)
         _zombie_bags  = [
             o for o in open_orders
             if o.contract.secType == 'BAG'
-            and o.contract.symbol not in _closing_syms
+            and o.contract.symbol not in _protected_syms
+            and (o.order.orderId or 0) not in _protected_oids
         ]
         if _zombie_bags:
             log(f"  🧹 Startup-Sweep: {len(_zombie_bags)} zombie BAG-Order(s) canceln ...")
