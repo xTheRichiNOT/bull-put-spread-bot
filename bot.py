@@ -147,7 +147,7 @@ ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
 MIN_CREDIT_PERCENT = 0.18   # 18 % der Spread-Breite als Mindest-Credit (relativ)
-MIN_CREDIT_ABS     = float(_cfg.get('min_credit_abs', 80))  # Absolutes Minimum pro Kontrakt (PDF: $80)
+MIN_CREDIT_ABS     = float(_cfg.get('min_credit', _cfg.get('min_credit_abs', 80)))  # Absolutes Minimum pro Kontrakt
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
 MIN_PROBABILITY  = 0.72
@@ -327,7 +327,7 @@ def _reload_cfg():
         MAX_POSITIONS         = int(updated['max_positions'])
         MAX_PER_SECTOR        = int(updated['max_per_sector'])
         SCAN_INTERVALL        = int(updated['scan_intervall'])
-        MIN_CREDIT_ABS        = float(updated.get('min_credit_abs', 80))
+        MIN_CREDIT_ABS        = float(updated.get('min_credit', updated.get('min_credit_abs', 80)))
         MIN_RISK_REWARD       = float(updated['min_risk_reward'])
         MAX_DELTA             = float(updated['max_delta'])
     except Exception:
