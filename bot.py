@@ -2880,10 +2880,11 @@ async def run_bot(stop_event: threading.Event = None):
             # ── Kill-Switch-Check ─────────────────────────────────────────────
             if await check_kill_switch(ib):
                 log(f"  🛑 KILL-SWITCH aktiv ({_kill_switch_reason}) — Scan übersprungen, nur Exit-Monitoring läuft")
-                log(f"  Pause {SCAN_INTERVALL}s ...")
-                for _ in range(SCAN_INTERVALL):
+                for _cd in range(SCAN_INTERVALL, 0, -1):
                     if stop_event and stop_event.is_set():
                         break
+                    if _cd == SCAN_INTERVALL or _cd % 10 == 0:
+                        log(f"  ⏳ Nächster Zyklus in {_cd}s ...")
                     await asyncio.sleep(1)
                 continue
 
@@ -3200,10 +3201,11 @@ async def run_bot(stop_event: threading.Event = None):
             # Positionen für Launcher-Anzeige schreiben
             _write_positions_file()
 
-            log(f"\n  Pause {SCAN_INTERVALL}s ...")
-            for _ in range(SCAN_INTERVALL):
+            for _cd in range(SCAN_INTERVALL, 0, -1):
                 if stop_event and stop_event.is_set():
                     break
+                if _cd == SCAN_INTERVALL or _cd % 10 == 0:
+                    log(f"\n  ⏳ Nächster Zyklus in {_cd}s ...")
                 await asyncio.sleep(1)
 
     except Exception as e:
