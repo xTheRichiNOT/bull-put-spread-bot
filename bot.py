@@ -1669,71 +1669,75 @@ async def close_spread(ib, symbol, info, reason):
                     pass
 
             # ── PHASE 2: WAIT — IB-Server-Sync abwarten ────────────────────────────
-            # Festes 2s Pause nach dem Cancel-Batch.
-            # Kein weiterer Cancel während dieser Phase — IB verarbeitet async.
             await asyncio.sleep(2.0)
 
             # ── PHASE 3: GATE-POLL (read-only) ─────────────────────────────────────
-            # Prüfe account-weit ob IB alle BAG-Orders als Cancelled bestätigt hat.
-            # Inactive-Orders (Error-201-Rejects) tauchen in reqAllOpenOrders NICHT auf
-            # → ib.trades()-Cache wird zusätzlich geprüft.
-            # KEIN weiterer Cancel in dieser Phase — nur lesen und warten.
+            # Wartet NUR darauf dass die in Phase 1 gecancelten Order-IDs verschwinden.
+            # Prüft NICHT account-weit (würde bei aktiven Brackets anderer Positionen
+            # nie sauber sein). Wenn nichts gecancelt wurde → sofort weiter.
             cancel_confirmed = False
-            for _attempt in range(40):  # 40 × 0.5s = 20s Timeout
-                await asyncio.sleep(0.5)
-                fresh = await ib.reqAllOpenOrdersAsync()
-                _server_active = [
-                    t for t in (fresh if fresh is not None else ib.openTrades())
-                    if t.contract.secType == 'BAG'
-                    and t.orderStatus.status in _BLOCKING
-                ]
-                _server_oids = {t.order.orderId for t in _server_active}
-                _inactive_cached = [
-                    t for t in ib.trades()
-                    if t.contract.secType == 'BAG'
-                    and t.orderStatus.status == 'Inactive'
-                    and t.order.orderId not in _server_oids
-                ]
-                still_active = _server_active + _inactive_cached
-                if not still_active:
+            if not _cancelled_ids:
+                cancel_confirmed = True  # nichts gecancelt → kein Warten nötig
+            else:
+                for _attempt in range(40):  # 40 × 0.5s = 20s Timeout
+                    await asyncio.sleep(0.5)
+                    fresh = await ib.reqAllOpenOrdersAsync()
+                    _all_active_oids = {
+                        t.order.orderId
+                        for t in (fresh if fresh is not None else ib.openTrades())
+                        if t.orderStatus.status in _BLOCKING
+                    }
+                    _all_inactive_oids = {
+                        t.order.orderId
+                        for t in ib.trades()
+                        if t.orderStatus.status == 'Inactive'
+                    }
+                    _still_blocking = _cancelled_ids & (_all_active_oids | _all_inactive_oids)
+                    if not _still_blocking:
+                        cancel_confirmed = True
+                        break
+                    if _attempt % 6 == 0:
+                        log(f"  ⏳ [{symbol}] Warte auf Cancel-Bestätigung ({_attempt+1}/40): {_still_blocking}")
+
+                if not cancel_confirmed:
+                    log(f"  🔄 [{symbol}] Timeout (20s) — 5s Extra-Puffer ...")
+                    await asyncio.sleep(5.0)
+                    _final_oids = {
+                        t.order.orderId for t in ib.trades()
+                        if t.orderStatus.status not in _TERMINAL
+                    }
+                    _still = _cancelled_ids & _final_oids
+                    if _still:
+                        _delay = _exit_retry_delay(info)
+                        log(f"  ❌ [{symbol}] Cancel nicht bestätigt nach 25s: {_still} — "
+                            f"EXIT_RETRY in {_delay}s (Versuch #{info.get('retry_count', 1)})")
+                        info['status']   = 'exit_retry'
+                        info['retry_at'] = (datetime.now() + timedelta(seconds=_delay)).timestamp()
+                        _save_state()
+                        return
                     cancel_confirmed = True
-                    break
-                if _attempt % 6 == 0:
-                    _sa_info = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
-                                for t in still_active]
-                    log(f"  ⏳ [{symbol}] Warte auf IB-Clearance ({_attempt+1}/40): {_sa_info}")
 
-            if not cancel_confirmed:
-                # Letzte Chance: 5s extra + finaler Check
-                log(f"  🔄 [{symbol}] Timeout (20s) — 5s Extra-Puffer ...")
-                await asyncio.sleep(5.0)
-                final = await ib.reqAllOpenOrdersAsync()
-                _final_active = [
-                    t for t in (final if final is not None else ib.openTrades())
-                    if t.contract.secType == 'BAG'
-                    and t.orderStatus.status in _BLOCKING
-                ]
-                _final_oids = {t.order.orderId for t in _final_active}
-                _final_inactive = [
-                    t for t in ib.trades()
-                    if t.contract.secType == 'BAG'
-                    and t.orderStatus.status == 'Inactive'
-                    and t.order.orderId not in _final_oids
-                ]
-                _final_active += _final_inactive
-                if _final_active:
-                    _fids = [(t.contract.symbol, t.order.orderId, t.orderStatus.status)
-                             for t in _final_active]
-                    _delay = _exit_retry_delay(info)
-                    log(f"  ❌ [{symbol}] IB nicht sauber nach 25s: {_fids} — "
-                        f"EXIT_RETRY in {_delay}s (Versuch #{info.get('retry_count', 1)})")
-                    info['status']   = 'exit_retry'
-                    info['retry_at'] = (datetime.now() + timedelta(seconds=_delay)).timestamp()
-                    _save_state()
-                    return
-                cancel_confirmed = True
+            # ── PRE-FLIGHT: IB Combo-Order-Limit prüfen ────────────────────────────
+            # IB erlaubt max. ~10 aktive Combo/BAG-Orders account-weit.
+            # Bracket-Orders anderer Positionen zählen mit → Limit kann überschritten sein.
+            await ib.reqAllOpenOrdersAsync()
+            await asyncio.sleep(0.3)
+            _active_combos = [
+                t for t in ib.openTrades()
+                if t.contract.secType == 'BAG'
+                and t.orderStatus.status in _BLOCKING
+            ]
+            _IB_COMBO_LIMIT = 9  # konservativ: IB-Limit liegt bei ~10, 1 Slot für unsere Order
+            if len(_active_combos) >= _IB_COMBO_LIMIT:
+                _delay = _exit_retry_delay(info)
+                log(f"  ⏳ [{symbol}] IB-Combo-Limit: {len(_active_combos)}/{_IB_COMBO_LIMIT} "
+                    f"aktive BAG-Orders — EXIT_RETRY in {_delay}s (warte bis andere Orders füllen/canceln)")
+                info['status']   = 'exit_retry'
+                info['retry_at'] = (datetime.now() + timedelta(seconds=_delay)).timestamp()
+                _save_state()
+                return
 
-            log(f"  ✅ [{symbol}] IB clean — sende Exit-Order")
+            log(f"  ✅ [{symbol}] IB clean ({len(_active_combos)} aktive BAGs) — sende Exit-Order")
 
         # ── PHASE 4: PLACE ──────────────────────────────────────────────────────
         # BUY kehrt Legs um: SELL short_put (deckt Short) + BUY long_put (schließt Long)
