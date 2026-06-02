@@ -92,6 +92,28 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.1.7": [
+        "🐛  avgCost=0 (Demo-Konto): Einstiegspreis wird jetzt via reqExecutions aus echten Fill-Daten rekonstruiert statt falschem Limit-Order-Preis",
+    ],
+    "3.1.6": [
+        "🐛  Closing-Race: 'closing'-Status nicht mehr in IB-Sync-Ghost-Cleanup — Exit-Order wird nicht sofort gelöscht",
+        "🐛  Exit-Limit-Fallback: spread_width × 0.80 wenn Einstiegspreis < $0.10 — verhindert $0.01-Orders bei Demo-Konto",
+    ],
+    "3.1.5": [
+        "🆕  Manueller Exit jetzt auch für Status 'error' und 'exit_retry' möglich",
+    ],
+    "3.1.4": [
+        "🐛  min_credit-Einstellung wurde ignoriert (Key-Mismatch min_credit vs min_credit_abs)",
+    ],
+    "3.1.3": [
+        "🐛  Error 201 re-fix: Exit-Limit ×2 (statt ×5) — ×5 löste Price-based Guaranteed-to-Lose aus",
+    ],
+    "3.1.2": [
+        "🐛  Einstellungen nicht editierbar: Safe-Mode war standardmäßig aktiv (gesperrt) — Default jetzt entsperrt",
+    ],
+    "3.1.1": [
+        "🐛  Einstellungen-Speichern schlug fehl wenn max_daily_loss fehlt (leeres Feld → ValueError)",
+    ],
     "1.0.44": [
         "🐛  Akt. P&L Crash behoben (UnboundLocalError 'current' wenn IB-Portfolio-Daten vorhanden)",
         "🐛  CI-Workflow: Release-Build toleriert bereits existierende Releases",

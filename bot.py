@@ -2746,14 +2746,27 @@ async def run_bot(stop_event: threading.Event = None):
                 if entry['entry_per_share'] > 0:
                     entry['entry_per_share'] = max(0, entry['entry_per_share'] - paid)
 
-            # avgCost=0 im Demo-Konto: Fallback auf Limit-Preis der offenen Entry-Order
+            # avgCost=0 (Demo-Konto): Einstiegspreis über reqExecutions rekonstruieren
             if entry['entry_per_share'] <= 0:
-                for ot in ib.openTrades():
-                    if ot.contract.symbol == sym and abs(ot.order.lmtPrice or 0) > 0:
-                        fallback = abs(ot.order.lmtPrice)
-                        entry['entry_per_share'] = fallback
-                        log(f"  ⚠️  [{sym}] avgCost=0 (Demo) — Einstiegspreis von Limit-Order: ${fallback:.2f}")
-                        break
+                try:
+                    _ef = ExecutionFilter(symbol=sym, secType='OPT')
+                    _fills = await ib.reqExecutionsAsync(_ef)
+                    _short_price = 0.0
+                    _long_price  = 0.0
+                    for _f in (_fills or []):
+                        _cid = _f.contract.conId
+                        _ep  = _f.execution.avgPrice or _f.execution.price or 0.0
+                        if _cid == entry.get('short_conid') and _f.execution.side == 'SLD':
+                            _short_price = _ep
+                        elif _cid == entry.get('long_conid') and _f.execution.side == 'BOT':
+                            _long_price = _ep
+                    if _short_price > 0:
+                        _exec_entry = round(max(_short_price - _long_price, 0.01), 2)
+                        entry['entry_per_share'] = _exec_entry
+                        log(f"  ✅ [{sym}] Einstiegspreis via reqExecutions: "
+                            f"SLD ${_short_price:.2f} − BOT ${_long_price:.2f} = ${_exec_entry:.2f}/Share")
+                except Exception as _exc:
+                    log(f"  ⚠️  [{sym}] reqExecutions fehlgeschlagen: {_exc}")
 
             if entry['entry_per_share'] <= 0:
                 log(f"  ⚠️  [{sym}] Einstiegspreis konnte nicht rekonstruiert werden — "
