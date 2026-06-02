@@ -1591,8 +1591,8 @@ class BotLauncher(ctk.CTk):
                 status_txt, status_col = "Schließt…", "#f59e0b"
             lbl(row, status_txt, 95, status_col)
 
-            # Exit-Button: nur für aktive Positionen
-            if status == "open":
+            # Exit-Button: für aktive Positionen und Fehler-/Retry-Status
+            if status in ("open", "error", "exit_retry"):
                 sym_ref = p.get("symbol", "")
                 def _make_exit_fn(sym):
                     def _do_exit():

@@ -1797,10 +1797,14 @@ async def _process_close_commands(ib):
         os.remove(_CLOSE_CMD_FILE)   # sofort löschen → kein Doppel-Exit
         for sym in cmds:
             info = _bot_trades.get(sym)
-            if info and info.get('status') == 'open':
-                log(f"  🖱️  [{sym}] Manueller Exit via Frontend")
+            if info and info.get('status') in ('open', 'error', 'exit_retry'):
+                log(f"  🖱️  [{sym}] Manueller Exit via Frontend (Status: {info.get('status')})")
+                info['status'] = 'open'   # Reset damit close_spread() durchläuft
+                info.pop('retry_count', None)
                 async with _sym_lock(sym):
                     await close_spread(ib, sym, info, 'MANUAL_EXIT')
+            elif info and info.get('status') == 'closing':
+                log(f"  ⚠️  [{sym}] Manueller Exit: Position schließt bereits ...")
             elif info:
                 log(f"  ⚠️  [{sym}] Manueller Exit ignoriert — Status: {info.get('status')}")
     except Exception as e:
