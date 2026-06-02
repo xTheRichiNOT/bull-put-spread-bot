@@ -1631,6 +1631,17 @@ async def close_spread(ib, symbol, info, reason):
     _BLOCKING  = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending'}
     _TERMINAL  = {'Filled', 'Cancelled', 'ApiCancelled'}
 
+    # ── MARKT-CHECK: vor jeder Cancel/Place-Aktion ──────────────────────────────
+    # Brackets bleiben intakt — keine unnötigen Stornierungen außerhalb der Handelszeiten.
+    if not is_market_open():
+        _secs, _open_et = seconds_until_market_open()
+        info['status']      = 'exit_retry'
+        info['retry_at']    = (datetime.now() + timedelta(seconds=_secs + 30)).timestamp()
+        info['close_reason'] = reason
+        log(f"  ⏸️  [{symbol}] Markt geschlossen — Exit bei Öffnung ({_open_et.strftime('%H:%M ET')})")
+        _save_state()
+        return
+
     try:
         if ib is not None:
             # ── PHASE 1: CANCEL (jede Order genau einmal) ──────────────────────────
@@ -1750,14 +1761,6 @@ async def close_spread(ib, symbol, info, reason):
         )
         entry = info['entry_per_share']
         info['close_reason'] = reason
-
-        if not is_market_open():
-            _secs, _open_et = seconds_until_market_open()
-            info['status']   = 'exit_retry'
-            info['retry_at'] = (datetime.now() + timedelta(seconds=_secs + 30)).timestamp()
-            log(f"  ⏸️  [{symbol}] Markt geschlossen — Exit bei Öffnung ({_open_et.strftime('%H:%M ET')})")
-            _save_state()
-            return
 
         info['status'] = 'closing'
         info['close_initiated_at'] = datetime.now().timestamp()
