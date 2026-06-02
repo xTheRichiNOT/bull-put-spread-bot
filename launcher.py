@@ -2075,9 +2075,9 @@ class BotLauncher(ctk.CTk):
                     elif key in ("max_positions", "max_per_sector",
                                  "min_available_funds", "scan_intervall",
                                  "dte_exit", "min_credit", "max_daily_loss"):
-                        self.cfg[key] = int(raw)
+                        self.cfg[key] = int(raw) if raw else DEFAULT_CONFIG.get(key, 0)
                     else:
-                        self.cfg[key] = float(raw)
+                        self.cfg[key] = float(raw) if raw else DEFAULT_CONFIG.get(key, 0.0)
             save_config(self.cfg)
             self._save_lbl.configure(text="✅  Einstellungen gespeichert!", text_color="#4ade80")
             self.after(3000, lambda: self._save_lbl.configure(text=""))
