@@ -1687,12 +1687,10 @@ async def close_spread(ib, symbol, info, reason):
                         for t in (fresh if fresh is not None else ib.openTrades())
                         if t.orderStatus.status in _BLOCKING
                     }
-                    _all_inactive_oids = {
-                        t.order.orderId
-                        for t in ib.trades()
-                        if t.orderStatus.status == 'Inactive'
-                    }
-                    _still_blocking = _cancelled_ids & (_all_active_oids | _all_inactive_oids)
+                    # Nur Server-bestätigte aktive Orders blockieren — Inactive Orders
+                    # die bereits gecancelt wurden tauchen nicht mehr in reqAllOpenOrders
+                    # auf und sind IB-seitig erledigt (lokaler Cache hinkt nach).
+                    _still_blocking = _cancelled_ids & _all_active_oids
                     if not _still_blocking:
                         cancel_confirmed = True
                         break
@@ -1702,9 +1700,11 @@ async def close_spread(ib, symbol, info, reason):
                 if not cancel_confirmed:
                     log(f"  🔄 [{symbol}] Timeout (20s) — 5s Extra-Puffer ...")
                     await asyncio.sleep(5.0)
+                    _final_fresh = await ib.reqAllOpenOrdersAsync()
                     _final_oids = {
-                        t.order.orderId for t in ib.trades()
-                        if t.orderStatus.status not in _TERMINAL
+                        t.order.orderId
+                        for t in (_final_fresh if _final_fresh is not None else ib.openTrades())
+                        if t.orderStatus.status in _BLOCKING
                     }
                     _still = _cancelled_ids & _final_oids
                     if _still:
