@@ -2529,7 +2529,7 @@ async def _reconciliation_loop(ib, stop_event=None) -> None:
                               if t.contract.secType in ('OPT', 'BAG')}
             _ghost = [
                 s for s, v in list(_bot_trades.items())
-                if v.get('status') in ('open', 'closing', 'exit_retry')
+                if v.get('status') in ('open', 'closing', 'exit_retry', 'error')
                 and s not in _ib_opt_syms
                 and s not in _ib_order_syms
             ]
@@ -2742,7 +2742,7 @@ async def run_bot(stop_event: threading.Event = None):
         ib_order_syms     = {o.contract.symbol for o in open_orders if o.contract.secType == 'OPT'}
         ghost_syms = [
             sym for sym, info in list(_bot_trades.items())
-            if info.get('status') in ('open', 'closing', 'exit_retry')
+            if info.get('status') in ('open', 'closing', 'exit_retry', 'error')
             and sym not in ib_position_syms
             and sym not in ib_order_syms
         ]
