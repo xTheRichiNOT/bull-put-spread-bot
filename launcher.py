@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.8": [
+        "⚡  IV-Performance: Bot erkennt nach dem ersten Scan ob IB dauerhaft kein IV liefert — überspringt dann den 10s IB-Warte-Block und holt IV direkt via yfinance (Demo-Account deutlich schneller)",
+        "🐛  IV-Logging: Erfolg/Fehler der yfinance Options-Chain wird jetzt im Log sichtbar ([IV SYM] yf-Chain: IV=XX.X%)",
+    ],
     "3.2.7": [
         "🐛  IV-Fallback 3: yfinance Options-Chain als letzter Ausweg wenn IB (Type 1+3) keine Options-Daten liefert",
     ],

@@ -450,6 +450,8 @@ _strike_map: dict = {}
 _iv_cache: dict = {}
 _IV_CACHE_TTL = 300  # Sekunden (5 Minuten)
 _iv_use_delayed: bool = False  # True wenn Type 1 kein IV liefert → automatisch Type 3
+_iv_yf_only:     bool = False  # True wenn IB Type1+3 dauerhaft kein IV → yfinance direkt
+_iv_yf_hits:     int  = 0     # Wie oft yfinance als IV-Quelle genutzt wurde (kumulativ)
 
 # yfinance Rate-Limit Cooldown — wenn gesperrt, 10 Min direkt zu IB springen
 _yf_blocked_until: float = 0.0
@@ -927,120 +929,116 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
         if not price or price <= 0:
             return None, None
 
-        # Echter ATM-Strike: nächster Strike zum aktuellen Kurs
-        strike = min(strikes, key=lambda s: abs(s - price))
-
-        # Expiry ~38 DTE
-        today = datetime.now()
-        exp = min(expiries, key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38))
-        if (datetime.strptime(exp, '%Y%m%d') - today).days < 7:
-            return None, None
-
-        opt_con = Option(symbol, exp, strike, 'P', 'SMART')
-        await ib.qualifyContractsAsync(opt_con)
-
-        # Wenn ATM-Strike für diese Expiry nicht existiert → bis zu 4 nächste Strikes versuchen
-        if not opt_con.conId:
-            alt_strikes = sorted(strikes, key=lambda s: abs(s - price))[:5]
-            for alt_s in alt_strikes:
-                if alt_s == strike:
-                    continue
-                opt_alt = Option(symbol, exp, alt_s, 'P', 'SMART')
-                await ib.qualifyContractsAsync(opt_alt)
-                if opt_alt.conId:
-                    opt_con = opt_alt
-                    strike = alt_s
-                    break
-
-        if not opt_con.conId:
-            log(f"   [IV-DBG {symbol}] kein Contract: strike={strike} exp={exp} — Strike für diese Expiry nicht verfügbar")
-            return None, None
-
-        global _iv_use_delayed
-        if _iv_use_delayed:
-            ib.reqMarketDataType(3)  # bereits bekannt: kein OPRA → direkt Delayed
-        else:
-            ib.reqMarketDataType(1)
-        t_opt = ib.reqMktData(opt_con, '', False, False)
-
-        def _valid_iv(v) -> bool:
-            try:
-                return v is not None and v > 0 and not _math.isnan(v)
-            except Exception:
-                return False
+        global _iv_use_delayed, _iv_yf_only, _iv_yf_hits
 
         iv = None
-        for _ in range(10):  # max 5s — IBKR braucht bei stark gehandelten Symbolen bis 3s
-            await asyncio.sleep(0.5)
-            # Versuch 1: bidGreeks / askGreeks — kommen direkt aus OPRA, kein Underlying nötig
-            for grk_attr in ('bidGreeks', 'askGreeks'):
-                grk = getattr(t_opt, grk_attr, None)
-                if grk:
-                    iv_raw = getattr(grk, 'impliedVol', None)
-                    if _valid_iv(iv_raw):
-                        iv = float(iv_raw)
-                        break
-            if iv:
-                break
-            # Versuch 2: modelGreeks (wird nur geliefert wenn IBKR Underlying-Preis kennt)
-            mg = getattr(t_opt, 'modelGreeks', None)
-            if mg:
-                iv_raw = getattr(mg, 'impliedVol', None)
-                if _valid_iv(iv_raw):
-                    iv = float(iv_raw)
-                    break
-            # Versuch 3: OPRA Bid/Ask vorhanden → echte IV per BS-Bisektion rückrechnen
-            bid = getattr(t_opt, 'bid', None)
-            ask = getattr(t_opt, 'ask', None)
-            if _valid_iv(bid) and _valid_iv(ask):
-                mid_price = (bid + ask) / 2.0
-                T_years   = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
-                iv_bs = _bs_iv_from_price(price, strike, T_years, mid_price)
-                if iv_bs:
-                    iv = iv_bs
-                    break
 
-        await asyncio.sleep(0.2)
-        try:
-            ib.cancelMktData(t_opt)
-        except Exception:
-            pass
+        # ── IB-Pfad (übersprungen wenn bekannt nutzlos) ──────────────────────────
+        if not _iv_yf_only:
+            # Echter ATM-Strike: nächster Strike zum aktuellen Kurs
+            strike = min(strikes, key=lambda s: abs(s - price))
 
-        # Kein IV via Type 1 → Fallback auf Type 3 + Flag für Session setzen
-        if not iv and not _iv_use_delayed:
-            ib.reqMarketDataType(3)
-            t_opt3 = ib.reqMktData(opt_con, '', False, False)
-            for _ in range(10):
-                await asyncio.sleep(0.5)
-                for grk_attr in ('bidGreeks', 'askGreeks', 'modelGreeks'):
-                    grk = getattr(t_opt3, grk_attr, None)
-                    if grk:
-                        iv_raw = getattr(grk, 'impliedVol', None)
-                        if _valid_iv(iv_raw):
-                            iv = float(iv_raw)
+            # Expiry ~38 DTE
+            today = datetime.now()
+            exp = min(expiries, key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38))
+            if (datetime.strptime(exp, '%Y%m%d') - today).days >= 7:
+                opt_con = Option(symbol, exp, strike, 'P', 'SMART')
+                await ib.qualifyContractsAsync(opt_con)
+
+                # Wenn ATM-Strike für diese Expiry nicht existiert → bis zu 4 nächste Strikes versuchen
+                if not opt_con.conId:
+                    alt_strikes = sorted(strikes, key=lambda s: abs(s - price))[:5]
+                    for alt_s in alt_strikes:
+                        if alt_s == strike:
+                            continue
+                        opt_alt = Option(symbol, exp, alt_s, 'P', 'SMART')
+                        await ib.qualifyContractsAsync(opt_alt)
+                        if opt_alt.conId:
+                            opt_con = opt_alt
+                            strike = alt_s
                             break
-                if iv:
-                    break
-                bid3 = getattr(t_opt3, 'bid', None)
-                ask3 = getattr(t_opt3, 'ask', None)
-                if _valid_iv(bid3) and _valid_iv(ask3):
-                    T_y = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
-                    iv_bs = _bs_iv_from_price(price, strike, T_y, (bid3 + ask3) / 2.0)
-                    if iv_bs:
-                        iv = iv_bs
-                        break
-            await asyncio.sleep(0.2)
-            try:
-                ib.cancelMktData(t_opt3)
-            except Exception:
-                pass
-            if iv:
-                if not _iv_use_delayed:
-                    _iv_use_delayed = True
-                    log(f"   ℹ️  OPRA Type 1 ohne Daten — wechsle dauerhaft auf Type 3 (Delayed) für IV")
-                log(f"   [IV {symbol}] Type-3: IV={iv:.1%} (strike={strike})")
 
-        # ── Fallback 3: yfinance Options-Chain (Demo / kein IB-Optionsdaten-Abo) ──
+                if opt_con.conId:
+                    if _iv_use_delayed:
+                        ib.reqMarketDataType(3)
+                    else:
+                        ib.reqMarketDataType(1)
+                    t_opt = ib.reqMktData(opt_con, '', False, False)
+
+                    def _valid_iv(v) -> bool:
+                        try:
+                            return v is not None and v > 0 and not _math.isnan(v)
+                        except Exception:
+                            return False
+
+                    for _ in range(10):  # max 5s
+                        await asyncio.sleep(0.5)
+                        for grk_attr in ('bidGreeks', 'askGreeks'):
+                            grk = getattr(t_opt, grk_attr, None)
+                            if grk:
+                                iv_raw = getattr(grk, 'impliedVol', None)
+                                if _valid_iv(iv_raw):
+                                    iv = float(iv_raw)
+                                    break
+                        if iv:
+                            break
+                        mg = getattr(t_opt, 'modelGreeks', None)
+                        if mg:
+                            iv_raw = getattr(mg, 'impliedVol', None)
+                            if _valid_iv(iv_raw):
+                                iv = float(iv_raw)
+                                break
+                        bid = getattr(t_opt, 'bid', None)
+                        ask = getattr(t_opt, 'ask', None)
+                        if _valid_iv(bid) and _valid_iv(ask):
+                            mid_price = (bid + ask) / 2.0
+                            T_years   = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
+                            iv_bs = _bs_iv_from_price(price, strike, T_years, mid_price)
+                            if iv_bs:
+                                iv = iv_bs
+                                break
+
+                    await asyncio.sleep(0.2)
+                    try:
+                        ib.cancelMktData(t_opt)
+                    except Exception:
+                        pass
+
+                    # Kein IV via Type 1 → Fallback auf Type 3
+                    if not iv and not _iv_use_delayed:
+                        ib.reqMarketDataType(3)
+                        t_opt3 = ib.reqMktData(opt_con, '', False, False)
+                        for _ in range(10):
+                            await asyncio.sleep(0.5)
+                            for grk_attr in ('bidGreeks', 'askGreeks', 'modelGreeks'):
+                                grk = getattr(t_opt3, grk_attr, None)
+                                if grk:
+                                    iv_raw = getattr(grk, 'impliedVol', None)
+                                    if _valid_iv(iv_raw):
+                                        iv = float(iv_raw)
+                                        break
+                            if iv:
+                                break
+                            bid3 = getattr(t_opt3, 'bid', None)
+                            ask3 = getattr(t_opt3, 'ask', None)
+                            if _valid_iv(bid3) and _valid_iv(ask3):
+                                T_y = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
+                                iv_bs = _bs_iv_from_price(price, strike, T_y, (bid3 + ask3) / 2.0)
+                                if iv_bs:
+                                    iv = iv_bs
+                                    break
+                        await asyncio.sleep(0.2)
+                        try:
+                            ib.cancelMktData(t_opt3)
+                        except Exception:
+                            pass
+                        if iv:
+                            if not _iv_use_delayed:
+                                _iv_use_delayed = True
+                                log(f"   ℹ️  OPRA Type 1 ohne Daten — wechsle dauerhaft auf Type 3 (Delayed) für IV")
+                            log(f"   [IV {symbol}] Type-3: IV={iv:.1%} (strike={strike})")
+
+        # ── Fallback: yfinance Options-Chain (Demo / kein IB-Optionsdaten-Abo) ──
         if not iv:
             try:
                 import yfinance as _yf
@@ -1062,8 +1060,12 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                 iv_yf = await asyncio.wait_for(asyncio.to_thread(_yf_iv), timeout=12)
                 if iv_yf:
                     iv = iv_yf
-            except Exception:
-                pass
+                    _iv_yf_hits += 1
+                    log(f"   [IV {symbol}] yf-Chain: IV={iv:.1%}")
+                else:
+                    log(f"   [IV {symbol}] yf-Chain: kein IV für {symbol}")
+            except Exception as _e:
+                log(f"   [IV {symbol}] yf-Chain Fehler: {_e}")
 
         return (None, iv) if (iv and iv > 0) else (None, None)
 
@@ -3039,8 +3041,10 @@ async def run_bot(stop_event: threading.Event = None):
                     no_iv.remove(sym)
             # Nur abgelaufene / unbekannte IV via OPRA holen
             if no_iv:
-                log(f"   IV für {len(no_iv)} Symbole (OPRA ATM-Put, Type 1) ...")
+                _iv_src = "yf-Chain direkt" if _iv_yf_only else "OPRA ATM-Put, Type 1"
+                log(f"   IV für {len(no_iv)} Symbole ({_iv_src}) ...")
                 _sem_iv = asyncio.Semaphore(5)
+                _iv_yf_hits_before = _iv_yf_hits
                 async def _iv_fill(sym):
                     async with _sem_iv:
                         _known_price = ib_price_data.get(sym, (0.0, None))[0] or 0.0
@@ -3051,6 +3055,12 @@ async def run_bot(stop_event: threading.Event = None):
                         _iv_cache[sym] = (yf_iv, _time.time())
                 await asyncio.gather(*[_iv_fill(s) for s in no_iv],
                                      return_exceptions=True)
+                # Wenn in diesem Scan die meisten IV via yfinance kamen (IB taugt nichts) → direkt yfinance
+                _iv_yf_this_scan = _iv_yf_hits - _iv_yf_hits_before
+                if not _iv_yf_only and _iv_yf_this_scan >= max(1, len(no_iv) // 2):
+                    _iv_yf_only = True
+                    log(f"   ℹ️  IB liefert kein IV ({_iv_yf_this_scan}/{len(no_iv)} via yfinance)"
+                        f" — wechsle dauerhaft auf yfinance Options-Chain")
 
             # ── Phase 1d: News-Check und Signal-Berechnung für Trigger ───────
             _sem_news = asyncio.Semaphore(5)
