@@ -3041,6 +3041,7 @@ async def run_bot(stop_event: threading.Event = None):
                     no_iv.remove(sym)
             # Nur abgelaufene / unbekannte IV via OPRA holen
             if no_iv:
+                global _iv_yf_only, _iv_yf_hits
                 _iv_src = "yf-Chain direkt" if _iv_yf_only else "OPRA ATM-Put, Type 1"
                 log(f"   IV für {len(no_iv)} Symbole ({_iv_src}) ...")
                 _sem_iv = asyncio.Semaphore(5)
