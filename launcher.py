@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.6": [
+        "🐛  IV-Fetch: Aktienkurs aus yfinance wird direkt übergeben — kein doppelter (leerer) IB-Cache-Lookup mehr",
+    ],
     "3.2.5": [
         "🆕  IV-Auto-Erkennung: Bot erkennt automatisch ob OPRA Type 1 verfügbar ist — wechselt dauerhaft auf Type 3 (Delayed) wenn nicht (kein manueller Config-Eintrag nötig)",
     ],

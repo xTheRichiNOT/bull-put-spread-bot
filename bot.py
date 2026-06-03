@@ -895,8 +895,9 @@ async def get_market_data(symbol, ib=None):
     return await _get_market_data_yf(symbol)
 
 
-async def _get_market_data_yf(symbol, ib=None):
-    """IV via OPRA (Type 1): ATM-Strike aus Cache-Preis, impliedVolatility → modelGreeks → Bid/Ask-Fallback."""
+async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
+    """IV via OPRA/Delayed: ATM-Strike aus Kurs, impliedVolatility → modelGreeks → Bid/Ask-Fallback.
+    price_hint: bereits bekannter Aktienkurs (z.B. aus yfinance) — vermeidet doppelten IB-Cache-Lookup."""
     import math as _math
 
     if ib is None or not ib.isConnected() or symbol not in _strike_map:
@@ -909,7 +910,7 @@ async def _get_market_data_yf(symbol, ib=None):
         if not strikes or not expiries:
             return None, None
 
-        # Aktienkurs aus Hintergrund-Cache (Type-4-Stream) — kein Extra-API-Call
+        # Aktienkurs: IB-Cache primär, dann übergebener Hint (yfinance), kein Extra-API-Call
         price = None
         for t in ib.tickers():
             if t.contract and t.contract.symbol == symbol and t.contract.secType == 'STK':
@@ -921,6 +922,8 @@ async def _get_market_data_yf(symbol, ib=None):
                         break
                 if price:
                     break
+        if (not price or price <= 0) and price_hint > 0:
+            price = price_hint  # yfinance-Preis aus _yf_stock_scan verwenden
         if not price or price <= 0:
             return None, None
 
@@ -3020,7 +3023,8 @@ async def run_bot(stop_event: threading.Event = None):
                 _sem_iv = asyncio.Semaphore(5)
                 async def _iv_fill(sym):
                     async with _sem_iv:
-                        _, yf_iv = await _get_market_data_yf(sym, ib)
+                        _known_price = ib_price_data.get(sym, (0.0, None))[0] or 0.0
+                        _, yf_iv = await _get_market_data_yf(sym, ib, price_hint=_known_price)
                     if yf_iv is not None:
                         p, _ = ib_price_data[sym]
                         ib_price_data[sym] = (p, yf_iv)
