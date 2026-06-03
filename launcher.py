@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.4": [
+        "🐛  IV-Fallback Type 3 (Delayed): wenn OPRA Type 1 kein IV liefert (Demo ohne OPRA-Abo), wird automatisch auf Delayed-Greeks umgestellt",
+    ],
     "3.2.3": [
         "🐛  Bear-Put-Guard: Trade wird abgebrochen wenn Short-Strike ≤ Long-Strike — verhindert versehentliche Bear Put Spreads",
         "🐛  Entry-Reload-Schwelle: Positionen mit entry_per_share < $0.10 werden neu aus IB geladen (verhindert $0.01-Phantompreise)",

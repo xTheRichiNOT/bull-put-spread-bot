@@ -952,7 +952,8 @@ async def _get_market_data_yf(symbol, ib=None):
             log(f"   [IV-DBG {symbol}] kein Contract: strike={strike} exp={exp} — Strike für diese Expiry nicht verfügbar")
             return None, None
 
-        ib.reqMarketDataType(1)  # OPRA Echtzeit für Optionen
+        # Type 1 (Live/OPRA) — auf Demo-Konten ohne OPRA-Abo Type 3 (Delayed) als Fallback
+        ib.reqMarketDataType(1)
         t_opt = ib.reqMktData(opt_con, '', False, False)
 
         def _valid_iv(v) -> bool:
@@ -992,17 +993,49 @@ async def _get_market_data_yf(symbol, ib=None):
                     iv = iv_bs
                     break
 
-        await asyncio.sleep(0.2)  # Puffer vor Cancel — verhindert Error 300
+        await asyncio.sleep(0.2)
         try:
             ib.cancelMktData(t_opt)
         except Exception:
             pass
 
-        if not iv:
-            _bid = getattr(t_opt, 'bid', None)
-            _ask = getattr(t_opt, 'ask', None)
-            log(f"   [IV-DBG {symbol}] Stream offen, kein Tick: bid={_bid} ask={_ask} "
-                f"(strike={strike} exp={exp})")
+        # Kein IV via Type 1 → Fallback auf Type 3 (Delayed) — nur auf Demo/Paper-Konten
+        # (DU-Prefix = IB Paper, live_market_data=False = Demo ohne OPRA-Abo)
+        _no_opra = ACCOUNT_ID.upper().startswith('DU') or not _cfg.get('live_market_data', True)
+        if not iv and _no_opra:
+            ib.reqMarketDataType(3)
+            t_opt3 = ib.reqMktData(opt_con, '', False, False)
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                for grk_attr in ('bidGreeks', 'askGreeks', 'modelGreeks'):
+                    grk = getattr(t_opt3, grk_attr, None)
+                    if grk:
+                        iv_raw = getattr(grk, 'impliedVol', None)
+                        if _valid_iv(iv_raw):
+                            iv = float(iv_raw)
+                            break
+                if iv:
+                    break
+                bid3 = getattr(t_opt3, 'bid', None)
+                ask3 = getattr(t_opt3, 'ask', None)
+                if _valid_iv(bid3) and _valid_iv(ask3):
+                    T_y = (datetime.strptime(exp, '%Y%m%d') - datetime.now()).days / 365.0
+                    iv_bs = _bs_iv_from_price(price, strike, T_y, (bid3 + ask3) / 2.0)
+                    if iv_bs:
+                        iv = iv_bs
+                        break
+            await asyncio.sleep(0.2)
+            try:
+                ib.cancelMktData(t_opt3)
+            except Exception:
+                pass
+            if iv:
+                log(f"   [IV {symbol}] Type-3-Fallback: IV={iv:.1%} (strike={strike})")
+            else:
+                _bid = getattr(t_opt3, 'bid', None)
+                _ask = getattr(t_opt3, 'ask', None)
+                log(f"   [IV-DBG {symbol}] Kein Tick (Type1+3): bid={_bid} ask={_ask} "
+                    f"(strike={strike} exp={exp})")
 
         return (None, iv) if (iv and iv > 0) else (None, None)
 
