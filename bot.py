@@ -3030,24 +3030,17 @@ async def run_bot(stop_event: threading.Event = None):
                         sec = SECTOR_MAP.get(s, 'Unbekannt')
                         sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
-                # Margin-Check: reqAccountSummaryAsync → Cache → Paper-Fallback
+                # Margin-Check: IB-Cache (accountValues) — keine neue Subscription pro Zyklus
+                # reqAccountSummaryAsync() erzeugt jedes Mal eine neue IB-Subscription →
+                # Error 322 "Maximum number of account summary requests exceeded" nach wenigen Zyklen.
                 _is_paper_acct = ACCOUNT_ID.upper().startswith('DU')
                 available = 0.0
                 try:
-                    summary = await asyncio.wait_for(ib.reqAccountSummaryAsync(), timeout=10)
-                    # Kein Währungsfilter — Paper-Konten liefern teils BASE, USD oder leere Felder
-                    av = {v.tag: v.value for v in summary if v.account == ACCOUNT_ID}
-                    raw = (av.get('AvailableFunds') or av.get('AvailableFunds-S')
-                           or av.get('NetLiquidation') or av.get('TotalCashValue') or '0')
+                    cached_vals = {v.tag: v.value for v in ib.accountValues()
+                                   if v.account == ACCOUNT_ID}
+                    raw = (cached_vals.get('AvailableFunds') or cached_vals.get('AvailableFunds-S')
+                           or cached_vals.get('NetLiquidation') or cached_vals.get('TotalCashValue') or '0')
                     available = float(raw)
-
-                    if available <= 0:
-                        # Fallback: lokaler TWS-Cache
-                        cached_vals = {v.tag: v.value for v in ib.accountValues()
-                                       if v.account == ACCOUNT_ID}
-                        raw2 = (cached_vals.get('AvailableFunds') or cached_vals.get('TotalCashValue')
-                                or cached_vals.get('NetLiquidation') or '0')
-                        available = float(raw2)
                 except Exception:
                     log(f"  ⚠️  Kapital-Abfrage fehlgeschlagen — überspringe Margin-Check")
 

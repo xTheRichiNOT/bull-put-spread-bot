@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.1.9": [
+        "🐛  Error 322 behoben: Kapital-Abfrage nutzt jetzt IB-Cache (accountValues) statt reqAccountSummaryAsync — keine neue Subscription pro Zyklus mehr",
+    ],
     "3.1.8": [
         "🐛  Market-Closed-Check jetzt VOR Cancel-Phase — Bracket-Orders bleiben intakt wenn Markt zu ist",
         "🐛  Position landet in exit_retry bis Marktöffnung statt nackt (ohne TP/SL) zu warten",
