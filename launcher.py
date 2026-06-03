@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.2": [
+        "🆕  Portfolio: Spalte 'Typ' zeigt Bull Put / Bear Put — abgeleitet aus Short/Long-Strike (Positionen- und Trades-Tab)",
+    ],
     "3.2.1": [
         "🐛  Keine Preisdaten: yfinance-Fallback für Symbole die IB-Streaming nicht liefert (Demo-Account / Daten-Farm down)",
     ],
@@ -1359,7 +1362,7 @@ class BotLauncher(ctk.CTk):
 
         pos_cols = ctk.CTkFrame(pos_frame, fg_color=C["header"], corner_radius=0)
         pos_cols.pack(fill="x", padx=10, pady=(2, 0))
-        for col, w in [("Symbol", 70), ("Expiry", 90), ("DTE", 45),
+        for col, w in [("Symbol", 70), ("Typ", 75), ("Expiry", 90), ("DTE", 45),
                        ("Short", 65), ("Long", 65),
                        ("Credit", 70), ("TP-Ziel", 70), ("Akt. P&L", 80), ("Status", 80)]:
             ctk.CTkLabel(pos_cols, text=col, width=w,
@@ -1398,7 +1401,7 @@ class BotLauncher(ctk.CTk):
 
         hist_hdr = ctk.CTkFrame(hist_frame, fg_color=C["header"], corner_radius=0)
         hist_hdr.pack(fill="x", padx=10, pady=(4, 0))
-        for col, w in [("Datum", 130), ("Symbol", 70), ("Expiry", 90),
+        for col, w in [("Datum", 130), ("Symbol", 70), ("Typ", 75), ("Expiry", 90),
                        ("Short", 65), ("Long", 65),
                        ("Credit", 70), ("Exit", 70), ("P&L", 75), ("Status", 70)]:
             ctk.CTkLabel(hist_hdr, text=col, width=w,
@@ -1593,6 +1596,10 @@ class BotLauncher(ctk.CTk):
             row = ctk.CTkFrame(self._pos_scroll, fg_color=row_col, corner_radius=5)
             row.pack(fill="x", padx=4, pady=2)
             lbl(row, p.get("symbol", "–"), 70, C["accent"])
+            _ss = p.get("short_strike", 0) or 0
+            _ls = p.get("long_strike",  0) or 0
+            _typ = "Bull Put" if _ss > _ls else ("Bear Put" if _ls > _ss else "Put Spread")
+            lbl(row, _typ, 75, "#a78bfa")
             lbl(row, p.get("expiry", "–"), 90)
             dte = p.get("dte", 0)
             dte_col = "#ef4444" if dte <= 7 else ("#f59e0b" if dte <= 21 else C["text"])
@@ -1743,6 +1750,10 @@ class BotLauncher(ctk.CTk):
             row.pack(fill="x", padx=4, pady=2)
             lbl(row, t.get("closed_at", "–"), 130)
             lbl(row, t.get("symbol", "–"), 70, C["accent"])
+            _tss = t.get("short_strike", 0) or 0
+            _tls = t.get("long_strike",  0) or 0
+            _ttyp = "Bull Put" if _tss > _tls else ("Bear Put" if _tls > _tss else "Put Spread")
+            lbl(row, _ttyp, 75, "#a78bfa")
             lbl(row, t.get("expiry", "–"), 90)
             lbl(row, f"${t.get('short_strike', 0):.0f}", 65)
             lbl(row, f"${t.get('long_strike', 0):.0f}", 65)
