@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.1": [
+        "🐛  Keine Preisdaten: yfinance-Fallback für Symbole die IB-Streaming nicht liefert (Demo-Account / Daten-Farm down)",
+    ],
     "3.2.0": [
         "🐛  Keine Preisdaten nach Reconnect behoben: Hintergrund-Streams werden nach IB-Reconnect automatisch neu gestartet",
         "🐛  Sicherheitsnetz: leerer Ticker-Cache beim Scan startet Streams automatisch neu",

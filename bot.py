@@ -1012,30 +1012,55 @@ async def _get_market_data_yf(symbol, ib=None):
     return None, None
 
 async def _yf_stock_scan(symbols: list, ib=None) -> dict:
-    """Liest Aktienkurse aus dem Hintergrund-Cache — kein API-Aufruf, <0.1s."""
+    """Aktienkurse: IB-Cache primär, yfinance-Fallback für fehlende Symbole."""
     import math as _math
-    if ib is None or not ib.isConnected():
-        return {}
     results = {}
-    try:
-        cache = {t.contract.symbol: t for t in ib.tickers()
-                 if t.contract and t.contract.secType == 'STK'}
-        for sym in symbols:
-            t = cache.get(sym)
-            if t is None:
-                continue
-            # Live-Felder zuerst (falls vorhanden), dann Delayed-Felder (Type 4 liefert delayedLast/delayedClose)
-            price = None
-            for val in [t.last, t.close,
-                        getattr(t, 'delayedLast',  None),
-                        getattr(t, 'delayedClose', None)]:
-                if val is not None and val > 0 and not _math.isnan(val):
-                    price = float(val)
-                    break
-            if price:
-                results[sym] = (price, None)
-    except Exception:
-        pass
+
+    # ── Primär: IB-Ticker-Cache (Type-4-Stream, <0.1s) ─────────────────────
+    if ib is not None and ib.isConnected():
+        try:
+            cache = {t.contract.symbol: t for t in ib.tickers()
+                     if t.contract and t.contract.secType == 'STK'}
+            for sym in symbols:
+                t = cache.get(sym)
+                if t is None:
+                    continue
+                price = None
+                for val in [t.last, t.close,
+                            getattr(t, 'delayedLast',  None),
+                            getattr(t, 'delayedClose', None)]:
+                    if val is not None and val > 0 and not _math.isnan(val):
+                        price = float(val)
+                        break
+                if price:
+                    results[sym] = (price, None)
+        except Exception:
+            pass
+
+    # ── Fallback: yfinance für Symbole die IB nicht liefert ─────────────────
+    missing = [s for s in symbols if s not in results]
+    if missing:
+        import yfinance as _yf
+        _sem_yf = asyncio.Semaphore(8)
+
+        async def _fetch_yf(sym):
+            async with _sem_yf:
+                try:
+                    def _get():
+                        t = _yf.Ticker(sym)
+                        info = t.fast_info
+                        return getattr(info, 'last_price', None) or getattr(info, 'previous_close', None)
+                    price = await asyncio.wait_for(asyncio.to_thread(_get), timeout=8)
+                    if price and price > 0:
+                        results[sym] = (float(price), None)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[_fetch_yf(s) for s in missing], return_exceptions=True)
+        yf_count = sum(1 for s in missing if s in results)
+        if yf_count:
+            log(f"   📡 {yf_count}/{len(missing)} Preise via yfinance-Fallback")
+
     return results
 
 
