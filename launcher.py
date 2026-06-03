@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.0": [
+        "🐛  Keine Preisdaten nach Reconnect behoben: Hintergrund-Streams werden nach IB-Reconnect automatisch neu gestartet",
+        "🐛  Sicherheitsnetz: leerer Ticker-Cache beim Scan startet Streams automatisch neu",
+    ],
     "3.1.9": [
         "🐛  Error 322 behoben: Kapital-Abfrage nutzt jetzt IB-Cache (accountValues) statt reqAccountSummaryAsync — keine neue Subscription pro Zyklus mehr",
     ],

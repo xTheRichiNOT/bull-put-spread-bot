@@ -2888,6 +2888,7 @@ async def run_bot(stop_event: threading.Event = None):
                     await ib.reqAllOpenOrdersAsync()
                     await asyncio.sleep(1.0)
                     log("  ✅ IB-State nach Reconnect synchronisiert")
+                    await start_background_streaming(WATCHLIST, ib)
                 else:
                     log("  ❌ Reconnect fehlgeschlagen — nur Exit-Monitoring (ohne IB-Daten)")
 
@@ -2922,6 +2923,13 @@ async def run_bot(stop_event: threading.Event = None):
             ib_price_data: dict = await _yf_stock_scan(WATCHLIST, ib)
             elapsed = (datetime.now() - t0).total_seconds()
             log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
+
+            # Sicherheitsnetz: wenn Cache leer → Streams wurden wohl nicht (re)initialisiert
+            if len(ib_price_data) == 0 and ib and ib.isConnected():
+                log("  ⚠️  Ticker-Cache leer — starte Hintergrund-Streams neu ...")
+                await start_background_streaming(WATCHLIST, ib)
+                ib_price_data = await _yf_stock_scan(WATCHLIST, ib)
+                log(f"   🔄 Nach Stream-Neustart: {len(ib_price_data)}/{len(WATCHLIST)} Preise")
 
             # ── Phase 1c: IV via Cache + yfinance-Fallback (TTL 5min) ──────────
             # IV ändert sich langsam → Cache verhindert yfinance-Spam jeden Scan-Zyklus
