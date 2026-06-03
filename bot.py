@@ -449,6 +449,7 @@ _strike_map: dict = {}
 # IV-Cache: {symbol: (iv, timestamp)} — verhindert yfinance-Spam bei jedem Scan-Zyklus
 _iv_cache: dict = {}
 _IV_CACHE_TTL = 300  # Sekunden (5 Minuten)
+_iv_use_delayed: bool = False  # True wenn Type 1 kein IV liefert → automatisch Type 3
 
 # yfinance Rate-Limit Cooldown — wenn gesperrt, 10 Min direkt zu IB springen
 _yf_blocked_until: float = 0.0
@@ -952,8 +953,11 @@ async def _get_market_data_yf(symbol, ib=None):
             log(f"   [IV-DBG {symbol}] kein Contract: strike={strike} exp={exp} — Strike für diese Expiry nicht verfügbar")
             return None, None
 
-        # Type 1 (Live/OPRA) — auf Demo-Konten ohne OPRA-Abo Type 3 (Delayed) als Fallback
-        ib.reqMarketDataType(1)
+        global _iv_use_delayed
+        if _iv_use_delayed:
+            ib.reqMarketDataType(3)  # bereits bekannt: kein OPRA → direkt Delayed
+        else:
+            ib.reqMarketDataType(1)
         t_opt = ib.reqMktData(opt_con, '', False, False)
 
         def _valid_iv(v) -> bool:
@@ -999,10 +1003,8 @@ async def _get_market_data_yf(symbol, ib=None):
         except Exception:
             pass
 
-        # Kein IV via Type 1 → Fallback auf Type 3 (Delayed) — nur auf Demo/Paper-Konten
-        # (DU-Prefix = IB Paper, live_market_data=False = Demo ohne OPRA-Abo)
-        _no_opra = ACCOUNT_ID.upper().startswith('DU') or not _cfg.get('live_market_data', True)
-        if not iv and _no_opra:
+        # Kein IV via Type 1 → Fallback auf Type 3 + Flag für Session setzen
+        if not iv and not _iv_use_delayed:
             ib.reqMarketDataType(3)
             t_opt3 = ib.reqMktData(opt_con, '', False, False)
             for _ in range(10):
@@ -1030,7 +1032,10 @@ async def _get_market_data_yf(symbol, ib=None):
             except Exception:
                 pass
             if iv:
-                log(f"   [IV {symbol}] Type-3-Fallback: IV={iv:.1%} (strike={strike})")
+                if not _iv_use_delayed:
+                    _iv_use_delayed = True
+                    log(f"   ℹ️  OPRA Type 1 ohne Daten — wechsle dauerhaft auf Type 3 (Delayed) für IV")
+                log(f"   [IV {symbol}] Type-3: IV={iv:.1%} (strike={strike})")
             else:
                 _bid = getattr(t_opt3, 'bid', None)
                 _ask = getattr(t_opt3, 'ask', None)
