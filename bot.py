@@ -2157,6 +2157,13 @@ async def place_order(ib, sig):
         # Mutex: alle Order-Aktionen für dieses Symbol serialisiert
         # (verhindert Error 201: Entry/Exit/Breakeven dürfen nie gleichzeitig Orders senden)
         async with _sym_lock(sym):
+            # Sicherheitsprüfung: Short-Strike muss ÜBER Long-Strike liegen (Bull Put Spread)
+            # Bear Put Spread (Short < Long) würde einen Debit-Trade erzeugen — blockieren
+            if sig['short_strike'] <= sig['long_strike']:
+                log(f"  ❌ [{sym}] Strike-Fehler: Short={sig['short_strike']} ≤ Long={sig['long_strike']}"
+                    f" — kein Bull Put Spread möglich, Trade abgebrochen")
+                return
+
             short_contract = Option(sym, sig['expiry_ib'], sig['short_strike'], 'P', 'SMART')
             long_contract  = Option(sym, sig['expiry_ib'], sig['long_strike'],  'P', 'SMART')
 
@@ -2740,8 +2747,9 @@ async def run_bot(stop_event: threading.Event = None):
 
         for sym, legs in put_by_sym.items():
             existing = _bot_trades.get(sym, {})
-            # Überspringen nur wenn bereits ein valider Einstiegspreis bekannt ist
-            if existing.get('entry_per_share', 0) > 0:
+            # Überspringen nur wenn bereits ein valider Einstiegspreis bekannt ist (≥$0.10)
+            # Positionen mit $0.01-Entry (avgCost=0-Fallback) werden neu aus IB geladen
+            if existing.get('entry_per_share', 0) >= 0.10:
                 continue
             short_legs = [p for p in legs if p.position < 0]
             long_legs  = [p for p in legs if p.position > 0]

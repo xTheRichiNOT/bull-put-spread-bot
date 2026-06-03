@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.3": [
+        "🐛  Bear-Put-Guard: Trade wird abgebrochen wenn Short-Strike ≤ Long-Strike — verhindert versehentliche Bear Put Spreads",
+        "🐛  Entry-Reload-Schwelle: Positionen mit entry_per_share < $0.10 werden neu aus IB geladen (verhindert $0.01-Phantompreise)",
+    ],
     "3.2.2": [
         "🆕  Portfolio: Spalte 'Typ' zeigt Bull Put / Bear Put — abgeleitet aus Short/Long-Strike (Positionen- und Trades-Tab)",
     ],
