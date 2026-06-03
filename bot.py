@@ -1039,11 +1039,31 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                     _iv_use_delayed = True
                     log(f"   ℹ️  OPRA Type 1 ohne Daten — wechsle dauerhaft auf Type 3 (Delayed) für IV")
                 log(f"   [IV {symbol}] Type-3: IV={iv:.1%} (strike={strike})")
-            else:
-                _bid = getattr(t_opt3, 'bid', None)
-                _ask = getattr(t_opt3, 'ask', None)
-                log(f"   [IV-DBG {symbol}] Kein Tick (Type1+3): bid={_bid} ask={_ask} "
-                    f"(strike={strike} exp={exp})")
+
+        # ── Fallback 3: yfinance Options-Chain (Demo / kein IB-Optionsdaten-Abo) ──
+        if not iv:
+            try:
+                import yfinance as _yf
+                from datetime import timedelta as _td
+                def _yf_iv():
+                    _t    = _yf.Ticker(symbol)
+                    _exps = _t.options
+                    if not _exps:
+                        return None
+                    _tgt  = datetime.now() + _td(days=38)
+                    _best = min(_exps,
+                                key=lambda e: abs((datetime.strptime(e, '%Y-%m-%d') - _tgt).days))
+                    _puts = _t.option_chain(_best).puts
+                    if _puts.empty:
+                        return None
+                    _row  = _puts.iloc[(_puts['strike'] - price).abs().argsort()[:1]]
+                    _val  = float(_row['impliedVolatility'].values[0])
+                    return _val if _val > 0 else None
+                iv_yf = await asyncio.wait_for(asyncio.to_thread(_yf_iv), timeout=12)
+                if iv_yf:
+                    iv = iv_yf
+            except Exception:
+                pass
 
         return (None, iv) if (iv and iv > 0) else (None, None)
 

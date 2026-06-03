@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.7": [
+        "🐛  IV-Fallback 3: yfinance Options-Chain als letzter Ausweg wenn IB (Type 1+3) keine Options-Daten liefert",
+    ],
     "3.2.6": [
         "🐛  IV-Fetch: Aktienkurs aus yfinance wird direkt übergeben — kein doppelter (leerer) IB-Cache-Lookup mehr",
     ],
