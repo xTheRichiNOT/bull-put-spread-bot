@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.21": [
+        "🐛  Shadow-Analyse: platzierte Trades wurden nicht erkannt ('taken' statt 'placed')",
+    ],
     "3.2.20": [
         "🐛  Fenster: kein Flackern beim Start mehr — UI wird versteckt gebaut, dann direkt maximiert angezeigt",
     ],

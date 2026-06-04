@@ -31,7 +31,7 @@ with open(PATH, encoding="utf-8") as f:
             continue
         try:
             d = json.loads(line)
-            if d.get("type") == "placed":
+            if d.get("type") in ("placed", "taken"):
                 placed.append(d)
             else:
                 rejected.append(d)
