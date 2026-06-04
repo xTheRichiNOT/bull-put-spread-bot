@@ -3,9 +3,14 @@ Bull Put Spread Bot – Setup / Installer
 Lädt die aktuelle Version herunter, installiert Abhängigkeiten und legt
 eine Desktop-Verknüpfung an.
 """
-import os, sys, subprocess, urllib.request, shutil, threading, winreg
+import os, sys, subprocess, urllib.request, urllib.error, shutil, threading, ssl
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+# SSL-Kontext ohne Zertifikatsprüfung (PyInstaller-Bundle hat keine CA-Zertifikate)
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 VERSION     = "3.2.22"
 REPO_RAW    = "https://raw.githubusercontent.com/xTheRichiNOT/bull-put-spread-bot/main"
@@ -82,7 +87,10 @@ class InstallerUI(tk.Tk):
                     f"Lade {f} …", f"{REPO_RAW}/{f}"))
                 url  = f"{REPO_RAW}/{fname}"
                 dest = os.path.join(INSTALL_DIR, fname)
-                urllib.request.urlretrieve(url, dest)
+                req  = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, context=_SSL_CTX, timeout=30) as r:
+                    with open(dest, "wb") as fout:
+                        fout.write(r.read())
 
             # 3. pip-Abhängigkeiten installieren
             self.after(0, lambda: self._step("Installiere Abhängigkeiten …",
