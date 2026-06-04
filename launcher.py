@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.22": [
+        "🐛  Fenster öffnet wieder — withdraw/deiconify entfernt, after(0) für Maximierung",
+    ],
     "3.2.21": [
         "🐛  Shadow-Analyse: platzierte Trades wurden nicht erkannt ('taken' statt 'placed')",
     ],
@@ -929,7 +932,6 @@ class BotLauncher(ctk.CTk):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
         self.minsize(1060, 580)
-        self.withdraw()  # Fenster verstecken während UI gebaut wird → kein Flackern
 
         self.cfg           = load_config()
         self._stop_event      = None
@@ -937,7 +939,7 @@ class BotLauncher(ctk.CTk):
         self._queue           = queue_module.Queue()
         self._running         = False
         self._intentional_stop = False
-        self._start_time   = None   # für Uptime-Counter
+        self._start_time   = None   # für Uptime-icker
         self._pulse_state  = False
 
         self.configure(fg_color=C["bg"])
@@ -945,18 +947,17 @@ class BotLauncher(ctk.CTk):
         self._build_ui()
         self._poll_queue()
 
-        # Fenster in finaler Größe zeigen — nach _build_ui damit keine Überschreibung
-        self.update_idletasks()
+        # Maximieren nach UI-Build — after(0) stellt sicher dass CTk fertig ist
         if sys.platform == "win32":
-            self.state("zoomed")
+            self.after(0, lambda: self.state("zoomed"))
         else:
+            self.update_idletasks()
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
             w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
             x = (sw - w) // 2
             y = (sh - h) // 2
             self.geometry(f"{w}x{h}+{x}+{y}")
-        self.deiconify()
 
         # Erststart-Wizard wenn noch keine Account-Nummer gesetzt
         if not self.cfg.get("ib_account", "").strip():
