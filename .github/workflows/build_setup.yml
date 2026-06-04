@@ -1,0 +1,52 @@
+name: Build setup.exe
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach exe to (e.g. v3.2.22)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build setup.exe
+        run: |
+          pyinstaller --onefile --windowed --name "BullPutSpreadBot_Setup" `
+            --icon NONE `
+            setup_installer.py
+
+      - name: Upload to release (on release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/BullPutSpreadBot_Setup.exe
+
+      - name: Upload to specific release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          files: dist/BullPutSpreadBot_Setup.exe
+
+      - name: Upload artifact (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BullPutSpreadBot_Setup
+          path: dist/BullPutSpreadBot_Setup.exe
