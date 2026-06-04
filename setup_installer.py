@@ -96,11 +96,12 @@ class InstallerUI(tk.Tk):
             self.after(0, lambda: self._step("Installiere Abhängigkeiten …",
                                              "pip install -r requirements.txt"))
             py = _find_python()
+            _NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             if py:
                 req = os.path.join(INSTALL_DIR, "requirements.txt")
                 subprocess.run([py, "-m", "pip", "install", "-r", req,
                                 "--quiet", "--disable-pip-version-check"],
-                               check=False)
+                               check=False, creationflags=_NO_WIN)
 
             # 4. Desktop-Verknüpfung (.bat)
             self.after(0, lambda: self._step("Erstelle Desktop-Verknüpfung …"))
@@ -126,9 +127,10 @@ class InstallerUI(tk.Tk):
                                "Bot jetzt starten?",
                                icon="info"):
             py = _find_python()
+            _NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             if py:
                 subprocess.Popen([py, os.path.join(INSTALL_DIR, "launcher.py")],
-                                 cwd=INSTALL_DIR)
+                                 cwd=INSTALL_DIR, creationflags=_NO_WIN)
         self.destroy()
 
     def _error(self, exc):
