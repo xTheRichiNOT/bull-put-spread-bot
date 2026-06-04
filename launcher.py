@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.15": [
+        "🐛  Update-Fix: Nebendateien-Fehler blockieren Update nicht mehr — nur Kern-Fehler (bot.py/launcher.py) stoppen den Download",
+        "✨  Fenster-Höhe: max 85% der Bildschirmhöhe (kein Überlappen mehr)",
+    ],
     "3.2.14": [
         "✨  Fenster öffnet breiter (1100px) — Exit-Button in Positionen-Tab immer sichtbar",
     ],
@@ -902,12 +906,12 @@ class BotLauncher(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
-        self.minsize(1060, 620)
-        # Fenster zentriert auf dem Bildschirm platzieren
+        self.minsize(1060, 580)
+        # Fenster zentriert — Breite 1100px, Höhe max 85% des Bildschirms
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        w, h = max(1100, min(1280, sw - 80)), min(780, sh - 80)
+        w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -2136,7 +2140,9 @@ class BotLauncher(ctk.CTk):
 
     def _download_update(self, remote: str):
         """Lädt Update-Dateien herunter (Hintergrund-Thread)."""
+        _CORE = {"bot.py", "launcher.py", "version.txt"}
         errors = []
+        core_ok = True
         total = len(UPDATE_FILES)
         for idx, filename in enumerate(UPDATE_FILES):
             prog = idx / total
@@ -2162,12 +2168,18 @@ class BotLauncher(ctk.CTk):
                         pass
             except Exception as e:
                 errors.append(f"{filename}: {e}")
+                if filename in _CORE:
+                    core_ok = False
 
-        if errors:
+        if not core_ok:
             err_msg = errors[0]
             self.after(0, lambda: self._update_bar_set(
                 f"  ❌  Download fehlgeschlagen: {err_msg}", "#f87171"))
             self.after(10000, lambda: self.after(0, self._update_bar_hide))
+            return
+        if errors:
+            # Nebendateien fehlgeschlagen — trotzdem starten (Kerndateien ok)
+            pass
         else:
             self.after(0, lambda: self._update_bar_set(
                 f"  ✅  Update v{remote} installiert — startet neu...",
