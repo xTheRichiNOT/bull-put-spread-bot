@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.18": [
+        "✨  Backtest: Min. Score (Entry-Schwelle) jetzt als Parameter in beiden Szenarien",
+    ],
     "3.2.17": [
         "✨  Einstellungen: Min. Score in Strategie-Sektion verschoben (kein eigener Abschnitt mehr)",
     ],
@@ -2550,12 +2553,13 @@ class BotLauncher(ctk.CTk):
 
         # ── Parameter-Spalten ─────────────────────────────────────────────────
         BT_DEFS = [
-            ("Take Profit %",    "take_profit",    "take_profit_pct",  0.70),
-            ("DTE-Exit (Tage)",  "dte_exit",       "dte_exit",         0),
-            ("Min IV (HV×1.3)", "min_vola",        "min_vola",         0.28),
-            ("Min Credit $",     "min_credit_abs", "min_credit_abs",   80),
-            ("Stop Loss Mult",   "stop_loss_mult", "stop_loss_mult",   2.0),
-            ("Min Risk/Reward",  "min_risk_reward","min_risk_reward",  0.22),
+            ("Take Profit %",    "take_profit",      "take_profit_pct",  0.70),
+            ("DTE-Exit (Tage)",  "dte_exit",         "dte_exit",         0),
+            ("Min IV (HV×1.3)", "min_vola",          "min_vola",         0.28),
+            ("Min Credit $",     "min_credit_abs",   "min_credit_abs",   80),
+            ("Stop Loss Mult",   "stop_loss_mult",   "stop_loss_mult",   2.0),
+            ("Min Risk/Reward",  "min_risk_reward",  "min_risk_reward",  0.22),
+            ("Min Score",        "entry_threshold",  "entry_threshold",  0.60),
         ]
         self._bt_vals_a = {
             bt_key: self.cfg.get(cfg_key, default)
@@ -2714,6 +2718,7 @@ class BotLauncher(ctk.CTk):
                 bt.MIN_CREDIT_ABS  = float(params["min_credit_abs"])
                 bt.STOP_LOSS_MULT  = float(params["stop_loss_mult"])
                 bt.MIN_RISK_REWARD = float(params["min_risk_reward"])
+                bt.ENTRY_THRESHOLD = float(params["entry_threshold"])
                 tp     = float(params["take_profit"])
                 dte_on = int(float(params["dte_exit"])) > 0
                 trades, daily_pnl = BotLauncher._bt_run_scenario(
@@ -2994,6 +2999,7 @@ class BotLauncher(ctk.CTk):
             ("Min Credit $",    "min_credit_abs"),
             ("Stop Loss Mult",  "stop_loss_mult"),
             ("Min Risk/Reward", "min_risk_reward"),
+            ("Min Score",       "entry_threshold"),
         ]
         for i, (label, key) in enumerate(param_keys):
             r, g, b = (243, 248, 255) if i % 2 == 0 else (255, 255, 255)
