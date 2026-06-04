@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.16": [
+        "✨  Fenster öffnet auf Windows maximiert",
+        "✨  Exit-Dialog im Dark-Mode-Style (kein Windows-Systemdialog mehr)",
+    ],
     "3.2.15": [
         "🐛  Update-Fix: Nebendateien-Fehler blockieren Update nicht mehr — nur Kern-Fehler (bot.py/launcher.py) stoppen den Download",
         "✨  Fenster-Höhe: max 85% der Bildschirmhöhe (kein Überlappen mehr)",
@@ -907,14 +911,17 @@ class BotLauncher(ctk.CTk):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
         self.minsize(1060, 580)
-        # Fenster zentriert — Breite 1100px, Höhe max 85% des Bildschirms
         self.update_idletasks()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        if sys.platform == "win32":
+            # Windows: maximiert starten
+            self.state("zoomed")
+        else:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+            self.geometry(f"{w}x{h}+{x}+{y}")
 
         self.cfg           = load_config()
         self._stop_event      = None
@@ -1708,25 +1715,43 @@ class BotLauncher(ctk.CTk):
                 sym_ref = p.get("symbol", "")
                 def _make_exit_fn(sym):
                     def _do_exit():
-                        import tkinter.messagebox as mb
-                        if not mb.askyesno(
-                                "Position schließen",
-                                f"{sym}: Position jetzt manuell schließen?\n\n"
-                                f"Der Bot sendet eine Exit-Order an IB.",
-                                icon="warning"):
-                            return
-                        cmd_file = os.path.join(_BASE, "close_commands.json")
-                        try:
-                            cmds = []
-                            if os.path.exists(cmd_file):
-                                with open(cmd_file) as _f:
-                                    cmds = json.load(_f)
-                            if sym not in cmds:
-                                cmds.append(sym)
-                            with open(cmd_file, "w") as _f:
-                                json.dump(cmds, _f)
-                        except Exception as _e:
-                            mb.showerror("Fehler", f"Befehl konnte nicht geschrieben werden:\n{_e}")
+                        dlg = ctk.CTkToplevel(self)
+                        dlg.title("Position schließen")
+                        dlg.geometry("360x150")
+                        dlg.resizable(False, False)
+                        dlg.configure(fg_color=C["surface"])
+                        dlg.grab_set()
+                        dlg.lift()
+                        ctk.CTkLabel(
+                            dlg,
+                            text=f"⚠️  {sym}: Position jetzt manuell schließen?\n"
+                                 f"Der Bot sendet eine Exit-Order an IB.",
+                            font=ctk.CTkFont(size=13, weight="bold"),
+                            text_color=C["amber"],
+                            justify="center",
+                        ).pack(pady=(22, 14))
+                        btn_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+                        btn_frame.pack()
+                        def _confirm(s=sym):
+                            dlg.destroy()
+                            cmd_file = os.path.join(_BASE, "close_commands.json")
+                            try:
+                                cmds = []
+                                if os.path.exists(cmd_file):
+                                    with open(cmd_file) as _f:
+                                        cmds = json.load(_f)
+                                if s not in cmds:
+                                    cmds.append(s)
+                                with open(cmd_file, "w") as _f:
+                                    json.dump(cmds, _f)
+                            except Exception:
+                                pass
+                        ctk.CTkButton(btn_frame, text="Ja, schließen", width=140, height=34,
+                                      fg_color="#dc2626", hover_color="#b91c1c",
+                                      command=_confirm).pack(side="left", padx=8)
+                        ctk.CTkButton(btn_frame, text="Abbrechen", width=140, height=34,
+                                      fg_color=C["surface2"], hover_color=C["header"],
+                                      command=dlg.destroy).pack(side="left", padx=8)
                     return _do_exit
                 ctk.CTkButton(
                     row, text="✕ Exit", width=72, height=22,
