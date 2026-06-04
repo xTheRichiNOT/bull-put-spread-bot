@@ -21,12 +21,22 @@ INSTALL_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
 
 
 def _find_python():
-    for cand in [sys.executable,
-                 shutil.which("python"), shutil.which("python3"),
-                 r"C:\Python312\python.exe", r"C:\Python311\python.exe",
-                 r"C:\Python310\python.exe"]:
-        if cand and os.path.isfile(cand):
-            return cand
+    # sys.executable ist im frozen-Modus die Setup-exe selbst — niemals verwenden
+    frozen = getattr(sys, "frozen", False)
+    candidates = []
+    if not frozen:
+        candidates.append(sys.executable)
+    candidates += [
+        shutil.which("python"), shutil.which("python3"),
+        r"C:\Python313\python.exe", r"C:\Python312\python.exe",
+        r"C:\Python311\python.exe", r"C:\Python310\python.exe",
+        r"C:\Python39\python.exe",
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand) and cand.lower().endswith(".exe"):
+            # Sicherstellen dass es wirklich Python ist, nicht die Setup-exe
+            if "setup" not in os.path.basename(cand).lower():
+                return cand
     return None
 
 
