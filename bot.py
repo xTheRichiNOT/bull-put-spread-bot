@@ -1074,10 +1074,12 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
 
     return None, None
 
-async def _yf_stock_scan(symbols: list, ib=None) -> dict:
-    """Aktienkurse: IB-Cache primär, yfinance-Fallback für fehlende Symbole."""
+async def _yf_stock_scan(symbols: list, ib=None) -> tuple:
+    """Aktienkurse: IB-Cache primär, yfinance-Fallback für fehlende Symbole.
+    Gibt (results, ib_count) zurück — ib_count = Anzahl Preise direkt aus IB."""
     import math as _math
     results = {}
+    ib_count = 0
 
     # ── Primär: IB-Ticker-Cache (Type-4-Stream, <0.1s) ─────────────────────
     if ib is not None and ib.isConnected():
@@ -1097,6 +1099,7 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
                         break
                 if price:
                     results[sym] = (price, None)
+                    ib_count += 1
         except Exception:
             pass
 
@@ -1124,7 +1127,7 @@ async def _yf_stock_scan(symbols: list, ib=None) -> dict:
         if yf_count:
             log(f"   📡 {yf_count}/{len(missing)} Preise via yfinance-Fallback")
 
-    return results
+    return results, ib_count
 
 
 async def check_news_trigger(symbol):
@@ -3016,7 +3019,7 @@ async def run_bot(stop_event: threading.Event = None):
             t0 = datetime.now()
             import time as _time
             log(f"   Scanne {len(WATCHLIST)} Symbole ...")
-            ib_price_data: dict = await _yf_stock_scan(WATCHLIST, ib)
+            ib_price_data, _ib_price_count = await _yf_stock_scan(WATCHLIST, ib)
             elapsed = (datetime.now() - t0).total_seconds()
             log(f"   ✅ {len(ib_price_data)}/{len(WATCHLIST)} Preise erhalten ({elapsed:.1f}s)")
 
@@ -3024,8 +3027,14 @@ async def run_bot(stop_event: threading.Event = None):
             if len(ib_price_data) == 0 and ib and ib.isConnected():
                 log("  ⚠️  Ticker-Cache leer — starte Hintergrund-Streams neu ...")
                 await start_background_streaming(WATCHLIST, ib)
-                ib_price_data = await _yf_stock_scan(WATCHLIST, ib)
+                ib_price_data, _ib_price_count = await _yf_stock_scan(WATCHLIST, ib)
                 log(f"   🔄 Nach Stream-Neustart: {len(ib_price_data)}/{len(WATCHLIST)} Preise")
+
+            # IB liefert keine Preise → IV-Abruf via IB spart auch nichts → direkt yfinance
+            if _ib_price_count == 0 and len(ib_price_data) > 0 and not _iv_yf_only:
+                global _iv_yf_only
+                _iv_yf_only = True
+                log("   ℹ️  IB liefert keine Preise → IV-Scan direkt via yfinance (kein IB-Wait)")
 
             # ── Phase 1c: IV via Cache + yfinance-Fallback (TTL 5min) ──────────
             # IV ändert sich langsam → Cache verhindert yfinance-Spam jeden Scan-Zyklus

@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.12": [
+        "⚡  IV-Scan Startup: IB wird sofort übersprungen wenn Preise komplett via yfinance kamen — erster Scan deutlich schneller",
+        "✨  Auto-Scroll: standardmäßig aktiv, pausiert nur bei manuellem Scroll nach oben, reaktiviert automatisch beim Runterscrollen ans Ende",
+    ],
     "3.2.11": [
         "🐛  Log-Scroll: yview wird jetzt VOR dem Insert geprüft — Auto-Scroll funktioniert wieder korrekt wenn man ganz unten ist",
         "✨  Fenster öffnet zentriert und passt Höhe automatisch an Bildschirmgröße an",
@@ -1279,7 +1283,25 @@ class BotLauncher(ctk.CTk):
         tb.tag_configure("blue",   foreground="#60a5fa")
         tb.tag_configure("dim",    foreground="#2d4a6b")
         tb.tag_configure("white",  foreground="#e2e8f0")
-        self._log_lines = 0
+        self._log_lines  = 0
+        self._auto_scroll = True  # An bis User manuell nach oben scrollt
+
+        def _on_log_scroll(event=None):
+            self._log.after(30, _check_at_bottom)
+
+        def _check_at_bottom():
+            self._auto_scroll = self._log._textbox.yview()[1] >= 0.999
+
+        tb.bind("<MouseWheel>",  _on_log_scroll)
+        tb.bind("<Button-4>",    _on_log_scroll)   # Linux scroll up
+        tb.bind("<Button-5>",    _on_log_scroll)   # Linux scroll down
+        tb.bind("<KeyPress>",    _on_log_scroll)   # Tastatur-Scroll (PgUp etc.)
+        # Scrollbar-Drag ebenfalls abfangen
+        try:
+            for child in self._log.winfo_children():
+                child.bind("<ButtonRelease-1>", _on_log_scroll)
+        except Exception:
+            pass
 
     # ── History tab ──────────────────────────────────────────────────────────
 
@@ -2393,8 +2415,6 @@ class BotLauncher(ctk.CTk):
     def _log_append(self, text: str):
         self._log.configure(state="normal")
         tb = self._log._textbox
-        # yview VOR dem Insert prüfen — nach Insert verschiebt sich die Position
-        was_at_bottom = tb.yview()[1] >= 0.999
         tag = None
         for keywords, t in self._LOG_TAGS:
             if any(kw in text for kw in keywords):
@@ -2404,8 +2424,8 @@ class BotLauncher(ctk.CTk):
             tb.insert("end", text, tag)
         else:
             tb.insert("end", text)
-        if was_at_bottom:
-            self._log.see("end")
+        if self._auto_scroll:
+            tb.see("end")
         self._log.configure(state="disabled")
         self._log_lines += text.count("\n")
         if self._log_lines > 0:
