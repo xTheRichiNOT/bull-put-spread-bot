@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.10": [
+        "✨  Log-Scroll: automatisches Scrollen stoppt wenn der User nach oben gescrollt hat — Position bleibt erhalten",
+        "✨  Einstellungen: neue Score-Schwelle (Min. Score) konfigurierbar — steuert welche Signale als Trade gewertet werden",
+    ],
     "3.2.9": [
         "🐛  Absturz-Fix: UnboundLocalError _iv_yf_only in run_bot — fehlende global-Deklaration behoben",
     ],
@@ -337,6 +341,7 @@ DEFAULT_CONFIG = {
     "dte_exit":            0,
     "min_available_funds": 2000,
     "max_daily_loss":      500,
+    "entry_threshold":     0.60,
 }
 
 def load_config() -> dict:
@@ -1947,6 +1952,9 @@ class BotLauncher(ctk.CTk):
         field("Stop-Loss Faktor",  "stop_loss_mult",  tip="2.0 = schließen wenn Verlust = 2× Credit")
         field("DTE-Exit (Tage)",   "dte_exit",        tip="Schließen wenn ≤ X Tage bis Verfall (Gamma-Schutz)")
 
+        section("Signal-Filter")
+        field("Min. Score (Entry-Schwelle)", "entry_threshold", tip="0.60 = nur Trades mit Score ≥ 0.60 | höher = selektiver, weniger Trades")
+
         section("Automation")
         toggle_field("Auto-Trade — Orders automatisch platzieren", "auto_trade")
 
@@ -2382,7 +2390,10 @@ class BotLauncher(ctk.CTk):
             tb.insert("end", text, tag)
         else:
             tb.insert("end", text)
-        self._log.see("end")
+        # Nur scrollen wenn der User bereits am Ende ist (nicht wenn er nach oben gescrollt hat)
+        yview = tb.yview()
+        if yview[1] >= 0.999:
+            self._log.see("end")
         self._log.configure(state="disabled")
         self._log_lines += text.count("\n")
         if self._log_lines > 0:

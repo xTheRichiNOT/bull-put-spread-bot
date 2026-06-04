@@ -67,7 +67,7 @@ _cfg_defaults = {
     "min_vola": 0.28, "abstand_y": 0.10, "min_credit": 70,
     "min_risk_reward": 0.20, "max_delta": 0.28, "max_positions": 8,
     "max_per_sector": 2, "scan_intervall": 60, "auto_trade": True,
-    "take_profit_pct": 0.50, "stop_loss_mult": 2.0, "dte_exit": 21,
+    "take_profit_pct": 0.50, "stop_loss_mult": 2.0, "dte_exit": 21, "entry_threshold": 0.60,
     "min_available_funds": 2000,
     "max_daily_loss": 500,          # Kill-Switch: max Tagesverlust in $ (0 = disabled)
     "max_weekly_loss": 0,           # Kill-Switch: max Wochenverlust in $ (0 = disabled)
@@ -156,7 +156,7 @@ MAX_LOSS_PROB    = 0.22    # Hard-Block: P(MaxVerlust) > 22% → Totalverlustris
 MIN_EV_RATIO     = 0.005   # Hard-Block: EV < 0.5% des Credits → statistisch kein Vorteil
 
 # Decision Engine — Ranking-System: Score entscheidet, kein Hard-Filter-Stack
-ENTRY_THRESHOLD  = 0.60    # Score ≥ 0.60: Trade-Kandidat
+ENTRY_THRESHOLD  = float(_cfg.get('entry_threshold', 0.60))
 WATCH_THRESHOLD  = 0.50    # Score 0.50–0.60: Watch (war 0.62)
 MAX_TRADES_PER_DAY = int(_cfg.get('max_trades_per_day', 10))  # Daily Budget
 RATIO_TOLERANCE  = 0.20
