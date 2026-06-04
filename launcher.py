@@ -92,6 +92,12 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.19": [
+        "🐛  Analyse: kein zweites Bot-Fenster mehr — läuft jetzt in-process",
+        "🐛  Log: Mausrad-Scroll im Dashboard funktioniert jetzt",
+        "✨  PDF: fpdf2 wird automatisch installiert wenn fehlend",
+        "✨  Backtest: Gesamt-Ergebnis prominent am Ende der Log-Ausgabe",
+    ],
     "3.2.18": [
         "✨  Backtest: Min. Score (Entry-Schwelle) jetzt als Parameter in beiden Szenarien",
     ],
@@ -1309,19 +1315,33 @@ class BotLauncher(ctk.CTk):
         self._log_lines  = 0
         self._auto_scroll = True  # An bis User manuell nach oben scrollt
 
+        def _check_at_bottom():
+            self._auto_scroll = tb.yview()[1] >= 0.999
+
         def _on_log_scroll(event=None):
             self._log.after(30, _check_at_bottom)
 
-        def _check_at_bottom():
-            self._auto_scroll = self._log._textbox.yview()[1] >= 0.999
+        def _on_mousewheel(event):
+            # Windows: event.delta in Vielfachen von 120; Linux: Button-4/5
+            if event.num == 4:
+                tb.yview_scroll(-3, "units")
+            elif event.num == 5:
+                tb.yview_scroll(3, "units")
+            else:
+                tb.yview_scroll(-1 * (event.delta // 120), "units")
+            self._log.after(30, _check_at_bottom)
+            return "break"  # verhindert doppeltes Scrollen
 
-        tb.bind("<MouseWheel>",  _on_log_scroll)
-        tb.bind("<Button-4>",    _on_log_scroll)   # Linux scroll up
-        tb.bind("<Button-5>",    _on_log_scroll)   # Linux scroll down
-        tb.bind("<KeyPress>",    _on_log_scroll)   # Tastatur-Scroll (PgUp etc.)
-        # Scrollbar-Drag ebenfalls abfangen
+        for widget in [tb, self._log]:
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Button-4>",   _on_mousewheel, add="+")
+            widget.bind("<Button-5>",   _on_mousewheel, add="+")
+        tb.bind("<KeyPress>", _on_log_scroll)
         try:
             for child in self._log.winfo_children():
+                child.bind("<MouseWheel>",      _on_mousewheel, add="+")
+                child.bind("<Button-4>",        _on_mousewheel, add="+")
+                child.bind("<Button-5>",        _on_mousewheel, add="+")
                 child.bind("<ButtonRelease-1>", _on_log_scroll)
         except Exception:
             pass
@@ -2955,8 +2975,18 @@ class BotLauncher(ctk.CTk):
             from fpdf import FPDF
         except ImportError:
             self._bt_status_lbl.configure(
-                text="fpdf2 fehlt: pip install fpdf2", text_color=C["amber"])
-            return
+                text="fpdf2 wird installiert...", text_color=C["amber"])
+            self.update_idletasks()
+            try:
+                import subprocess as _pip
+                _pip.run([sys.executable, "-m", "pip", "install", "fpdf2"],
+                         check=True, capture_output=True)
+                from fpdf import FPDF
+                self._bt_status_lbl.configure(text="fpdf2 installiert ✓", text_color=C["green"])
+            except Exception as _ie:
+                self._bt_status_lbl.configure(
+                    text=f"fpdf2 Install fehlgeschlagen: {_ie}", text_color=C["red"])
+                return
         import tempfile, subprocess as _sp
 
         m_a, m_b = results[0]["m"], results[1]["m"]
@@ -3189,13 +3219,21 @@ class BotLauncher(ctk.CTk):
                     break
             if not an_path:
                 raise FileNotFoundError("shadow_analyze.py nicht gefunden")
-            result = subprocess.run(
-                [sys.executable, an_path],
-                capture_output=True, text=True, timeout=60,
-                cwd=os.path.dirname(an_path))
-            out = result.stdout
-            if result.returncode != 0 and result.stderr:
-                out += f"\n\n⚠️  STDERR:\n{result.stderr}"
+            import io, importlib.util
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            old_argv = sys.argv[:]
+            sys.argv = [an_path]
+            try:
+                with redirect_stdout(buf):
+                    spec = importlib.util.spec_from_file_location("shadow_analyze", an_path)
+                    mod  = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+            out = buf.getvalue() or "(keine Ausgabe)"
             self.after(0, lambda o=out: self._an_show_output(o))
         except Exception:
             import traceback
@@ -3225,8 +3263,18 @@ class BotLauncher(ctk.CTk):
             from fpdf import FPDF
         except ImportError:
             self._an_status_lbl.configure(
-                text="fpdf2 fehlt: pip install fpdf2", text_color=C["amber"])
-            return
+                text="fpdf2 wird installiert...", text_color=C["amber"])
+            self.update_idletasks()
+            try:
+                import subprocess as _pip
+                _pip.run([sys.executable, "-m", "pip", "install", "fpdf2"],
+                         check=True, capture_output=True)
+                from fpdf import FPDF
+                self._an_status_lbl.configure(text="fpdf2 installiert ✓", text_color=C["green"])
+            except Exception as _ie:
+                self._an_status_lbl.configure(
+                    text=f"fpdf2 Install fehlgeschlagen: {_ie}", text_color=C["red"])
+                return
         import tempfile, subprocess as _sp
 
         pdf = FPDF()

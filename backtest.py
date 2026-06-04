@@ -542,7 +542,16 @@ def print_results(trades, daily_pnl, filter_stats, start_date, end_date):
             wr_s = sum(1 for p in pnls if p > 0) / len(pnls)
             print(f"    {sym:<6}  {len(pnls):>3}×  ${sum(pnls):>+7.0f}  Win {wr_s:.0%}  ø ${sum(pnls)/len(pnls):>+6.2f}")
 
-    print(f"\n{'═'*66}")
+    # ── Prominente Zusammenfassung ────────────────────────────────────────────
+    sign  = "+" if total >= 0 else ""
+    emoji = "✅" if total >= 0 else "❌"
+    print(f"\n{'█'*66}")
+    print(f"  {emoji}  GESAMT-ERGEBNIS:  ${sign}{total:,.0f}   |   "
+          f"Win-Rate {wr:.0%}  ({len(wins)}W / {len(losses)}L)  |   "
+          f"Trades: {n}")
+    print(f"{'█'*66}\n")
+
+    print(f"{'═'*66}")
     print(f"  ⚠️  VEREINFACHTER BACKTEST — nur Orientierungswerte!")
     print(f"     IV = HV×{IV_VRP_FACTOR}  |  Slippage {SLIPPAGE:.0%}  |  kein echter Options-Feed")
     print(f"     Keine Earnings/Makro-Events  |  Expiry = Entry + {FIXED_DTE} Tage")
