@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.13": [
+        "🐛  Absturz-Fix: _iv_yf_only global-Deklaration vor erster Verwendung in run_bot",
+    ],
     "3.2.12": [
         "⚡  IV-Scan Startup: IB wird sofort übersprungen wenn Preise komplett via yfinance kamen — erster Scan deutlich schneller",
         "✨  Auto-Scroll: standardmäßig aktiv, pausiert nur bei manuellem Scroll nach oben, reaktiviert automatisch beim Runterscrollen ans Ende",
