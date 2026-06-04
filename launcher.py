@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.14": [
+        "✨  Fenster öffnet breiter (1100px) — Exit-Button in Positionen-Tab immer sichtbar",
+    ],
     "3.2.13": [
         "🐛  Absturz-Fix: _iv_yf_only global-Deklaration vor erster Verwendung in run_bot",
     ],
@@ -899,12 +902,12 @@ class BotLauncher(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
-        self.minsize(820, 620)
+        self.minsize(1060, 620)
         # Fenster zentriert auf dem Bildschirm platzieren
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        w, h = 960, min(740, sh - 80)
+        w, h = max(1100, min(1280, sw - 80)), min(780, sh - 80)
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
