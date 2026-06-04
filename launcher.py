@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.11": [
+        "🐛  Log-Scroll: yview wird jetzt VOR dem Insert geprüft — Auto-Scroll funktioniert wieder korrekt wenn man ganz unten ist",
+        "✨  Fenster öffnet zentriert und passt Höhe automatisch an Bildschirmgröße an",
+        "🐛  Exit-Button sichtbar: Spaltenbreiten reduziert damit der ✕-Button nicht abgeschnitten wird",
+    ],
     "3.2.10": [
         "✨  Log-Scroll: automatisches Scrollen stoppt wenn der User nach oben gescrollt hat — Position bleibt erhalten",
         "✨  Einstellungen: neue Score-Schwelle (Min. Score) konfigurierbar — steuert welche Signale als Trade gewertet werden",
@@ -887,8 +892,15 @@ class BotLauncher(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
-        self.geometry("960x740")
         self.minsize(820, 620)
+        # Fenster zentriert auf dem Bildschirm platzieren
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w, h = 960, min(740, sh - 80)
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
         self.cfg           = load_config()
         self._stop_event      = None
@@ -1387,9 +1399,9 @@ class BotLauncher(ctk.CTk):
 
         pos_cols = ctk.CTkFrame(pos_frame, fg_color=C["header"], corner_radius=0)
         pos_cols.pack(fill="x", padx=10, pady=(2, 0))
-        for col, w in [("Symbol", 70), ("Typ", 75), ("Expiry", 90), ("DTE", 45),
-                       ("Short", 65), ("Long", 65),
-                       ("Credit", 70), ("TP-Ziel", 70), ("Akt. P&L", 80), ("Status", 80)]:
+        for col, w in [("Symbol", 70), ("Typ", 75), ("Expiry", 90), ("DTE", 40),
+                       ("Short", 60), ("Long", 60),
+                       ("Credit", 65), ("TP-Ziel", 65), ("Akt. P&L", 75), ("Status", 65)]:
             ctk.CTkLabel(pos_cols, text=col, width=w,
                          font=ctk.CTkFont(size=10, weight="bold"),
                          text_color=C["muted"]).pack(side="left", padx=3, pady=4)
@@ -1628,18 +1640,18 @@ class BotLauncher(ctk.CTk):
             lbl(row, p.get("expiry", "–"), 90)
             dte = p.get("dte", 0)
             dte_col = "#ef4444" if dte <= 7 else ("#f59e0b" if dte <= 21 else C["text"])
-            lbl(row, f"{dte}d", 45, dte_col)
-            lbl(row, f"${p.get('short_strike', 0):.0f}", 65)
-            lbl(row, f"${p.get('long_strike', 0):.0f}", 65)
-            lbl(row, f"${p.get('entry_per_share', 0)*100:.0f}", 70, "#4ade80")
-            lbl(row, f"${p.get('tp_target', 0)*100:.0f}", 70, "#60a5fa")
+            lbl(row, f"{dte}d", 40, dte_col)
+            lbl(row, f"${p.get('short_strike', 0):.0f}", 60)
+            lbl(row, f"${p.get('long_strike', 0):.0f}", 60)
+            lbl(row, f"${p.get('entry_per_share', 0)*100:.0f}", 65, "#4ade80")
+            lbl(row, f"${p.get('tp_target', 0)*100:.0f}", 65, "#60a5fa")
             upnl = p.get("unrealized_pnl")
             if upnl is not None:
                 upnl_col = "#4ade80" if upnl >= 0 else "#ef4444"
                 upnl_txt = f"{'+'if upnl>=0 else ''}${upnl:,.0f}"
             else:
                 upnl_col, upnl_txt = C["dim"], "—"
-            lbl(row, upnl_txt, 80, upnl_col)
+            lbl(row, upnl_txt, 75, upnl_col)
             close_reason = p.get("close_reason", "")
             if status == "open":
                 status_txt, status_col = "Aktiv", "#4ade80"
@@ -1657,7 +1669,7 @@ class BotLauncher(ctk.CTk):
                 status_txt, status_col = "Manuell", "#a78bfa"
             else:
                 status_txt, status_col = "Schließt…", "#f59e0b"
-            lbl(row, status_txt, 95, status_col)
+            lbl(row, status_txt, 65, status_col)
 
             # Exit-Button: für aktive Positionen und Fehler-/Retry-Status
             if status in ("open", "error", "exit_retry"):
@@ -2381,6 +2393,8 @@ class BotLauncher(ctk.CTk):
     def _log_append(self, text: str):
         self._log.configure(state="normal")
         tb = self._log._textbox
+        # yview VOR dem Insert prüfen — nach Insert verschiebt sich die Position
+        was_at_bottom = tb.yview()[1] >= 0.999
         tag = None
         for keywords, t in self._LOG_TAGS:
             if any(kw in text for kw in keywords):
@@ -2390,9 +2404,7 @@ class BotLauncher(ctk.CTk):
             tb.insert("end", text, tag)
         else:
             tb.insert("end", text)
-        # Nur scrollen wenn der User bereits am Ende ist (nicht wenn er nach oben gescrollt hat)
-        yview = tb.yview()
-        if yview[1] >= 0.999:
+        if was_at_bottom:
             self._log.see("end")
         self._log.configure(state="disabled")
         self._log_lines += text.count("\n")
