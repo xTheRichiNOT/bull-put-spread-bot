@@ -3031,8 +3031,8 @@ async def run_bot(stop_event: threading.Event = None):
                 log(f"   🔄 Nach Stream-Neustart: {len(ib_price_data)}/{len(WATCHLIST)} Preise")
 
             # IB liefert keine Preise → IV-Abruf via IB spart auch nichts → direkt yfinance
+            global _iv_yf_only, _iv_yf_hits
             if _ib_price_count == 0 and len(ib_price_data) > 0 and not _iv_yf_only:
-                global _iv_yf_only
                 _iv_yf_only = True
                 log("   ℹ️  IB liefert keine Preise → IV-Scan direkt via yfinance (kein IB-Wait)")
 
@@ -3050,7 +3050,6 @@ async def run_bot(stop_event: threading.Event = None):
                     no_iv.remove(sym)
             # Nur abgelaufene / unbekannte IV via OPRA holen
             if no_iv:
-                global _iv_yf_only, _iv_yf_hits
                 _iv_src = "yf-Chain direkt" if _iv_yf_only else "OPRA ATM-Put, Type 1"
                 log(f"   IV für {len(no_iv)} Symbole ({_iv_src}) ...")
                 _sem_iv = asyncio.Semaphore(5)
