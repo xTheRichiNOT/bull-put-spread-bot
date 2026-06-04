@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.17": [
+        "✨  Einstellungen: Min. Score in Strategie-Sektion verschoben (kein eigener Abschnitt mehr)",
+    ],
     "3.2.16": [
         "✨  Fenster öffnet auf Windows maximiert",
         "✨  Exit-Dialog im Dark-Mode-Style (kein Windows-Systemdialog mehr)",
@@ -2014,15 +2017,13 @@ class BotLauncher(ctk.CTk):
         field("Min. Credit pro Kontrakt ($)",   "min_credit",      tip="Empfohlen: 70–100 $")
         field("Min. Risk/Reward Ratio",         "min_risk_reward", tip="0.20 = Prämie ≥ 20% des max. Risikos")
         field("Max. Delta Short-Put",           "max_delta",       tip="0.28 = Short-Put max. 28% Ausübungswahrsch.")
+        field("Min. Score (Entry-Schwelle)",    "entry_threshold", tip="0.60 = nur Trades mit Score ≥ 0.60 | höher = selektiver, weniger Trades")
         field("Scan-Intervall (Sekunden)",      "scan_intervall",  tip="Alle X Sekunden neu scannen")
 
         section("Exit-Regeln")
         field("Take-Profit (%)",   "take_profit_pct", tip="0.50 = schließen wenn 50% des Credits verdient")
         field("Stop-Loss Faktor",  "stop_loss_mult",  tip="2.0 = schließen wenn Verlust = 2× Credit")
         field("DTE-Exit (Tage)",   "dte_exit",        tip="Schließen wenn ≤ X Tage bis Verfall (Gamma-Schutz)")
-
-        section("Signal-Filter")
-        field("Min. Score (Entry-Schwelle)", "entry_threshold", tip="0.60 = nur Trades mit Score ≥ 0.60 | höher = selektiver, weniger Trades")
 
         section("Automation")
         toggle_field("Auto-Trade — Orders automatisch platzieren", "auto_trade")
