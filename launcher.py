@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.20": [
+        "🐛  Fenster: kein Flackern beim Start mehr — UI wird versteckt gebaut, dann direkt maximiert angezeigt",
+    ],
     "3.2.19": [
         "🐛  Analyse: kein zweites Bot-Fenster mehr — läuft jetzt in-process",
         "🐛  Log: Mausrad-Scroll im Dashboard funktioniert jetzt",
@@ -923,17 +926,7 @@ class BotLauncher(ctk.CTk):
         super().__init__()
         self.title(f"Bull Put Spread Bot  v{VERSION}")
         self.minsize(1060, 580)
-        self.update_idletasks()
-        if sys.platform == "win32":
-            # Windows: maximiert starten
-            self.state("zoomed")
-        else:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
-            x = (sw - w) // 2
-            y = (sh - h) // 2
-            self.geometry(f"{w}x{h}+{x}+{y}")
+        self.withdraw()  # Fenster verstecken während UI gebaut wird → kein Flackern
 
         self.cfg           = load_config()
         self._stop_event      = None
@@ -948,6 +941,19 @@ class BotLauncher(ctk.CTk):
         self._set_icon()
         self._build_ui()
         self._poll_queue()
+
+        # Fenster in finaler Größe zeigen — nach _build_ui damit keine Überschreibung
+        self.update_idletasks()
+        if sys.platform == "win32":
+            self.state("zoomed")
+        else:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            w, h = max(1100, min(1280, sw - 80)), min(700, int(sh * 0.85))
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        self.deiconify()
 
         # Erststart-Wizard wenn noch keine Account-Nummer gesetzt
         if not self.cfg.get("ib_account", "").strip():
