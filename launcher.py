@@ -1474,9 +1474,9 @@ class BotLauncher(ctk.CTk):
 
         pos_cols = ctk.CTkFrame(pos_frame, fg_color=C["header"], corner_radius=0)
         pos_cols.pack(fill="x", padx=10, pady=(2, 0))
-        for col, w in [("Symbol", 70), ("Typ", 75), ("Expiry", 90), ("DTE", 40),
+        for col, w in [("Symbol", 70), ("Typ", 75), ("Exp", 55), ("DTE", 40),
                        ("Short", 60), ("Long", 60),
-                       ("Credit", 65), ("TP-Ziel", 65), ("Akt. P&L", 75), ("Status", 65)]:
+                       ("Credit", 65), ("TP-Ziel", 60), ("SL-Ziel", 60), ("Akt. P&L", 75), ("Status", 70)]:
             ctk.CTkLabel(pos_cols, text=col, width=w,
                          font=ctk.CTkFont(size=10, weight="bold"),
                          text_color=C["muted"]).pack(side="left", padx=3, pady=4)
@@ -1712,14 +1712,24 @@ class BotLauncher(ctk.CTk):
             _ls = p.get("long_strike",  0) or 0
             _typ = "Bull Put" if _ss > _ls else ("Bear Put" if _ls > _ss else "Put Spread")
             lbl(row, _typ, 75, "#a78bfa")
-            lbl(row, p.get("expiry", "–"), 90)
+            _exp_raw = p.get("expiry", "–")
+            try:
+                from datetime import datetime as _dtp
+                _exp_fmt = _dtp.strptime(_exp_raw, '%Y-%m-%d').strftime('%d.%b')
+            except Exception:
+                _exp_fmt = _exp_raw
+            lbl(row, _exp_fmt, 55)
             dte = p.get("dte", 0)
             dte_col = "#ef4444" if dte <= 7 else ("#f59e0b" if dte <= 21 else C["text"])
             lbl(row, f"{dte}d", 40, dte_col)
             lbl(row, f"${p.get('short_strike', 0):.0f}", 60)
             lbl(row, f"${p.get('long_strike', 0):.0f}", 60)
-            lbl(row, f"${p.get('entry_per_share', 0)*100:.0f}", 65, "#4ade80")
-            lbl(row, f"${p.get('tp_target', 0)*100:.0f}", 65, "#60a5fa")
+            _entry_disp = p.get('entry_per_share', 0) or 0
+            lbl(row, f"${_entry_disp*100:.0f}" if _entry_disp > 0 else "—", 65, "#4ade80" if _entry_disp > 0 else C["dim"])
+            _tp_disp = p.get('tp_target', 0) or 0
+            lbl(row, f"${_tp_disp*100:.0f}" if _tp_disp > 0 else "—", 60, "#60a5fa" if _tp_disp > 0 else C["dim"])
+            _sl_disp = p.get('sl_target', 0) or 0
+            lbl(row, f"${_sl_disp*100:.0f}" if _sl_disp > 0 else "—", 60, "#f87171" if _sl_disp > 0 else C["dim"])
             upnl = p.get("unrealized_pnl")
             if upnl is not None:
                 upnl_col = "#4ade80" if upnl >= 0 else "#ef4444"
@@ -1731,20 +1741,24 @@ class BotLauncher(ctk.CTk):
             if status == "open":
                 status_txt, status_col = "Aktiv", "#4ade80"
             elif status == "error":
-                status_txt, status_col = "⛔ Manuell!", "#ff0000"
+                status_txt, status_col = "Manuell!", "#ff0000"
             elif status == "exit_retry":
-                status_txt, status_col = "Fehler…", "#ef4444"
+                status_txt, status_col = "Retry…", "#ef4444"
             elif close_reason == "TP_HIT":
-                status_txt, status_col = "TP erreicht", "#34d399"
+                status_txt, status_col = "TP Hit", "#34d399"
             elif "SL" in close_reason:
-                status_txt, status_col = "SL aktiv", "#ef4444"
-            elif any(x in close_reason for x in ("DTE", "EXPIRY")):
-                status_txt, status_col = "DTE Exit", "#f59e0b"
+                status_txt, status_col = "SL Exit", "#ef4444"
+            elif "EXPIRY" in close_reason:
+                status_txt, status_col = "Verfall", "#f59e0b"
+            elif "DTE" in close_reason:
+                status_txt, status_col = "21d Exit", "#f59e0b"
             elif close_reason == "MANUAL_EXIT":
                 status_txt, status_col = "Manuell", "#a78bfa"
+            elif status == "closing":
+                status_txt, status_col = "Schließt…", "#f59e0b"
             else:
                 status_txt, status_col = "Schließt…", "#f59e0b"
-            lbl(row, status_txt, 65, status_col)
+            lbl(row, status_txt, 70, status_col)
 
             # Exit-Button: für aktive Positionen und Fehler-/Retry-Status
             if status in ("open", "error", "exit_retry"):

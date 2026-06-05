@@ -501,6 +501,8 @@ def _write_positions_file():
             except Exception:
                 dte = 0
             entry = info.get('entry_per_share', 0.0)
+            _tp = info.get('tp_price') or (round(entry * (1 - TAKE_PROFIT_PCT), 2) if entry > 0 else 0)
+            _sl = info.get('sl_price') or (round(entry * STOP_LOSS_MULT, 2)        if entry > 0 else 0)
             positions.append({
                 'symbol':          sym,
                 'expiry':          info.get('expiry_yf', ''),
@@ -508,10 +510,12 @@ def _write_positions_file():
                 'short_strike':    info.get('short_strike', 0),
                 'long_strike':     info.get('long_strike', 0),
                 'entry_per_share': round(entry, 2),
-                'tp_target':       round(entry * (1 - TAKE_PROFIT_PCT), 2),
+                'tp_target':       _tp,
+                'sl_target':       _sl,
+                'close_reason':    info.get('close_reason', ''),
                 'status':          info.get('status', 'open'),
                 'opened_at':       info.get('opened_at', ''),
-                'unrealized_pnl':  info.get('unrealized_pnl'),  # None wenn noch nicht berechnet
+                'unrealized_pnl':  info.get('unrealized_pnl'),
             })
         with open(_POSITIONS_FILE, 'w') as f:
             json.dump({
@@ -2485,6 +2489,8 @@ async def place_order(ib, sig):
 
                     _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
                     _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+                    _bot_trades[sym]['tp_price']    = tp_close
+                    _bot_trades[sym]['sl_price']    = sl_close
                     log(f"  ✅ [{sym}] OCA-BRACKET (Paper) platziert — TP #{tp_trade.order.orderId} @ ${tp_close:.2f} / SL #{sl_trade.order.orderId} @ ${sl_close:.2f}")
                 except Exception as _oca_err:
                     import traceback as _tb
@@ -2513,6 +2519,8 @@ async def place_order(ib, sig):
 
                 _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
                 _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+                _bot_trades[sym]['tp_price']    = tp_close
+                _bot_trades[sym]['sl_price']    = sl_close
 
             _save_state()
 
