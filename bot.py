@@ -1878,7 +1878,10 @@ async def close_spread(ib, symbol, info, reason):
             src = 'absolute fallback'
         close_limit = max(close_limit, 0.05)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
-        order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+        # Close-Orders: NonGuaranteed='0' (gleichzeitige Leg-Ausführung)
+        # NonGuaranteed='1' triggert IBKR Error 201 "Guaranteed-to-Lose" auf Paper-Konten
+        # wenn das Spread tief ITM ist (maximaler Verlust quasi sicher).
+        order.smartComboRoutingParams = [TagValue('NonGuaranteed', '0')]
         order.account = _cfg.get('ib_account', '')
         if _ibq is not None:
             trade = await _ibq.place(ib, bag, order)
@@ -2858,20 +2861,32 @@ async def run_bot(stop_event: threading.Event = None):
                 try:
                     _ef = ExecutionFilter(symbol=sym, secType='OPT')
                     _fills = await ib.reqExecutionsAsync(_ef)
-                    _short_price = 0.0
-                    _long_price  = 0.0
+                    # FRÜHESTE Fills verwenden (Entry-Zeitpunkt) — spätere Fills können
+                    # Close-Versuche sein mit invertierten Preisen (z.B. SLD 0.51 bei tiefem ITM).
+                    # Fills nach Symbol + ConId gruppieren, frühestes Fill pro ConId nehmen.
+                    _short_fills: list = []
+                    _long_fills:  list = []
                     for _f in (_fills or []):
                         _cid = _f.contract.conId
                         _ep  = _f.execution.avgPrice or _f.execution.price or 0.0
+                        if _ep <= 0:
+                            continue
                         if _cid == entry.get('short_conid') and _f.execution.side == 'SLD':
-                            _short_price = _ep
+                            _short_fills.append((_f.execution.time, _ep))
                         elif _cid == entry.get('long_conid') and _f.execution.side == 'BOT':
-                            _long_price = _ep
-                    if _short_price > 0:
-                        _exec_entry = round(max(_short_price - _long_price, 0.01), 2)
+                            _long_fills.append((_f.execution.time, _ep))
+                    # Frühestes Fill = Entry (nach Zeit sortieren)
+                    _short_price = sorted(_short_fills)[0][1] if _short_fills else 0.0
+                    _long_price  = sorted(_long_fills)[0][1]  if _long_fills  else 0.0
+                    if _short_price > 0 and (_short_price - _long_price) > 0.01:
+                        _exec_entry = round(_short_price - _long_price, 2)
                         entry['entry_per_share'] = _exec_entry
-                        log(f"  ✅ [{sym}] Einstiegspreis via reqExecutions: "
+                        log(f"  ✅ [{sym}] Einstiegspreis via reqExecutions (frühestes Fill): "
                             f"SLD ${_short_price:.2f} − BOT ${_long_price:.2f} = ${_exec_entry:.2f}/Share")
+                    elif _short_price > 0:
+                        log(f"  ⚠️  [{sym}] reqExecutions: Netto-Credit negativ "
+                            f"(SLD ${_short_price:.2f} − BOT ${_long_price:.2f}) — "
+                            f"Einstiegspreis nicht überschrieben (Close-Fill dominiert)")
                 except Exception as _exc:
                     log(f"  ⚠️  [{sym}] reqExecutions fehlgeschlagen: {_exc}")
 
