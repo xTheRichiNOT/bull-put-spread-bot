@@ -2891,8 +2891,14 @@ async def run_bot(stop_event: threading.Event = None):
                     log(f"  ⚠️  [{sym}] reqExecutions fehlgeschlagen: {_exc}")
 
             if entry['entry_per_share'] <= 0:
-                log(f"  ⚠️  [{sym}] Einstiegspreis konnte nicht rekonstruiert werden — "
-                    f"P&L-Anzeige deaktiviert bis zur nächsten Füllung")
+                _saved_entry = (existing or {}).get('entry_per_share', 0)
+                if _saved_entry > 0.01:
+                    entry['entry_per_share'] = _saved_entry
+                    log(f"  ↩️  [{sym}] Einstiegspreis nicht rekonstruierbar — "
+                        f"gespeicherter Wert ${_saved_entry:.2f}/Share beibehalten")
+                else:
+                    log(f"  ⚠️  [{sym}] Einstiegspreis konnte nicht rekonstruiert werden — "
+                        f"P&L-Anzeige deaktiviert bis zur nächsten Füllung")
 
             was_known = sym in _bot_trades
             _bot_trades[sym] = entry
