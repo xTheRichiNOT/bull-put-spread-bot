@@ -1864,11 +1864,15 @@ async def close_spread(ib, symbol, info, reason):
             close_limit = round(_cur_exit * 2.0, 2)
             src = f'live ${_cur_exit*100:.0f}¢ ×2 (sofort-Fill)'
         elif entry and entry >= 0.10:
-            close_limit = round(entry * 2.0, 2)
-            src = f'entry×2 (${entry:.2f})'
+            # Fallback: entry×2 — aber mindestens 90% der Spread-Breite damit der
+            # Exit auch bei tief ITM-Position (Spread am Maximum) noch füllen kann.
+            entry_based = round(entry * 2.0, 2)
+            width_floor  = round(_spread_width * 0.90, 2) if _spread_width > 0 else 0
+            close_limit  = max(entry_based, width_floor)
+            src = f'entry×2={entry_based:.2f} / width-floor={width_floor:.2f} → ${close_limit:.2f}'
         elif _spread_width > 0:
-            close_limit = round(_spread_width * 0.80, 2)
-            src = f'spread-width fallback (80% von ${_spread_width:.0f})'
+            close_limit = round(_spread_width * 0.90, 2)
+            src = f'spread-width fallback (90% von ${_spread_width:.0f})'
         else:
             close_limit = 5.00
             src = 'absolute fallback'
@@ -2457,7 +2461,7 @@ async def place_order(ib, sig):
                     tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
                     tp_order.ocaGroup = _oca
                     tp_order.ocaType  = 1  # Cancel remaining with block
-                    tp_order.transmit = False
+                    tp_order.transmit = True  # OCA-Orders sind unabhängig → beide müssen transmit=True haben
                     tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                     tp_order.account = _cfg.get('ib_account', '')
                     if _ibq is not None:
@@ -2478,9 +2482,10 @@ async def place_order(ib, sig):
 
                     _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
                     _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
-                    log(f"  ✅ [{sym}] OCA-BRACKET (Paper) platziert — TP #{tp_trade.order.orderId} / SL #{sl_trade.order.orderId}")
+                    log(f"  ✅ [{sym}] OCA-BRACKET (Paper) platziert — TP #{tp_trade.order.orderId} @ ${tp_close:.2f} / SL #{sl_trade.order.orderId} @ ${sl_close:.2f}")
                 except Exception as _oca_err:
-                    log(f"  ⚠️  [{sym}] OCA-Bracket fehlgeschlagen ({_oca_err}) — nur Software-Monitor aktiv")
+                    import traceback as _tb
+                    log(f"  ❌ [{sym}] OCA-Bracket fehlgeschlagen: {_oca_err}\n{_tb.format_exc()}")
             else:
                 # Live-Konto: klassisches Bracket mit TP + SL
                 tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
