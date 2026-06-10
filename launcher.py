@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.32": [
+        "✨  Status-Spalte: Gecancelt / Offen / Schließt… / Fehler / Verfall OTM klar unterschieden",
+        "✨  TP Hit mit ✓-Haken, Retry in Amber statt Rot, unbekannte Status zeigen Rohwert statt 'Schließt…'",
+    ],
     "3.2.31": [
         "🐛  Paper-Konto: Error 201 Combo-Limit — BAG-Order-Schwelle auf 2 gesenkt (IBKR Paper erlaubt max. 2 aktive Riskless/Guaranteed-Loss Combo-Orders gleichzeitig)",
     ],
@@ -1756,13 +1760,19 @@ class BotLauncher(ctk.CTk):
             lbl(row, upnl_txt, 75, upnl_col)
             close_reason = p.get("close_reason", "")
             if status == "open":
-                status_txt, status_col = "Aktiv", "#4ade80"
+                status_txt, status_col = "Offen", "#4ade80"
+            elif status == "cancelled":
+                status_txt, status_col = "Gecancelt", C["dim"]
+            elif status == "failed":
+                status_txt, status_col = "Fehler", "#ef4444"
+            elif status == "expired_otm":
+                status_txt, status_col = "Verfall OTM", "#f59e0b"
             elif status == "error":
                 status_txt, status_col = "Manuell!", "#ff0000"
             elif status == "exit_retry":
-                status_txt, status_col = "Retry…", "#ef4444"
+                status_txt, status_col = "Retry…", "#f59e0b"
             elif close_reason == "TP_HIT":
-                status_txt, status_col = "TP Hit", "#34d399"
+                status_txt, status_col = "TP Hit ✓", "#34d399"
             elif "SL" in close_reason:
                 status_txt, status_col = "SL Exit", "#ef4444"
             elif "EXPIRY" in close_reason:
@@ -1771,10 +1781,12 @@ class BotLauncher(ctk.CTk):
                 status_txt, status_col = "21d Exit", "#f59e0b"
             elif close_reason == "MANUAL_EXIT":
                 status_txt, status_col = "Manuell", "#a78bfa"
+            elif close_reason == "RETRY_EXIT":
+                status_txt, status_col = "Schließt…", "#f59e0b"
             elif status == "closing":
                 status_txt, status_col = "Schließt…", "#f59e0b"
             else:
-                status_txt, status_col = "Schließt…", "#f59e0b"
+                status_txt, status_col = status or "—", C["dim"]
             lbl(row, status_txt, 70, status_col)
 
             # Exit-Button: für aktive Positionen und Fehler-/Retry-Status
