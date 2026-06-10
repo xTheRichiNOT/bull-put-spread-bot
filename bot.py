@@ -2482,17 +2482,16 @@ async def place_order(ib, sig):
             _is_paper = ACCOUNT_ID.upper().startswith('DU')
 
             # ── Combo-Limit-Check: IB erlaubt max. ~8 aktive BAG-Orders ─────────────
-            # Paper-Konten: IBKR hat ein hartes Limit für "Riskless/Guaranteed-Loss
-            # Combination Orders" — typisch 2 gleichzeitig. Jede Position mit aktivem
-            # OCA-Bracket belegt 2 Slots (TP + SL). Neuer Entry würde Error 201 auslösen.
+            # Paper: nur noch Entry-Order (kein OCA-Bracket) → 1 BAG pro Position, füllt schnell.
+            # Live: Bracket-Orders (parentId) zählen als separate BAGs.
             _BLOCKING_ENTRY = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending'}
             await ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
             _active_bag_n = sum(
                 1 for t in ib.openTrades()
                 if t.contract.secType == 'BAG' and t.orderStatus.status in _BLOCKING_ENTRY
             )
-            _bag_limit = 2 if _is_paper else 7
+            _bag_limit = 4 if _is_paper else 7
             if _active_bag_n >= _bag_limit:
                 log(f"  ⏳ [{sym}] IB-Combo-Limit ({'Paper' if _is_paper else 'Live'}): "
                     f"{_active_bag_n}/{_bag_limit} aktive BAG-Orders — "
@@ -2516,43 +2515,14 @@ async def place_order(ib, sig):
             _bot_trades[sym]['entry_order_id'] = parent_id
 
             if _is_paper:
-                # Paper-Konto: OCA-Gruppe als Bracket-Ersatz (Error 201 verhindert parentId)
-                # Beide Orders stehen in IBKR auch wenn der Bot abstürzt
-                import random as _rnd
-                import time as _time
-                _oca = f"BPS_{sym}_{int(_time.time())}_{_rnd.randint(100,999)}"
-                tp_trade = sl_trade = None
-                try:
-                    tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
-                    tp_order.ocaGroup = _oca
-                    tp_order.ocaType  = 1  # Cancel remaining with block
-                    tp_order.transmit = True  # OCA-Orders sind unabhängig → beide müssen transmit=True haben
-                    tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-                    tp_order.account = _cfg.get('ib_account', '')
-                    if _ibq is not None:
-                        tp_trade = await _ibq.place(ib, bag, tp_order)
-                    else:
-                        tp_trade = ib.placeOrder(bag, tp_order)
-
-                    sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
-                    sl_order.ocaGroup = _oca
-                    sl_order.ocaType  = 1
-                    sl_order.transmit = True
-                    sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
-                    sl_order.account = _cfg.get('ib_account', '')
-                    if _ibq is not None:
-                        sl_trade = await _ibq.place(ib, bag, sl_order)
-                    else:
-                        sl_trade = ib.placeOrder(bag, sl_order)
-
-                    _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
-                    _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
-                    _bot_trades[sym]['tp_price']    = tp_close
-                    _bot_trades[sym]['sl_price']    = sl_close
-                    log(f"  ✅ [{sym}] OCA-BRACKET (Paper) platziert — TP #{tp_trade.order.orderId} @ ${tp_close:.2f} / SL #{sl_trade.order.orderId} @ ${sl_close:.2f}")
-                except Exception as _oca_err:
-                    import traceback as _tb
-                    log(f"  ❌ [{sym}] OCA-Bracket fehlgeschlagen: {_oca_err}\n{_tb.format_exc()}")
+                # Paper-Konto: KEINE Broker-seitigen TP/SL-Orders
+                # IBKR Paper limitiert "riskless/guaranteed-loss combination orders" auf 2 account-weit.
+                # OCA-Bracket (2 weitere BAG-Orders) würde Error 201 auslösen sobald eine Position offen ist.
+                # Lösung: TP/SL-Preise nur lokal speichern — monitor_exits überwacht und schließt per Software.
+                _bot_trades[sym]['tp_price'] = tp_close
+                _bot_trades[sym]['sl_price'] = sl_close
+                _bot_trades[sym].pop('tp_order_id', None)
+                _bot_trades[sym].pop('sl_order_id', None)
             else:
                 # Live-Konto: klassisches Bracket mit TP + SL
                 tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
@@ -2584,11 +2554,10 @@ async def place_order(ib, sig):
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
             if _is_paper:
-                log(f"  ✅ [{sym}] ENTRY-ORDER PLATZIERT (Paper — OCA-Bracket) × {n_contracts} Kontrakt(e)")
+                log(f"  ✅ [{sym}] ENTRY-ORDER GESENDET (Paper — TP/SL per Bot-Monitoring) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
-                if tp_trade and sl_trade:
-                    log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
-                    log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
+                log(f"     TP-Ziel:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f}) — Bot überwacht")
+                log(f"     SL-Ziel:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f}) — Bot überwacht")
             else:
                 log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
