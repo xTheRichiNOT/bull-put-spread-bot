@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.29": [
+        "🐛  Hard-Gate nutzt jetzt ausschließlich Min. Credit ($) — Prozent-Floor blockiert Dollar-Einstellung nicht mehr",
+    ],
     "3.2.28": [
         "✨  Einstellungen: Min. Credit (% Spread-Breite) jetzt konfigurierbar — verhindert dass 18%-Floor den Dollar-Wert übersteuert",
     ],
@@ -2070,7 +2073,7 @@ class BotLauncher(ctk.CTk):
         field("Min. Implied Volatility (IV)",   "min_vola",        tip="0.28 = 28%  — IV-Filter für genug Prämie")
         field("OTM-Abstand Short Strike",       "abstand_y",       tip="0.10 = 10% unter aktuellem Kurs")
         field("Min. Credit pro Kontrakt ($)",   "min_credit",      tip="Empfohlen: 70–100 $")
-        field("Min. Credit (% Spread-Breite)", "min_credit_pct",  tip="0.18 = 18% — bei $5-Spread → $90 Floor | 0 = deaktiviert")
+        field("Credit Score-Normierung (%)",   "min_credit_pct",  tip="0.18 = 18% — nur für Score-Berechnung, kein Hard-Gate")
         field("Min. Risk/Reward Ratio",         "min_risk_reward", tip="0.20 = Prämie ≥ 20% des max. Risikos")
         field("Max. Delta Short-Put",           "max_delta",       tip="0.28 = Short-Put max. 28% Ausübungswahrsch.")
         field("Min. Score (Entry-Schwelle)",    "entry_threshold", tip="0.60 = nur Trades mit Score ≥ 0.60 | höher = selektiver, weniger Trades")

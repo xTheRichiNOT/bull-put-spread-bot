@@ -834,7 +834,7 @@ def _check_credit(credit: float, breite: float, prob_otm: float):
     Returns (passes: bool, required_credit: float, min_pwin: float)
     """
     spread_risk = breite * 100
-    required    = max(spread_risk * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
+    required    = MIN_CREDIT_ABS
 
     if credit < required:
         return False, required, None
@@ -1613,7 +1613,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         decision = 'TRADE' if score >= ENTRY_THRESHOLD else 'WATCH' if score >= WATCH_THRESHOLD else 'SKIP'
 
         # Hard-Gate: Mindest-Credit-Größe (Infrastruktur, kein Score-Thema)
-        credit_ok_hard = credit >= max(breite * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
+        credit_ok_hard = credit >= MIN_CREDIT_ABS
 
         return {
             'symbol':           symbol,
@@ -3293,8 +3293,7 @@ async def run_bot(stop_event: threading.Event = None):
                         reasons.append("kein echtes Bid (BS-Schätzung) — Live-Modus erfordert echtes Bid")
                     if not s.get('credit_ok_hard', True):
                         _c, _b = s['credit'], s['breite']
-                        _req = max(_b * 100 * MIN_CREDIT_PERCENT, MIN_CREDIT_ABS)
-                        reasons.append(f"Credit ${_c:.0f} < erforderlich ${_req:.0f} (Hard-Gate)")
+                        reasons.append(f"Credit ${_c:.0f} < erforderlich ${MIN_CREDIT_ABS:.0f} (Hard-Gate)")
                     decision = s.get('decision', 'SKIP')
                     score    = s.get('score', 0.0)
                     edge     = s.get('edge', 0.0)
