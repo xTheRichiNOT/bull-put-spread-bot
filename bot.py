@@ -2065,14 +2065,8 @@ async def monitor_exits(ib=None):
                     log(f"  ✅ [{symbol}] 21-DTE erreicht — Puffer {puffer:.1%} > {BUFFER_MIN_PCT:.0%} "
                         f"— tief OTM, verfallen lassen")
 
-        entry = info['entry_per_share']
-        if not entry or entry <= 0:
-            log(f"  ⚠️  [{symbol}] Einstiegspreis nicht bekannt — P&L-Anzeige deaktiviert "
-                f"(Bot-Neustart während offener Position?)")
-            continue
-
         # ── Anzeige-P&L aus ib.portfolio() (gleicher Wert wie CapTrader) ────────────
-        # Nur für die UI-Anzeige — IB cached Combo-Werte und friert manchmal ein.
+        # Vor dem Entry-Check — IB liefert unrealizedPNL unabhängig vom eigenen Einstiegspreis.
         _pnl_display = None
         if ib is not None:
             try:
@@ -2091,6 +2085,15 @@ async def monitor_exits(ib=None):
                     _pnl_display = round(sum(p.unrealizedPNL for p in _legs), 2)
             except Exception:
                 pass
+
+        entry = info['entry_per_share']
+        if not entry or entry <= 0:
+            log(f"  ⚠️  [{symbol}] Einstiegspreis nicht bekannt — TP/SL-Monitoring deaktiviert "
+                f"(Bot-Neustart während offener Position?)")
+            if _pnl_display is not None:
+                info['unrealized_pnl'] = round(_pnl_display, 2)
+                log(f"  📊 [{symbol}] IB-P&L direkt aus Portfolio: ${_pnl_display:+.0f}")
+            continue
 
         # ── Aktueller Spread-Preis aus Einzel-Legs (immer frisch, nie eingefroren) ──
         # IB berechnet Combo-Preise aus dem letzten Combo-Trade — der kann stundenlang
@@ -2462,7 +2465,8 @@ async def place_order(ib, sig):
                 # Paper-Konto: OCA-Gruppe als Bracket-Ersatz (Error 201 verhindert parentId)
                 # Beide Orders stehen in IBKR auch wenn der Bot abstürzt
                 import random as _rnd
-                _oca = f"BPS_{sym}_{int(time.time())}_{_rnd.randint(100,999)}"
+                import time as _time
+                _oca = f"BPS_{sym}_{int(_time.time())}_{_rnd.randint(100,999)}"
                 tp_trade = sl_trade = None
                 try:
                     tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')

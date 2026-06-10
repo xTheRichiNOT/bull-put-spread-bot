@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.27": [
+        "🐛  fix: import time fehlte in place_order — NameError beim Platzieren behoben",
+        "✨  Akt. P&L wird jetzt direkt aus IB-Portfolio gezogen — auch nach Bot-Neustart ohne bekannten Einstiegspreis",
+    ],
     "3.2.22": [
         "🐛  Fenster öffnet wieder — withdraw/deiconify entfernt, after(0) für Maximierung",
     ],
