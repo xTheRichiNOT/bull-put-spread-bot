@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.30": [
+        "🐛  Einstellungen-Felder nicht mehr anklickbar behoben — BooleanVar explizit gesetzt statt Konstruktor-Argument (Windows-CTk Bug)",
+    ],
     "3.2.29": [
         "🐛  Hard-Gate nutzt jetzt ausschließlich Min. Credit ($) — Prozent-Floor blockiert Dollar-Einstellung nicht mehr",
     ],
@@ -1958,7 +1961,8 @@ class BotLauncher(ctk.CTk):
         parent.configure(fg_color=C["surface"])
 
         # ── Sicherer-Modus Header ─────────────────────────────────────────────
-        self._safe_mode_var = ctk.BooleanVar(value=False)  # default: entsperrt
+        self._safe_mode_var = ctk.BooleanVar()
+        self._safe_mode_var.set(False)   # explizit nach Erstellung setzen (Windows-CTk Bug)
         self._input_widgets: list = []
 
         safe_bar = ctk.CTkFrame(parent, fg_color=C["surface2"],
@@ -1968,9 +1972,9 @@ class BotLauncher(ctk.CTk):
 
         self._safe_mode_lbl = ctk.CTkLabel(
             safe_bar,
-            text="🔒  Sicherer Modus — Einstellungen gesperrt",
+            text="🔓  Einstellungen bearbeitbar",
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=C["amber"])
+            text_color=C["green"])
         self._safe_mode_lbl.pack(side="left", padx=14)
 
         ctk.CTkCheckBox(safe_bar, text="Sicherer Modus",
@@ -2116,8 +2120,7 @@ class BotLauncher(ctk.CTk):
         self._save_lbl.grid(row=self._row, column=0, columnspan=3,
                             sticky="w", padx=6)
 
-        # Initialen Zustand (gesperrt) anwenden und Scroll-Events binden
-        self.after(50, self._apply_safe_mode)
+        # Scroll-Events binden (nach Render-Zyklus)
         self.after(100, self._bind_settings_scroll)
 
     def _bind_settings_scroll(self):
@@ -2317,8 +2320,6 @@ class BotLauncher(ctk.CTk):
             self._safe_mode_lbl.configure(
                 text="🔓  Einstellungen bearbeitbar",
                 text_color=C["green"])
-        # Scroll-Bindings nach Zustandswechsel erneuern
-        self.after(50, self._bind_settings_scroll)
 
     def _reset_to_defaults(self):
         """Füllt alle Einstellungsfelder mit Standardwerten (ohne Speichern)."""
