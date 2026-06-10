@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.31": [
+        "🐛  Paper-Konto: Error 201 Combo-Limit — BAG-Order-Schwelle auf 2 gesenkt (IBKR Paper erlaubt max. 2 aktive Riskless/Guaranteed-Loss Combo-Orders gleichzeitig)",
+    ],
     "3.2.30": [
         "🐛  Einstellungen-Felder nicht mehr anklickbar behoben — BooleanVar explizit gesetzt statt Konstruktor-Argument (Windows-CTk Bug)",
     ],

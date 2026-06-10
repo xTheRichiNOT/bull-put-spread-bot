@@ -2455,8 +2455,9 @@ async def place_order(ib, sig):
             _is_paper = ACCOUNT_ID.upper().startswith('DU')
 
             # ── Combo-Limit-Check: IB erlaubt max. ~8 aktive BAG-Orders ─────────────
-            # Ohne diesen Check wird die Entry-Order direkt von IB mit Error 201
-            # ("maximum limit of active riskless combination orders") abgelehnt.
+            # Paper-Konten: IBKR hat ein hartes Limit für "Riskless/Guaranteed-Loss
+            # Combination Orders" — typisch 2 gleichzeitig. Jede Position mit aktivem
+            # OCA-Bracket belegt 2 Slots (TP + SL). Neuer Entry würde Error 201 auslösen.
             _BLOCKING_ENTRY = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending'}
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.3)
@@ -2464,8 +2465,10 @@ async def place_order(ib, sig):
                 1 for t in ib.openTrades()
                 if t.contract.secType == 'BAG' and t.orderStatus.status in _BLOCKING_ENTRY
             )
-            if _active_bag_n >= 7:
-                log(f"  ⏳ [{sym}] IB-Combo-Limit: {_active_bag_n}/7 aktive BAG-Orders — "
+            _bag_limit = 2 if _is_paper else 7
+            if _active_bag_n >= _bag_limit:
+                log(f"  ⏳ [{sym}] IB-Combo-Limit ({'Paper' if _is_paper else 'Live'}): "
+                    f"{_active_bag_n}/{_bag_limit} aktive BAG-Orders — "
                     f"Entry zurückgestellt (nächster Scan-Zyklus)")
                 _bot_trades.pop(sym, None)   # kein hängender State für dieses Symbol
                 return False
