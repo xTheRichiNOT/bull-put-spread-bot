@@ -708,10 +708,18 @@ def _on_order_status(trade):
         if current_st in ('open', 'closing', 'recovery_pending'):
             entry_oid = _bot_trades[sym].get('entry_order_id', -1)
             if not _bot_trades[sym].get('fill_confirmed', True) and order_id == entry_oid:
-                # Entry-Order abgelehnt bevor sie gefüllt wurde — Position nie eröffnet
-                _bot_trades[sym]['status'] = 'failed'
-                log(f"  🚫 [{sym}] Entry-Order #{order_id} abgelehnt (nie gefüllt) — "
-                    f"Position nicht eröffnet, nächster Zyklus")
+                # Entry-Order abgelehnt bevor sie gefüllt wurde — Retry oder aufgeben
+                _MAX_ENTRY_RETRIES = 3
+                _rc = _bot_trades[sym].get('entry_retry_count', 0) + 1
+                if _rc <= _MAX_ENTRY_RETRIES:
+                    _delay = 60 * _rc   # 60 / 120 / 180 s
+                    _bot_trades[sym]['status']            = 'entry_retry'
+                    _bot_trades[sym]['entry_retry_count'] = _rc
+                    _bot_trades[sym]['entry_retry_at']    = (datetime.now() + timedelta(seconds=_delay)).timestamp()
+                    log(f"  🔁 [{sym}] Entry #{order_id} abgelehnt — RETRY {_rc}/{_MAX_ENTRY_RETRIES} in {_delay}s")
+                else:
+                    _bot_trades[sym]['status'] = 'failed'
+                    log(f"  🚫 [{sym}] Entry #{order_id} abgelehnt — {_MAX_ENTRY_RETRIES} Versuche erschöpft, aufgegeben")
             else:
                 # Position war offen — Exit-Order gescheitert → Backoff-Retry
                 _delay = _exit_retry_delay(_bot_trades[sym])
@@ -721,9 +729,18 @@ def _on_order_status(trade):
                 log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY in {_delay}s "
                     f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
         else:
-            # Kein offener Trade — nur überspringen
-            _bot_trades[sym]['status'] = 'cancelled'
-            log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — kein offener Spread, Symbol übersprungen")
+            # Kein offener Trade (OCA TP/SL abgelehnt) — Entry-Retry falls noch nicht erschöpft
+            _MAX_ENTRY_RETRIES = 3
+            _rc = _bot_trades[sym].get('entry_retry_count', 0) + 1
+            if _rc <= _MAX_ENTRY_RETRIES:
+                _delay = 60 * _rc
+                _bot_trades[sym]['status']            = 'entry_retry'
+                _bot_trades[sym]['entry_retry_count'] = _rc
+                _bot_trades[sym]['entry_retry_at']    = (datetime.now() + timedelta(seconds=_delay)).timestamp()
+                log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — ENTRY_RETRY {_rc}/{_MAX_ENTRY_RETRIES} in {_delay}s")
+            else:
+                _bot_trades[sym]['status'] = 'cancelled'
+                log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — {_MAX_ENTRY_RETRIES} Versuche erschöpft, gecancelt")
         _save_state()
     elif status == 'Filled':
         filled_qty = trade.orderStatus.filled or 0
@@ -1995,6 +2012,16 @@ async def monitor_exits(ib=None):
             info['status'] = 'closing'   # kurz auf 'closing' für close_spread
             async with _sym_lock(symbol):
                 await close_spread(ib, symbol, info, 'RETRY_EXIT')
+            continue
+
+        # ENTRY_RETRY: Entry-Order wurde abgelehnt — nach Delay Symbol freigeben, Scanner retried
+        if info.get('status') == 'entry_retry':
+            retry_at = info.get('entry_retry_at', 0)
+            if datetime.now().timestamp() >= retry_at:
+                _rc = info.get('entry_retry_count', 1)
+                log(f"  🔁 [{symbol}] ENTRY_RETRY {_rc}/3 — Symbol freigegeben, Scanner versucht erneut")
+                _bot_trades.pop(symbol, None)
+                _save_state()
             continue
 
         # Stale-Closing: Exit-Order hängt >20 Min ohne Fill → stornieren und sofort neu

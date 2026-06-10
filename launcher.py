@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.33": [
+        "✨  Entry-Retry: abgelehnte Entry-Orders werden bis zu 3× automatisch neu versucht (60/120/180s Delay)",
+        "✨  Status 'Entry Retry X/3' in Offene Positionen — Exit-Button bleibt erreichbar",
+    ],
     "3.2.32": [
         "✨  Status-Spalte: Gecancelt / Offen / Schließt… / Fehler / Verfall OTM klar unterschieden",
         "✨  TP Hit mit ✓-Haken, Retry in Amber statt Rot, unbekannte Status zeigen Rohwert statt 'Schließt…'",
@@ -1761,6 +1765,9 @@ class BotLauncher(ctk.CTk):
             close_reason = p.get("close_reason", "")
             if status == "open":
                 status_txt, status_col = "Offen", "#4ade80"
+            elif status == "entry_retry":
+                _erc = p.get("entry_retry_count", 1)
+                status_txt, status_col = f"Entry Retry {_erc}/3", "#f59e0b"
             elif status == "cancelled":
                 status_txt, status_col = "Gecancelt", C["dim"]
             elif status == "failed":
@@ -1790,7 +1797,7 @@ class BotLauncher(ctk.CTk):
             lbl(row, status_txt, 70, status_col)
 
             # Exit-Button: für aktive Positionen und Fehler-/Retry-Status
-            if status in ("open", "error", "exit_retry"):
+            if status in ("open", "error", "exit_retry", "entry_retry"):
                 sym_ref = p.get("symbol", "")
                 def _make_exit_fn(sym):
                     def _do_exit():
