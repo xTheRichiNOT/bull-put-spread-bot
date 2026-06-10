@@ -2962,24 +2962,31 @@ async def run_bot(stop_event: threading.Event = None):
         # Paper-OCA-Cleanup: seit v3.2.34 werden auf Paper-Konten keine Broker-seitigen
         # TP/SL-Orders mehr angelegt. Bestehende OCA-Bracket-Orders aus älteren Versionen
         # belegen IBKRs "riskless combo"-Limit (max. 2) und blockieren neue Entries → canceln.
+        # Strategie: alle offenen BAG-BUY-Orders auf Paper canceln (BUY = TP/SL/Close-Orders;
+        # Entry-Orders sind SELL-type). Auch Orders ohne gespeicherte ID (FTNT) werden erfasst.
         _is_paper_startup = ACCOUNT_ID.upper().startswith('DU')
         if _is_paper_startup:
-            _paper_oca = [(sym, label, info.get(label, 0))
-                          for sym, info in list(_bot_trades.items())
-                          for label in ('tp_order_id', 'sl_order_id')
-                          if info.get(label, 0) > 0]
-            if _paper_oca:
-                log(f"  🧹 Paper-OCA-Cleanup: {len(_paper_oca)} alte Bracket-Order(s) stornieren ...")
-                for _sym, _lbl, _oid in _paper_oca:
-                    try:
-                        _expected_cancels.add(_oid)
-                        await _ib_cancel_paced(ib, _oid)
-                        log(f"     → #{_oid} ({_sym} {_lbl[:2].upper()}) storniert")
-                    except Exception as _e:
-                        log(f"     ⚠️  #{_oid} Cancel-Fehler: {_e}")
-                    _bot_trades[_sym].pop(_lbl, None)
+            _old_oca_buys = [
+                o for o in open_orders
+                if o.contract.secType == 'BAG' and o.order.action.upper() == 'BUY'
+            ]
+            if _old_oca_buys:
+                log(f"  🧹 Paper-OCA-Cleanup: {len(_old_oca_buys)} BAG-BUY-Order(s) stornieren (alte TP/SL-Brackets) ...")
+                for _zo in _old_oca_buys:
+                    _zoid = _zo.order.orderId or 0
+                    if _zoid > 0:
+                        try:
+                            _expected_cancels.add(_zoid)
+                            await _ib_cancel_paced(ib, _zoid)
+                            log(f"     → #{_zoid} ({_zo.contract.symbol} BUY) storniert")
+                        except Exception as _ze:
+                            log(f"     ⚠️  #{_zoid} Cancel-Fehler: {_ze}")
+                # Gespeicherte OCA-IDs aus _bot_trades löschen
+                for _sym_c in _bot_trades:
+                    _bot_trades[_sym_c].pop('tp_order_id', None)
+                    _bot_trades[_sym_c].pop('sl_order_id', None)
                 _save_state()
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
 
         # Startup-BAG-Sweep: zombie BAG-Orders canceln (gecrashe Exits).
         # Schützt: (a) Symbole mit status='closing', (b) bekannte TP/SL-Bracket-Order-IDs
