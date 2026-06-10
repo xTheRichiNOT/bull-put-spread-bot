@@ -705,15 +705,22 @@ def _on_order_status(trade):
             return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
         current_st = _bot_trades[sym].get('status', '')
         if current_st in ('open', 'closing', 'recovery_pending'):
-            # Position war offen — Exit gescheitert → Backoff-Retry
-            _delay = _exit_retry_delay(_bot_trades[sym])
-            retry_ts = (datetime.now() + timedelta(seconds=_delay)).timestamp()
-            _bot_trades[sym]['status']   = 'exit_retry'
-            _bot_trades[sym]['retry_at'] = retry_ts
-            log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY in {_delay}s "
-                f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
+            entry_oid = _bot_trades[sym].get('entry_order_id', -1)
+            if not _bot_trades[sym].get('fill_confirmed', True) and order_id == entry_oid:
+                # Entry-Order abgelehnt bevor sie gefüllt wurde — Position nie eröffnet
+                _bot_trades[sym]['status'] = 'failed'
+                log(f"  🚫 [{sym}] Entry-Order #{order_id} abgelehnt (nie gefüllt) — "
+                    f"Position nicht eröffnet, nächster Zyklus")
+            else:
+                # Position war offen — Exit-Order gescheitert → Backoff-Retry
+                _delay = _exit_retry_delay(_bot_trades[sym])
+                retry_ts = (datetime.now() + timedelta(seconds=_delay)).timestamp()
+                _bot_trades[sym]['status']   = 'exit_retry'
+                _bot_trades[sym]['retry_at'] = retry_ts
+                log(f"  🔁 [{sym}] Order #{order_id} abgelehnt — EXIT_RETRY in {_delay}s "
+                    f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
         else:
-            # Kein offener Trade (Entry-Order gecancelt) — nur überspringen
+            # Kein offener Trade — nur überspringen
             _bot_trades[sym]['status'] = 'cancelled'
             log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — kein offener Spread, Symbol übersprungen")
         _save_state()
@@ -2445,6 +2452,22 @@ async def place_order(ib, sig):
             sl_close = round(limit_price * STOP_LOSS_MULT, 2)
 
             _is_paper = ACCOUNT_ID.upper().startswith('DU')
+
+            # ── Combo-Limit-Check: IB erlaubt max. ~8 aktive BAG-Orders ─────────────
+            # Ohne diesen Check wird die Entry-Order direkt von IB mit Error 201
+            # ("maximum limit of active riskless combination orders") abgelehnt.
+            _BLOCKING_ENTRY = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending'}
+            await ib.reqAllOpenOrdersAsync()
+            await asyncio.sleep(0.3)
+            _active_bag_n = sum(
+                1 for t in ib.openTrades()
+                if t.contract.secType == 'BAG' and t.orderStatus.status in _BLOCKING_ENTRY
+            )
+            if _active_bag_n >= 7:
+                log(f"  ⏳ [{sym}] IB-Combo-Limit: {_active_bag_n}/7 aktive BAG-Orders — "
+                    f"Entry zurückgestellt (nächster Scan-Zyklus)")
+                _bot_trades.pop(sym, None)   # kein hängender State für dieses Symbol
+                return False
 
             # SELL-Order: IBKR führt ComboLeg-Aktionen exakt aus (SELL short put, BUY long put = Bull Put Spread)
             # BUY-Order würde Legs umkehren → Bear Put Spread (falsches Ergebnis)
