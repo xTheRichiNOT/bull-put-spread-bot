@@ -417,13 +417,44 @@ def _exit_retry_delay(info: dict) -> int:
     info['retry_count'] = count + 1
     return delay
 
+async def _wait_tickers(tickers, timeout: float = 5.0, interval: float = 0.4) -> bool:
+    """Pollt bis alle Ticker einen Bid ODER Ask (>0) liefern — statt fixer sleep(5).
+    Spart pro Marktdaten-Abfrage typischerweise 3-4s; Timeout bleibt die Obergrenze."""
+    def _ready(t):
+        return bool((t.bid and t.bid > 0) or (t.ask and t.ask > 0))
+    waited = 0.0
+    while waited < timeout:
+        if all(_ready(t) for t in tickers):
+            await asyncio.sleep(interval)   # 1 Tick Puffer: beide Seiten (Bid+Ask) ankommen lassen
+            return True
+        await asyncio.sleep(interval)
+        waited += interval
+    return False
+
+# NYSE-Feiertage (ganztägig geschlossen) — jährlich pflegen!
+# Quelle: nyse.com/markets/hours-calendars
+_NYSE_HOLIDAYS = {
+    # 2026
+    '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+    '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+    # 2027
+    '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31',
+    '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+}
+# Verkürzte Handelstage (Schluss 13:00 ET statt 16:00)
+_NYSE_EARLY_CLOSE = {'2026-11-27', '2026-12-24', '2027-11-26'}
+
 def is_market_open() -> bool:
-    """NYSE offen: Mo–Fr 09:30–16:00 ET (15:30–22:00 MEZ/15:30–22:00 MESZ)."""
+    """NYSE offen: Mo–Fr 09:30–16:00 ET, ohne Feiertage; Early-Close-Tage bis 13:00 ET."""
     now_et = _now_et()
     if now_et.weekday() >= 5:
         return False
+    today = now_et.strftime('%Y-%m-%d')
+    if today in _NYSE_HOLIDAYS:
+        return False
+    close_hour = 13 if today in _NYSE_EARLY_CLOSE else 16
     open_t  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_t = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    close_t = now_et.replace(hour=close_hour, minute=0, second=0, microsecond=0)
     return open_t <= now_et < close_t
 
 def seconds_until_market_open() -> tuple:
@@ -431,10 +462,12 @@ def seconds_until_market_open() -> tuple:
     um Timezone-Fold-Probleme auf Windows/ZoneInfo zu vermeiden."""
     now_et = _now_et()
     tz     = now_et.tzinfo
-    for delta in range(8):   # max 7 Tage vorausschauen
+    for delta in range(15):   # max 14 Tage vorausschauen (Feiertags-Cluster um Weihnachten)
         d    = (now_et + timedelta(days=delta)).date()
         cand = datetime(d.year, d.month, d.day, 9, 30, 0, tzinfo=tz)
         if cand.weekday() >= 5:   # Wochenende überspringen
+            continue
+        if cand.strftime('%Y-%m-%d') in _NYSE_HOLIDAYS:   # Feiertage überspringen
             continue
         secs = int((cand - now_et).total_seconds())
         if secs > 0:
@@ -444,6 +477,12 @@ def seconds_until_market_open() -> tuple:
 
 # Speichert IV vom letzten Scan pro Symbol — für Spike-Erkennung
 _iv_memory: dict = {}
+# Letzter IBKR-Fehlercode pro Order-ID (reqId == orderId bei Order-Fehlern).
+# Strukturelle Fehler → Retry sinnlos, dieselbe Order würde identisch abgelehnt:
+# 201=riskless/guaranteed-loss, 110=Tick-Size, 203=Security nicht erlaubt,
+# 461/463=ungültige Order-Attribute, 478=Combo-Leg-Fehler
+_order_error_codes: dict = {}
+_FATAL_ORDER_ERRORS = {201, 110, 203, 461, 463, 478}
 # Speichert aktive Bot-Trades für Exit-Monitoring
 _bot_trades: dict = {}
 # IB-validierte Strikes und Expiries pro Symbol (einmalig beim Start geladen)
@@ -669,14 +708,19 @@ def _load_state():
         pass
 
 def _save_state():
-    """Schreibt aktive Spread-Positionen auf Disk (nur open/closing mit short_conid)."""
+    """Schreibt aktive Spread-Positionen auf Disk (nur open/closing mit short_conid).
+    Atomar via tmp + os.replace — ein Crash mitten im Write korrumpiert den State nicht."""
     try:
         import json
         data = {sym: info
                 for sym, info in _bot_trades.items()
                 if info.get('status') in ('open', 'closing', 'exit_retry') and info.get('short_conid')}
-        with open(_STATE_FILE, 'w') as f:
+        _tmp = _STATE_FILE + '.tmp'
+        with open(_tmp, 'w') as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, _STATE_FILE)
     except Exception:
         pass
 
@@ -695,8 +739,8 @@ def _cancel_order_by_id(ib, order_id: int, symbol: str, label: str):
         log(f"  ⚠️  [{symbol}] Konnte {label}-Order #{order_id} nicht stornieren: {e}")
 
 async def _place_paper_oca(ib, sym):
-    """Platziert TP/SL OCA-Bracket auf Paper NACH Entry-Fill.
-    Entry-Slot ist dann frei → TP + SL belegen genau die 2 erlaubten Slots."""
+    """Self-Healing: platziert TP/SL als OCA-Paar NACH Entry-Fill, falls die
+    Bracket-Kinder beim Entry nicht angelegt werden konnten (Reject/Crash)."""
     info = _bot_trades.get(sym)
     if not info:
         return
@@ -706,30 +750,33 @@ async def _place_paper_oca(ib, sym):
     short_conid = info.get('short_conid', 0)
     long_conid  = info.get('long_conid', 0)
     if not (tp_close > 0 and sl_close > 0 and short_conid and long_conid):
-        log(f"  ⚠️  [{sym}] Paper-OCA: Daten unvollständig — kein Bracket (TP={tp_close} SL={sl_close})")
+        log(f"  ⚠️  [{sym}] OCA-Fallback: Daten unvollständig — kein Bracket (TP={tp_close} SL={sl_close})")
         return
     try:
+        # Kauf-Konvention: BUY short / SELL long → BUY-Order schließt den Spread (positiver Debit)
         bag = Bag(
             symbol=sym, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=short_conid, ratio=1, action='SELL', exchange='SMART'),
-                ComboLeg(conId=long_conid,  ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=short_conid, ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=long_conid,  ratio=1, action='SELL', exchange='SMART'),
             ]
         )
         import random as _rnd, time as _time
-        _oca = f"BPS_{sym}_{int(_time.time())}_{_rnd.randint(100,999)}"
+        _oca  = f"BPS_{sym}_{int(_time.time())}_{_rnd.randint(100,999)}"
+        _acct = ACCOUNT_ID or _cfg.get('ib_account', '')
 
         tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
         tp_order.ocaGroup = _oca
         tp_order.ocaType  = 1
         tp_order.transmit = True
-        tp_order.account = _cfg.get('ib_account', '')
+        tp_order.account = _acct
 
-        sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
+        # SL als Stop-Order: Limit-BUY über Markt würde sofort füllen und die Position schließen
+        sl_order = StopOrder('BUY', n_contracts, sl_close, tif='GTC')
         sl_order.ocaGroup = _oca
         sl_order.ocaType  = 1
         sl_order.transmit = True
-        sl_order.account = _cfg.get('ib_account', '')
+        sl_order.account = _acct
 
         if _ibq is not None:
             tp_trade = await _ibq.place(ib, bag, tp_order)
@@ -741,11 +788,11 @@ async def _place_paper_oca(ib, sym):
         _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
         _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
         _save_state()
-        log(f"  ✅ [{sym}] OCA-BRACKET (Paper, post-fill) gesetzt — "
-            f"TP #{tp_trade.order.orderId} @ ${tp_close:.2f} / SL #{sl_trade.order.orderId} @ ${sl_close:.2f}")
+        log(f"  ✅ [{sym}] OCA-BRACKET (Fallback, post-fill) gesetzt — "
+            f"TP #{tp_trade.order.orderId} LMT ${tp_close:.2f} / SL #{sl_trade.order.orderId} STP ${sl_close:.2f}")
     except Exception as _e:
         import traceback as _tb
-        log(f"  ❌ [{sym}] Paper-OCA post-fill fehlgeschlagen: {_e}\n{_tb.format_exc()}")
+        log(f"  ❌ [{sym}] OCA-Fallback post-fill fehlgeschlagen: {_e}\n{_tb.format_exc()}")
 
 
 def _on_order_status(trade):
@@ -759,11 +806,30 @@ def _on_order_status(trade):
         if order_id in _expected_cancels:
             _expected_cancels.discard(order_id)
             return  # absichtliche TP/SL-Stornierung — Symbol nicht sperren
+        # TP/SL-Bracket-Kind storniert/abgelehnt → kein Entry-/Exit-Retry auslösen
+        _tp_c = _bot_trades[sym].get('tp_order_id', 0)
+        _sl_c = _bot_trades[sym].get('sl_order_id', 0)
+        if order_id and order_id in (_tp_c, _sl_c):
+            if _bot_trades[sym].get('status') in ('done', 'expired_otm', 'failed', 'cancelled'):
+                return  # Position bereits zu (z.B. OCA-Gegenstück nach TP/SL-Fill)
+            _label = 'TP' if order_id == _tp_c else 'SL'
+            _bot_trades[sym]['tp_order_id' if order_id == _tp_c else 'sl_order_id'] = 0
+            log(f"  ⚠️  [{sym}] {_label}-Order #{order_id} abgelehnt/storniert — "
+                f"Software-{_label} (monitor_exits) übernimmt")
+            _save_state()
+            return
         current_st = _bot_trades[sym].get('status', '')
         if current_st in ('open', 'closing', 'recovery_pending'):
             entry_oid = _bot_trades[sym].get('entry_order_id', -1)
             if not _bot_trades[sym].get('fill_confirmed', True) and order_id == entry_oid:
                 # Entry-Order abgelehnt bevor sie gefüllt wurde — Retry oder aufgeben
+                _err = _order_error_codes.pop(order_id, None)
+                if _err in _FATAL_ORDER_ERRORS:
+                    _bot_trades[sym]['status'] = 'failed'
+                    log(f"  🚫 [{sym}] Entry #{order_id} abgelehnt — IBKR Error {_err} ist "
+                        f"strukturell (Order wäre identisch falsch) → kein Retry, aufgegeben")
+                    _save_state()
+                    return
                 _MAX_ENTRY_RETRIES = 3
                 _rc = _bot_trades[sym].get('entry_retry_count', 0) + 1
                 if _rc <= _MAX_ENTRY_RETRIES:
@@ -785,6 +851,13 @@ def _on_order_status(trade):
                     f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
         else:
             # Kein offener Trade (OCA TP/SL abgelehnt) — Entry-Retry falls noch nicht erschöpft
+            _err = _order_error_codes.pop(order_id, None)
+            if _err in _FATAL_ORDER_ERRORS:
+                _bot_trades[sym]['status'] = 'cancelled'
+                log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — IBKR Error {_err} ist "
+                    f"strukturell → kein Retry")
+                _save_state()
+                return
             _MAX_ENTRY_RETRIES = 3
             _rc = _bot_trades[sym].get('entry_retry_count', 0) + 1
             if _rc <= _MAX_ENTRY_RETRIES:
@@ -812,12 +885,16 @@ def _on_order_status(trade):
             log(f"  💰 [{sym}] EXIT AUSGEFÜHRT @ ${exit_fill:.2f}/Share — Position geschlossen!")
         elif order_id and _tp_oid and order_id == _tp_oid:
             # IB-Bracket Take-Profit ausgeführt — kein close_spread() nötig
+            if _sl_oid:
+                _expected_cancels.add(_sl_oid)   # OCA storniert SL automatisch — kein Retry auslösen
             exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
             _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
             log(f"  💰 [{sym}] TP AUSGEFÜHRT (IB-Bracket) @ ${exit_fill:.2f}/Share — Position geschlossen!")
         elif order_id and _sl_oid and order_id == _sl_oid:
             # IB-Bracket Stop-Loss ausgeführt — kein close_spread() nötig
+            if _tp_oid:
+                _expected_cancels.add(_tp_oid)   # OCA storniert TP automatisch — kein Retry auslösen
             exit_fill = abs(trade.orderStatus.avgFillPrice or 0)
             _bot_trades[sym]['status'] = 'done'
             _append_history(sym, _bot_trades[sym], exit_per_share=exit_fill)
@@ -831,8 +908,9 @@ def _on_order_status(trade):
                 log(f"  💰 [{sym}] TRADE AUSGEFÜHRT @ ${abs(fill):.2f}/Share — Viel Erfolg!")
             else:
                 log(f"  ✅ [{sym}] Entry-Order bestätigt (Fill-Preis folgt)")
-            # Paper: OCA-Bracket JETZT platzieren (Entry-Slot frei → genau 2 Slots für TP+SL)
-            if ACCOUNT_ID.upper().startswith('DU') and _ib_ref is not None:
+            # Self-Healing: Bracket-Kinder fehlen (Reject beim Entry)? → OCA-Paar nachschieben
+            if _ib_ref is not None and not _bot_trades[sym].get('tp_order_id') \
+                    and not _bot_trades[sym].get('sl_order_id'):
                 asyncio.ensure_future(_place_paper_oca(_ib_ref, sym))
         _save_state()
 
@@ -1590,7 +1668,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
             if _l_con_net.conId > 0:
                 async with _sem_ib_mktdata:
                     _t_long = ib.reqMktData(_l_con_net, '', False, False)
-                    await asyncio.sleep(5)
+                    await _wait_tickers([_t_long], timeout=5.0)
                     _la = _t_long.ask if (_t_long.ask and not math.isnan(_t_long.ask) and _t_long.ask > 0) else 0.0
                     if _la == 0.0:
                         _la = _t_long.bid if (_t_long.bid and not math.isnan(_t_long.bid) and _t_long.bid > 0) else 0.0
@@ -1612,16 +1690,19 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
             l_con = Option(symbol, expiry_ib_str, long_strike,  'P', 'SMART')
             await ib.qualifyContractsAsync(s_con, l_con)
             if s_con.conId > 0 and l_con.conId > 0:
+                # Kauf-Konvention: BUY short / SELL long → Combo-Wert positiv (= Credit).
+                # Vorher (SELL/BUY) war der Combo-Preis negativ und der `> 0`-Check
+                # hat die IB-Combo-Quote immer verworfen.
                 combo_bag = Bag(
                     symbol=symbol, exchange='SMART', currency='USD',
                     comboLegs=[
-                        ComboLeg(conId=s_con.conId, ratio=1, action='SELL', exchange='SMART'),
-                        ComboLeg(conId=l_con.conId, ratio=1, action='BUY',  exchange='SMART'),
+                        ComboLeg(conId=s_con.conId, ratio=1, action='BUY',  exchange='SMART'),
+                        ComboLeg(conId=l_con.conId, ratio=1, action='SELL', exchange='SMART'),
                     ]
                 )
                 async with _sem_ib_mktdata:
                     t_combo = ib.reqMktData(combo_bag, '', False, False)
-                    await asyncio.sleep(5)
+                    await _wait_tickers([t_combo], timeout=5.0)
                     combo_bid = t_combo.bid if (t_combo.bid and not math.isnan(t_combo.bid)) else None
                     try: ib.cancelMktData(t_combo)
                     except Exception: pass
@@ -1762,7 +1843,7 @@ async def get_spread_value(symbol, expiry_yf, short_strike, long_strike, ib=None
             async with _sem_ib_mktdata:
                 t_s = ib.reqMktData(s_contract, '', False, False)
                 t_l = ib.reqMktData(l_contract,  '', False, False)
-                await asyncio.sleep(4)
+                await _wait_tickers([t_s, t_l], timeout=4.0)
                 s_bid = t_s.bid if (t_s.bid and t_s.bid > 0) else None
                 s_ask = t_s.ask if (t_s.ask and t_s.ask > 0) else None
                 l_bid = t_l.bid if (t_l.bid and t_l.bid > 0) else None
@@ -1929,12 +2010,14 @@ async def close_spread(ib, symbol, info, reason):
             log(f"  ✅ [{symbol}] IB clean ({len(_active_combos)} aktive BAGs) — sende Exit-Order")
 
         # ── PHASE 4: PLACE ──────────────────────────────────────────────────────
-        # BUY kehrt Legs um: SELL short_put (deckt Short) + BUY long_put (schließt Long)
+        # Legs in IBKR-Kauf-Konvention (BUY short / SELL long) — eine BUY-Order auf
+        # diese Combo führt die Legs exakt aus: BUY short_put (deckt Short) +
+        # SELL long_put (schließt Long) = Spread-Close zum positiven Debit.
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=info['short_conid'], ratio=1, action='SELL', exchange='SMART'),
-                ComboLeg(conId=info['long_conid'],  ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
             ]
         )
         entry = info['entry_per_share']
@@ -1964,9 +2047,9 @@ async def close_spread(ib, symbol, info, reason):
             close_limit = 5.00
             src = 'absolute fallback'
         close_limit = max(close_limit, 0.05)
-        order = LimitOrder('BUY', 1, close_limit, tif='DAY')
-        # NonGuaranteed entfernt: IBKR ignoriert lmtPrice bei Non-Guaranteed-Routing
-        order.account = _cfg.get('ib_account', '')
+        _n_close = max(1, int(info.get('n_contracts', 1)))
+        order = LimitOrder('BUY', _n_close, close_limit, tif='DAY')
+        order.account = ACCOUNT_ID or _cfg.get('ib_account', '')
         if _ibq is not None:
             trade = await _ibq.place(ib, bag, order)
         else:
@@ -2213,8 +2296,8 @@ async def monitor_exits(ib=None):
         pnl_pct     = (pnl_per_ctr / (entry * 100) * 100) if entry > 0 else 0
 
         # Breakeven: bestehende SL-Order auf Breakeven-Preis modifizieren (Modify, kein Cancel)
-        # Kein Cancel des TP nötig → kein Error 201 (TP-Leg BUY long_put ≠ BE-SL SELL long_put
-        # tritt nur auf wenn neues Bag mit umgekehrten Legs platziert wird)
+        # Bei +25% Profit wird der Stop-Trigger von SL-Ziel auf Entry+2% gezogen →
+        # Position kann ab dann (fast) nicht mehr im Verlust schließen.
         if pnl_share >= entry * BREAKEVEN_TRIGGER_PCT and not info.get('at_breakeven'):
             async with _sym_lock(symbol):
                 if info.get('at_breakeven'):     # double-check nach Lock-Erwerb
@@ -2225,20 +2308,23 @@ async def monitor_exits(ib=None):
                     sl_order_id = info.get('sl_order_id', 0)
                     sl_modified = False
 
-                    # Primär: bestehende SL-Order auf Breakeven-Preis modifizieren (kein Cancel nötig)
+                    # Primär: bestehende SL-Order auf Breakeven modifizieren (kein Cancel nötig)
                     if sl_order_id and ib is not None:
                         await ib.reqAllOpenOrdersAsync()
                         await asyncio.sleep(0.5)
                         for t in ib.openTrades():
                             if t.order.orderId == sl_order_id:
-                                t.order.lmtPrice = be_close
+                                if (t.order.orderType or '').startswith('STP'):
+                                    t.order.auxPrice = be_close   # Stop-Trigger verschieben
+                                else:
+                                    t.order.lmtPrice = be_close   # Legacy: Limit-SL
                                 if _ibq is not None:
                                     asyncio.ensure_future(_ibq.place(ib, t.contract, t.order))
                                 else:
                                     ib.placeOrder(t.contract, t.order)
                                 sl_modified = True
                                 log(f"  🔒 [{symbol}] Breakeven-SL @ ${be_close:.2f} GTC "
-                                    f"(Modify #{sl_order_id}) | P&L: +${pnl_dollar:.0f}")
+                                    f"(Modify #{sl_order_id}, {t.order.orderType}) | P&L: +${pnl_dollar:.0f}")
                                 break
 
                     if not sl_modified:
@@ -2265,14 +2351,13 @@ async def monitor_exits(ib=None):
             f"  |  TP: +{tp_pct:.0f}%  SL: -{sl_pct:.0f}%{be_flag}"
             f"  |  Entry ${entry*100:.0f} → jetzt ${current*100:.0f}")
 
-        # ── Software-TP/SL Fallback: nur für Positionen OHNE IB-Bracket-Orders ──
-        # Betrifft Legacy-Positionen (tp_order_id=0) oder wenn Bracket-Platzierung
-        # beim Entry fehlschlug. IB-Bracket-Positionen werden von _on_order_status
-        # behandelt — hier niemals eingreifen wenn tp_order_id gesetzt ist.
-        if not info.get('tp_order_id') and not info.get('sl_order_id') and ib is not None:
+        # ── Software-TP/SL Fallback: pro Seite, nur wenn KEINE IB-Order existiert ──
+        # Betrifft Legacy-Positionen oder wenn ein Bracket-Kind abgelehnt wurde.
+        # Hat eine Seite eine aktive IB-Order, greift dort _on_order_status — nie doppelt.
+        if ib is not None:
             tp_close_price = round(entry * (1 - TAKE_PROFIT_PCT), 2)
             sl_close_price = round(entry * STOP_LOSS_MULT, 2)
-            if current <= tp_close_price and not info.get('tp_hit'):
+            if not info.get('tp_order_id') and current <= tp_close_price and not info.get('tp_hit'):
                 log(f"  🎯 [{symbol}] Software-TP (kein Bracket): "
                     f"${current*100:.0f}¢ ≤ ${tp_close_price*100:.0f}¢ — schließe Position")
                 async with _sym_lock(symbol):
@@ -2280,7 +2365,7 @@ async def monitor_exits(ib=None):
                     _save_state()
                     await close_spread(ib, symbol, info, 'TP_HIT')
                 continue
-            if current >= sl_close_price and not info.get('sl_hit'):
+            if not info.get('sl_order_id') and current >= sl_close_price and not info.get('sl_hit'):
                 log(f"  🛑 [{symbol}] Software-SL (kein Bracket): "
                     f"${current*100:.0f}¢ ≥ ${sl_close_price*100:.0f}¢ — schließe Position")
                 async with _sym_lock(symbol):
@@ -2342,11 +2427,16 @@ async def place_order(ib, sig):
                 log(f"  ❌ [{sym}] Qualifizierung fehlgeschlagen — Order abgebrochen")
                 return
 
+            # WICHTIG (IBKR-Konvention): ComboLeg-Actions beschreiben den KAUF der Combo.
+            # Eine SELL-Order INVERTIERT alle Legs. Damit "SELL Combo @ positiver Credit"
+            # den Bull Put Spread eröffnet (SELL short_put + BUY long_put), müssen die
+            # Legs hier als BUY short / SELL long definiert sein. Falsch herum definiert
+            # hat die Combo negativen Wert → IBKR Error 201 "Riskless combination".
             bag = Bag(
                 symbol=sym, exchange='SMART', currency='USD',
                 comboLegs=[
-                    ComboLeg(conId=short_contract.conId, ratio=1, action='SELL', exchange='SMART'),
-                    ComboLeg(conId=long_contract.conId,  ratio=1, action='BUY',  exchange='SMART'),
+                    ComboLeg(conId=short_contract.conId, ratio=1, action='BUY',  exchange='SMART'),
+                    ComboLeg(conId=long_contract.conId,  ratio=1, action='SELL', exchange='SMART'),
                 ]
             )
 
@@ -2357,7 +2447,7 @@ async def place_order(ib, sig):
             async with _sem_ib_mktdata:
                 t_short = ib.reqMktData(short_contract, '', False, False)
                 t_long  = ib.reqMktData(long_contract,  '', False, False)
-                await asyncio.sleep(5)
+                await _wait_tickers([t_short, t_long], timeout=5.0)
                 short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
                 long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
             try:
@@ -2537,14 +2627,15 @@ async def place_order(ib, sig):
             _is_paper = ACCOUNT_ID.upper().startswith('DU')
 
             # ── Combo-Limit-Check: IB erlaubt max. ~8 aktive BAG-Orders ─────────────
-            # Paper: nur noch Entry-Order (kein OCA-Bracket) → 1 BAG pro Position, füllt schnell.
-            # Live: Bracket-Orders (parentId) zählen als separate BAGs.
+            # Es zählen nur ENTRY-Orders (ohne parentId): TP/SL-Bracket-Kinder ruhen
+            # serverseitig und dürfen neue Entries nicht blockieren.
             _BLOCKING_ENTRY = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel', 'ApiPending'}
             await ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
             _active_bag_n = sum(
                 1 for t in ib.openTrades()
                 if t.contract.secType == 'BAG' and t.orderStatus.status in _BLOCKING_ENTRY
+                and not t.order.parentId
             )
             _bag_limit = 4 if _is_paper else 7
             if _active_bag_n >= _bag_limit:
@@ -2554,16 +2645,21 @@ async def place_order(ib, sig):
                 _bot_trades.pop(sym, None)   # kein hängender State für dieses Symbol
                 return False
 
-            # SELL-Order: IBKR führt ComboLeg-Aktionen exakt aus (SELL short put, BUY long put = Bull Put Spread)
-            # BUY-Order würde Legs umkehren → Bear Put Spread (falsches Ergebnis)
-            entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='GTC')
-            entry_order.transmit = True
+            # SELL-Order auf die (BUY short / SELL long)-Combo → IBKR invertiert die Legs
+            # und eröffnet den Bull Put Spread (SELL short_put + BUY long_put) zum Credit.
+            _acct = ACCOUNT_ID or _cfg.get('ib_account', '')
+            # Entry als DAY: füllt er heute nicht, storniert IBKR zum Handelsschluss —
+            # kein Übernacht-Fill zu Konditionen, die der Scanner nie geprüft hat.
+            # TP/SL bleiben GTC (sichern die Position über die gesamte Laufzeit).
+            entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='DAY')
+            entry_order.transmit = False   # erst SL-Kind (transmit=True) aktiviert das Paket atomar
             # NonGuaranteed=1 entfernt: bei Non-Guaranteed-Routing ignoriert IBKR lmtPrice
             # auf Combo-Ebene (erfordert orderComboLegs pro Leg) → Limit kommt als 0.00 an.
             # Ohne dieses Tag nutzt IBKR guaranteed combo routing → lmtPrice wird korrekt übertragen.
-            entry_order.account = _cfg.get('ib_account', '')
+            entry_order.account = _acct
             log(f"  🔍 [{sym}] Order-Debug: action={entry_order.action} qty={entry_order.totalQuantity} "
-                f"lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} transmit={entry_order.transmit}")
+                f"type={entry_order.orderType} lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} "
+                f"acct={_acct or 'default'}")
             if _ibq is not None:
                 entry_trade = await _ibq.place(ib, bag, entry_order)
             else:
@@ -2572,53 +2668,52 @@ async def place_order(ib, sig):
 
             _bot_trades[sym]['entry_order_id'] = parent_id
 
-            if _is_paper:
-                # Paper-Konto: KEINE Broker-seitigen TP/SL-Orders
-                # IBKR Paper limitiert "riskless/guaranteed-loss combination orders" auf 2 account-weit.
-                # OCA-Bracket (2 weitere BAG-Orders) würde Error 201 auslösen sobald eine Position offen ist.
-                # Lösung: TP/SL-Preise nur lokal speichern — monitor_exits überwacht und schließt per Software.
-                _bot_trades[sym]['tp_price'] = tp_close
-                _bot_trades[sym]['sl_price'] = sl_close
-                _bot_trades[sym].pop('tp_order_id', None)
-                _bot_trades[sym].pop('sl_order_id', None)
+            # ── Dreierpack: TP + SL als Bracket-Kinder (Paper UND Live identisch) ──
+            # parentId → IBKR hält die Kinder serverseitig zurück bis der Entry füllt,
+            # aktiviert sie danach automatisch als OCA-Paar (eins füllt → anderes weg).
+            # Überlebt Bot-Neustarts, da alle drei Orders im IB-Orderbuch liegen.
+            # TP: Limit-BUY unter Markt (ruht bis Gewinnziel).
+            tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
+            tp_order.parentId = parent_id
+            tp_order.transmit = False
+            tp_order.account = _acct
+            if _ibq is not None:
+                tp_trade = await _ibq.place(ib, bag, tp_order)
             else:
-                # Live-Konto: klassisches Bracket mit TP + SL
-                tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
-                tp_order.parentId = parent_id
-                tp_order.transmit = False
-                tp_order.account = _cfg.get('ib_account', '')
-                if _ibq is not None:
-                    tp_trade = await _ibq.place(ib, bag, tp_order)
-                else:
-                    tp_trade = ib.placeOrder(bag, tp_order)
+                tp_trade = ib.placeOrder(bag, tp_order)
 
-                sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
-                sl_order.parentId = parent_id
-                sl_order.transmit = True
-                sl_order.account = _cfg.get('ib_account', '')
-                if _ibq is not None:
-                    sl_trade = await _ibq.place(ib, bag, sl_order)
-                else:
-                    sl_trade = ib.placeOrder(bag, sl_order)
+            # SL: MUSS eine Stop-Order sein (STP, auxPrice=Trigger). Eine Limit-BUY-Order
+            # über dem Marktpreis (z.B. 1.26 bei Markt 0.84) wäre sofort marketable und
+            # würde die Position direkt nach dem Fill wieder schließen!
+            sl_order = StopOrder('BUY', n_contracts, sl_close, tif='GTC')
+            sl_order.parentId = parent_id
+            sl_order.transmit = True   # letztes Glied → transmittiert das gesamte Bracket
+            sl_order.account = _acct
+            if _ibq is not None:
+                sl_trade = await _ibq.place(ib, bag, sl_order)
+            else:
+                sl_trade = ib.placeOrder(bag, sl_order)
 
-                _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
-                _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
-                _bot_trades[sym]['tp_price']    = tp_close
-                _bot_trades[sym]['sl_price']    = sl_close
+            _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+            _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+            _bot_trades[sym]['tp_price']    = tp_close
+            _bot_trades[sym]['sl_price']    = sl_close
 
             _save_state()
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
-            if _is_paper:
-                log(f"  ✅ [{sym}] ENTRY-ORDER GESENDET (Paper — OCA-Bracket nach Fill) × {n_contracts} Kontrakt(e)")
-                log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
-                log(f"     TP-Ziel:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f}) → OCA bei Fill")
-                log(f"     SL-Ziel:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f}) → OCA bei Fill")
-            else:
-                log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
-                log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
-                log(f"     TP     #{tp_trade.order.orderId}:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})")
-                log(f"     SL     #{sl_trade.order.orderId}:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})")
+            # Kurz auf den ersten Status warten — Erfolg NICHT loggen wenn IBKR sofort ablehnt
+            await asyncio.sleep(2.0)
+            _st = entry_trade.orderStatus.status
+            if _st in ('Cancelled', 'ApiCancelled', 'Inactive'):
+                log(f"  ⚠️  [{sym}] Entry #{parent_id} von IBKR abgelehnt ({_st}) — "
+                    f"Retry-Logik übernimmt")
+                return False
+            _mode = 'Paper' if _is_paper else 'Live'
+            log(f"  ✅ [{sym}] BRACKET PLATZIERT ({_mode} — Entry DAY, TP/SL GTC) × {n_contracts} Kontrakt(e)")
+            log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x  [{_st}]")
+            log(f"     TP     #{tp_trade.order.orderId}:  LMT +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})  → aktiv nach Fill")
+            log(f"     SL     #{sl_trade.order.orderId}:  STP +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})  → aktiv nach Fill, BE bei +{BREAKEVEN_TRIGGER_PCT:.0%}")
             return True
     except Exception as e:
         import traceback
@@ -2877,6 +2972,8 @@ async def run_bot(stop_event: threading.Event = None):
         # >=2000 = reine Info/System-Meldungen, nicht relevant
         _SUPPRESS_CODES = {200, 354, 10167}
         def _on_ib_error(reqId, errorCode, errorString, _contract):
+            if errorCode < 2000 and reqId and reqId > 0:
+                _order_error_codes[reqId] = errorCode   # für fehlercode-bewusste Retry-Logik
             if errorCode < 2000 and errorCode not in _SUPPRESS_CODES:
                 log(f"  ⚠️  IBKR Error {errorCode} (reqId={reqId}): {errorString}")
         ib.errorEvent += _on_ib_error
@@ -3016,51 +3113,25 @@ async def run_bot(stop_event: threading.Event = None):
         if ghost_syms:
             _save_state()
 
-        # Paper-OCA-Cleanup: seit v3.2.34 werden auf Paper-Konten keine Broker-seitigen
-        # TP/SL-Orders mehr angelegt. Bestehende OCA-Bracket-Orders aus älteren Versionen
-        # belegen IBKRs "riskless combo"-Limit (max. 2) und blockieren neue Entries → canceln.
-        # Strategie: alle offenen BAG-BUY-Orders auf Paper canceln (BUY = TP/SL/Close-Orders;
-        # Entry-Orders sind SELL-type). Auch Orders ohne gespeicherte ID (FTNT) werden erfasst.
+        # Startup-Diagnose: offene BAG-Orders anzeigen. Bekannte Bracket-Kinder (TP/SL)
+        # bleiben aktiv — sie sind die Absicherung offener Positionen und überleben
+        # Bot-Neustarts genau deshalb serverseitig bei IBKR.
         _is_paper_startup = ACCOUNT_ID.upper().startswith('DU')
-        if _is_paper_startup:
-            # Debug: zeige alle gefundenen BAG-Orders für Diagnose
-            _all_bags = [o for o in open_orders if o.contract.secType == 'BAG']
-            log(f"  🔍 Paper-Startup: {len(open_orders)} offene Orders total, "
-                f"{len(_all_bags)} BAG-Orders gefunden: "
+        _all_bags = [o for o in open_orders if o.contract.secType == 'BAG']
+        if _all_bags:
+            log(f"  🔍 Startup: {len(open_orders)} offene Orders total, "
+                f"{len(_all_bags)} BAG-Orders: "
                 f"{[(o.contract.symbol, o.order.action, o.order.orderId) for o in _all_bags]}")
-            _old_oca_buys = [o for o in _all_bags if o.order.action.upper() == 'BUY']
-            if _old_oca_buys:
-                log(f"  🧹 Paper-OCA-Cleanup: {len(_old_oca_buys)} BAG-BUY-Order(s) stornieren (alte TP/SL-Brackets) ...")
-                for _zo in _old_oca_buys:
-                    _zoid = _zo.order.orderId or 0
-                    if _zoid > 0:
-                        try:
-                            _expected_cancels.add(_zoid)
-                            await _ib_cancel_paced(ib, _zoid)
-                            log(f"     → #{_zoid} ({_zo.contract.symbol} BUY) storniert")
-                        except Exception as _ze:
-                            log(f"     ⚠️  #{_zoid} Cancel-Fehler: {_ze}")
-                # Gespeicherte OCA-IDs aus _bot_trades löschen
-                for _sym_c in _bot_trades:
-                    _bot_trades[_sym_c].pop('tp_order_id', None)
-                    _bot_trades[_sym_c].pop('sl_order_id', None)
-                _save_state()
-                await asyncio.sleep(1.5)
-            else:
-                log(f"  ✅ Paper-OCA-Cleanup: keine BAG-BUY-Orders — keine Aktion nötig")
 
         # Startup-BAG-Sweep: zombie BAG-Orders canceln (gecrashe Exits).
-        # Schützt: (a) Symbole mit status='closing', (b) bekannte TP/SL-Bracket-Order-IDs
-        # für Live-Positionen — diese sollen auf IB aktiv bleiben.
-        # Paper: keine OCA-IDs mehr schützen (werden oben gecancelt).
+        # Schützt: (a) Symbole mit aktivem Status, (b) bekannte TP/SL-Bracket-Order-IDs
+        # — auf Paper UND Live, denn die Brackets sind die Absicherung offener Positionen.
         _protected_syms = {s for s, v in _bot_trades.items()
                            if v.get('status') in ('closing', 'open', 'exit_retry')}
-        if _is_paper_startup:
-            _protected_oids = set()
-        else:
-            _protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
-                            | {v.get('sl_order_id', 0) for v in _bot_trades.values()}
-            _protected_oids.discard(0)
+        _protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
+                        | {v.get('sl_order_id', 0) for v in _bot_trades.values()} \
+                        | {v.get('entry_order_id', 0) for v in _bot_trades.values()}
+        _protected_oids.discard(0)
         _zombie_bags  = [
             o for o in open_orders
             if o.contract.secType == 'BAG'
