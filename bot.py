@@ -401,6 +401,7 @@ class _IBOrderQueue:
                 self._q.task_done()
 
 _ibq: _IBOrderQueue | None = None  # wird in run_bot() initialisiert
+_ib_ref = None                     # aktive IB-Verbindung für async Callbacks
 
 async def _ib_cancel_paced(ib, oid: int) -> None:
     """Compat-Wrapper: leitet an _ibq weiter falls verfügbar, sonst direkter Call."""
@@ -693,6 +694,62 @@ def _cancel_order_by_id(ib, order_id: int, symbol: str, label: str):
     except Exception as e:
         log(f"  ⚠️  [{symbol}] Konnte {label}-Order #{order_id} nicht stornieren: {e}")
 
+async def _place_paper_oca(ib, sym):
+    """Platziert TP/SL OCA-Bracket auf Paper NACH Entry-Fill.
+    Entry-Slot ist dann frei → TP + SL belegen genau die 2 erlaubten Slots."""
+    info = _bot_trades.get(sym)
+    if not info:
+        return
+    tp_close    = info.get('tp_price', 0)
+    sl_close    = info.get('sl_price', 0)
+    n_contracts = info.get('n_contracts', 1)
+    short_conid = info.get('short_conid', 0)
+    long_conid  = info.get('long_conid', 0)
+    if not (tp_close > 0 and sl_close > 0 and short_conid and long_conid):
+        log(f"  ⚠️  [{sym}] Paper-OCA: Daten unvollständig — kein Bracket (TP={tp_close} SL={sl_close})")
+        return
+    try:
+        bag = Bag(
+            symbol=sym, exchange='SMART', currency='USD',
+            comboLegs=[
+                ComboLeg(conId=short_conid, ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=long_conid,  ratio=1, action='BUY',  exchange='SMART'),
+            ]
+        )
+        import random as _rnd, time as _time
+        _oca = f"BPS_{sym}_{int(_time.time())}_{_rnd.randint(100,999)}"
+
+        tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
+        tp_order.ocaGroup = _oca
+        tp_order.ocaType  = 1
+        tp_order.transmit = True
+        tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+        tp_order.account = _cfg.get('ib_account', '')
+
+        sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
+        sl_order.ocaGroup = _oca
+        sl_order.ocaType  = 1
+        sl_order.transmit = True
+        sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+        sl_order.account = _cfg.get('ib_account', '')
+
+        if _ibq is not None:
+            tp_trade = await _ibq.place(ib, bag, tp_order)
+            sl_trade = await _ibq.place(ib, bag, sl_order)
+        else:
+            tp_trade = ib.placeOrder(bag, tp_order)
+            sl_trade = ib.placeOrder(bag, sl_order)
+
+        _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+        _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+        _save_state()
+        log(f"  ✅ [{sym}] OCA-BRACKET (Paper, post-fill) gesetzt — "
+            f"TP #{tp_trade.order.orderId} @ ${tp_close:.2f} / SL #{sl_trade.order.orderId} @ ${sl_close:.2f}")
+    except Exception as _e:
+        import traceback as _tb
+        log(f"  ❌ [{sym}] Paper-OCA post-fill fehlgeschlagen: {_e}\n{_tb.format_exc()}")
+
+
 def _on_order_status(trade):
     """IBKR Event-Handler: aktualisiert _bot_trades wenn Order gecancelt oder gefüllt wird."""
     sym = trade.contract.symbol
@@ -776,6 +833,9 @@ def _on_order_status(trade):
                 log(f"  💰 [{sym}] TRADE AUSGEFÜHRT @ ${abs(fill):.2f}/Share — Viel Erfolg!")
             else:
                 log(f"  ✅ [{sym}] Entry-Order bestätigt (Fill-Preis folgt)")
+            # Paper: OCA-Bracket JETZT platzieren (Entry-Slot frei → genau 2 Slots für TP+SL)
+            if ACCOUNT_ID.upper().startswith('DU') and _ib_ref is not None:
+                asyncio.ensure_future(_place_paper_oca(_ib_ref, sym))
         _save_state()
 
 def _bs_put(S, K, T, sigma, r=0.045):
@@ -2502,10 +2562,11 @@ async def place_order(ib, sig):
             # SELL-Order: IBKR führt ComboLeg-Aktionen exakt aus (SELL short put, BUY long put = Bull Put Spread)
             # BUY-Order würde Legs umkehren → Bear Put Spread (falsches Ergebnis)
             entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='GTC')
-            # Paper: transmit=True (kein Bracket) — IBKR lehnt Combo-Child-Orders ab (Error 201)
-            entry_order.transmit = _is_paper
+            entry_order.transmit = True
             entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
             entry_order.account = _cfg.get('ib_account', '')
+            log(f"  🔍 [{sym}] Order-Debug: action={entry_order.action} qty={entry_order.totalQuantity} "
+                f"lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} transmit={entry_order.transmit}")
             if _ibq is not None:
                 entry_trade = await _ibq.place(ib, bag, entry_order)
             else:
@@ -2554,10 +2615,10 @@ async def place_order(ib, sig):
 
             log(f"  🟡 [{sym}] ORDER GESENDET — warte auf Broker-Bestätigung ...")
             if _is_paper:
-                log(f"  ✅ [{sym}] ENTRY-ORDER GESENDET (Paper — TP/SL per Bot-Monitoring) × {n_contracts} Kontrakt(e)")
+                log(f"  ✅ [{sym}] ENTRY-ORDER GESENDET (Paper — OCA-Bracket nach Fill) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
-                log(f"     TP-Ziel:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f}) — Bot überwacht")
-                log(f"     SL-Ziel:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f}) — Bot überwacht")
+                log(f"     TP-Ziel:  +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f}) → OCA bei Fill")
+                log(f"     SL-Ziel:  +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f}) → OCA bei Fill")
             else:
                 log(f"  ✅ [{sym}] BRACKET-ORDER PLATZIERT (alle GTC) × {n_contracts} Kontrakt(e)")
                 log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x")
@@ -2744,8 +2805,9 @@ async def _reconnect_ib(ib: 'IB', host: str, port: int,
 
 
 async def run_bot(stop_event: threading.Event = None):
-    global _ibq
+    global _ibq, _ib_ref
     ib = IB()
+    _ib_ref = ib
     log(f"🤖 Master-Bot startet... Verbinde zur IB (Port {_cfg.get('ib_port', 7496)})")
     _print_shadow_summary(days=30)
 
