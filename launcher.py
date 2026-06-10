@@ -92,6 +92,9 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "3.2.28": [
+        "✨  Einstellungen: Min. Credit (% Spread-Breite) jetzt konfigurierbar — verhindert dass 18%-Floor den Dollar-Wert übersteuert",
+    ],
     "3.2.27": [
         "🐛  fix: import time fehlte in place_order — NameError beim Platzieren behoben",
         "✨  Akt. P&L wird jetzt direkt aus IB-Portfolio gezogen — auch nach Bot-Neustart ohne bekannten Einstiegspreis",
@@ -378,6 +381,7 @@ DEFAULT_CONFIG = {
     "min_vola":            0.28,
     "abstand_y":           0.10,
     "min_credit":          70,
+    "min_credit_pct":      0.18,
     "min_risk_reward":     0.20,
     "max_delta":           0.28,
     "max_positions":       8,
@@ -2066,6 +2070,7 @@ class BotLauncher(ctk.CTk):
         field("Min. Implied Volatility (IV)",   "min_vola",        tip="0.28 = 28%  — IV-Filter für genug Prämie")
         field("OTM-Abstand Short Strike",       "abstand_y",       tip="0.10 = 10% unter aktuellem Kurs")
         field("Min. Credit pro Kontrakt ($)",   "min_credit",      tip="Empfohlen: 70–100 $")
+        field("Min. Credit (% Spread-Breite)", "min_credit_pct",  tip="0.18 = 18% — bei $5-Spread → $90 Floor | 0 = deaktiviert")
         field("Min. Risk/Reward Ratio",         "min_risk_reward", tip="0.20 = Prämie ≥ 20% des max. Risikos")
         field("Max. Delta Short-Put",           "max_delta",       tip="0.28 = Short-Put max. 28% Ausübungswahrsch.")
         field("Min. Score (Entry-Schwelle)",    "entry_threshold", tip="0.60 = nur Trades mit Score ≥ 0.60 | höher = selektiver, weniger Trades")

@@ -146,7 +146,7 @@ MIN_IV_SPIKE     = 0.05
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
-MIN_CREDIT_PERCENT = 0.18   # 18 % der Spread-Breite als Mindest-Credit (relativ)
+MIN_CREDIT_PERCENT = float(_cfg.get('min_credit_pct', 0.18))  # % der Spread-Breite als Mindest-Credit
 MIN_CREDIT_ABS     = float(_cfg.get('min_credit', _cfg.get('min_credit_abs', 80)))  # Absolutes Minimum pro Kontrakt
 MIN_RISK_REWARD  = float(_cfg['min_risk_reward'])
 MAX_DELTA        = float(_cfg['max_delta'])
@@ -313,7 +313,7 @@ def _reload_cfg():
     """Lädt config.json neu — aktualisiert Exit-/Trade-Parameter ohne Bot-Neustart."""
     global TAKE_PROFIT_PCT, STOP_LOSS_MULT, BREAKEVEN_TRIGGER_PCT, DTE_EXIT
     global AUTO_TRADE, MAX_POSITIONS, MAX_PER_SECTOR, SCAN_INTERVALL
-    global MIN_CREDIT_ABS, MIN_RISK_REWARD, MAX_DELTA
+    global MIN_CREDIT_ABS, MIN_CREDIT_PERCENT, MIN_RISK_REWARD, MAX_DELTA
     try:
         if not os.path.exists(_cfg_path):
             return
@@ -328,6 +328,7 @@ def _reload_cfg():
         MAX_PER_SECTOR        = int(updated['max_per_sector'])
         SCAN_INTERVALL        = int(updated['scan_intervall'])
         MIN_CREDIT_ABS        = float(updated.get('min_credit', updated.get('min_credit_abs', 80)))
+        MIN_CREDIT_PERCENT    = float(updated.get('min_credit_pct', 0.18))
         MIN_RISK_REWARD       = float(updated['min_risk_reward'])
         MAX_DELTA             = float(updated['max_delta'])
     except Exception:
