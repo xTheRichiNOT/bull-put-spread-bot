@@ -3028,10 +3028,12 @@ async def run_bot(stop_event: threading.Event = None):
         # Entry-Orders sind SELL-type). Auch Orders ohne gespeicherte ID (FTNT) werden erfasst.
         _is_paper_startup = ACCOUNT_ID.upper().startswith('DU')
         if _is_paper_startup:
-            _old_oca_buys = [
-                o for o in open_orders
-                if o.contract.secType == 'BAG' and o.order.action.upper() == 'BUY'
-            ]
+            # Debug: zeige alle gefundenen BAG-Orders für Diagnose
+            _all_bags = [o for o in open_orders if o.contract.secType == 'BAG']
+            log(f"  🔍 Paper-Startup: {len(open_orders)} offene Orders total, "
+                f"{len(_all_bags)} BAG-Orders gefunden: "
+                f"{[(o.contract.symbol, o.order.action, o.order.orderId) for o in _all_bags]}")
+            _old_oca_buys = [o for o in _all_bags if o.order.action.upper() == 'BUY']
             if _old_oca_buys:
                 log(f"  🧹 Paper-OCA-Cleanup: {len(_old_oca_buys)} BAG-BUY-Order(s) stornieren (alte TP/SL-Brackets) ...")
                 for _zo in _old_oca_buys:
@@ -3049,6 +3051,8 @@ async def run_bot(stop_event: threading.Event = None):
                     _bot_trades[_sym_c].pop('sl_order_id', None)
                 _save_state()
                 await asyncio.sleep(1.5)
+            else:
+                log(f"  ✅ Paper-OCA-Cleanup: keine BAG-BUY-Orders — keine Aktion nötig")
 
         # Startup-BAG-Sweep: zombie BAG-Orders canceln (gecrashe Exits).
         # Schützt: (a) Symbole mit status='closing', (b) bekannte TP/SL-Bracket-Order-IDs
