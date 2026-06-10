@@ -723,14 +723,12 @@ async def _place_paper_oca(ib, sym):
         tp_order.ocaGroup = _oca
         tp_order.ocaType  = 1
         tp_order.transmit = True
-        tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         tp_order.account = _cfg.get('ib_account', '')
 
         sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
         sl_order.ocaGroup = _oca
         sl_order.ocaType  = 1
         sl_order.transmit = True
-        sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
         sl_order.account = _cfg.get('ib_account', '')
 
         if _ibq is not None:
@@ -1967,10 +1965,7 @@ async def close_spread(ib, symbol, info, reason):
             src = 'absolute fallback'
         close_limit = max(close_limit, 0.05)
         order = LimitOrder('BUY', 1, close_limit, tif='DAY')
-        # Close-Orders: NonGuaranteed='0' (gleichzeitige Leg-Ausführung)
-        # NonGuaranteed='1' triggert IBKR Error 201 "Guaranteed-to-Lose" auf Paper-Konten
-        # wenn das Spread tief ITM ist (maximaler Verlust quasi sicher).
-        order.smartComboRoutingParams = [TagValue('NonGuaranteed', '0')]
+        # NonGuaranteed entfernt: IBKR ignoriert lmtPrice bei Non-Guaranteed-Routing
         order.account = _cfg.get('ib_account', '')
         if _ibq is not None:
             trade = await _ibq.place(ib, bag, order)
@@ -2563,7 +2558,9 @@ async def place_order(ib, sig):
             # BUY-Order würde Legs umkehren → Bear Put Spread (falsches Ergebnis)
             entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='GTC')
             entry_order.transmit = True
-            entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
+            # NonGuaranteed=1 entfernt: bei Non-Guaranteed-Routing ignoriert IBKR lmtPrice
+            # auf Combo-Ebene (erfordert orderComboLegs pro Leg) → Limit kommt als 0.00 an.
+            # Ohne dieses Tag nutzt IBKR guaranteed combo routing → lmtPrice wird korrekt übertragen.
             entry_order.account = _cfg.get('ib_account', '')
             log(f"  🔍 [{sym}] Order-Debug: action={entry_order.action} qty={entry_order.totalQuantity} "
                 f"lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} transmit={entry_order.transmit}")
@@ -2589,7 +2586,6 @@ async def place_order(ib, sig):
                 tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
                 tp_order.parentId = parent_id
                 tp_order.transmit = False
-                tp_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                 tp_order.account = _cfg.get('ib_account', '')
                 if _ibq is not None:
                     tp_trade = await _ibq.place(ib, bag, tp_order)
@@ -2599,7 +2595,6 @@ async def place_order(ib, sig):
                 sl_order = LimitOrder('BUY', n_contracts, sl_close, tif='GTC')
                 sl_order.parentId = parent_id
                 sl_order.transmit = True
-                sl_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '1')]
                 sl_order.account = _cfg.get('ib_account', '')
                 if _ibq is not None:
                     sl_trade = await _ibq.place(ib, bag, sl_order)
