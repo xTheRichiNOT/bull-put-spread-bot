@@ -2959,14 +2959,40 @@ async def run_bot(stop_event: threading.Event = None):
         if ghost_syms:
             _save_state()
 
+        # Paper-OCA-Cleanup: seit v3.2.34 werden auf Paper-Konten keine Broker-seitigen
+        # TP/SL-Orders mehr angelegt. Bestehende OCA-Bracket-Orders aus älteren Versionen
+        # belegen IBKRs "riskless combo"-Limit (max. 2) und blockieren neue Entries → canceln.
+        _is_paper_startup = ACCOUNT_ID.upper().startswith('DU')
+        if _is_paper_startup:
+            _paper_oca = [(sym, label, info.get(label, 0))
+                          for sym, info in list(_bot_trades.items())
+                          for label in ('tp_order_id', 'sl_order_id')
+                          if info.get(label, 0) > 0]
+            if _paper_oca:
+                log(f"  🧹 Paper-OCA-Cleanup: {len(_paper_oca)} alte Bracket-Order(s) stornieren ...")
+                for _sym, _lbl, _oid in _paper_oca:
+                    try:
+                        _expected_cancels.add(_oid)
+                        await _ib_cancel_paced(ib, _oid)
+                        log(f"     → #{_oid} ({_sym} {_lbl[:2].upper()}) storniert")
+                    except Exception as _e:
+                        log(f"     ⚠️  #{_oid} Cancel-Fehler: {_e}")
+                    _bot_trades[_sym].pop(_lbl, None)
+                _save_state()
+                await asyncio.sleep(1.0)
+
         # Startup-BAG-Sweep: zombie BAG-Orders canceln (gecrashe Exits).
         # Schützt: (a) Symbole mit status='closing', (b) bekannte TP/SL-Bracket-Order-IDs
-        # für 'open'-Positionen — diese sollen auf IB aktiv bleiben.
+        # für Live-Positionen — diese sollen auf IB aktiv bleiben.
+        # Paper: keine OCA-IDs mehr schützen (werden oben gecancelt).
         _protected_syms = {s for s, v in _bot_trades.items()
                            if v.get('status') in ('closing', 'open', 'exit_retry')}
-        _protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
-                        | {v.get('sl_order_id', 0) for v in _bot_trades.values()}
-        _protected_oids.discard(0)
+        if _is_paper_startup:
+            _protected_oids = set()
+        else:
+            _protected_oids = {v.get('tp_order_id', 0) for v in _bot_trades.values()} \
+                            | {v.get('sl_order_id', 0) for v in _bot_trades.values()}
+            _protected_oids.discard(0)
         _zombie_bags  = [
             o for o in open_orders
             if o.contract.secType == 'BAG'
