@@ -2072,14 +2072,21 @@ async def close_spread(ib, symbol, info, reason):
         # Legs in IBKR-Kauf-Konvention (BUY short / SELL long) — eine BUY-Order auf
         # diese Combo führt die Legs exakt aus: BUY short_put (deckt Short) +
         # SELL long_put (schließt Long) = Spread-Close zum positiven Debit.
+        _sc = info.get('short_conid')
+        _lc = info.get('long_conid')
+        if not _sc or not _lc:
+            log(f"  🚫 [{symbol}] Exit abgebrochen — ConIds fehlen (short={_sc}, long={_lc})")
+            info['status'] = 'error'
+            _save_state()
+            return
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=info['short_conid'], ratio=1, action='BUY',  exchange='SMART'),
-                ComboLeg(conId=info['long_conid'],  ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=_sc, ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=_lc, ratio=1, action='SELL', exchange='SMART'),
             ]
         )
-        entry = info['entry_per_share']
+        entry = info.get('entry_per_share', 0)
         info['close_reason'] = reason
 
         info['status'] = 'closing'
