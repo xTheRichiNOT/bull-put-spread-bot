@@ -3259,6 +3259,135 @@ class BotLauncher(ctk.CTk):
         self._an_output.configure(state="disabled")
         self._an_output_text = None
 
+        # ── Gate-Funnel Sektion ───────────────────────────────────────────────
+        ctk.CTkLabel(sc, text="  🔻 Gate-Funnel Auswertung", anchor="w",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["accent"]).pack(fill="x", padx=12, pady=(18, 2))
+
+        funnel_fi = ctk.CTkFrame(sc, fg_color=C["surface2"], corner_radius=8)
+        funnel_fi.pack(fill="x", padx=12)
+        ctk.CTkLabel(funnel_fi, text="Datei:", font=ctk.CTkFont(size=12),
+                     text_color=C["muted"]).pack(side="left", padx=(12, 6), pady=8)
+        _fpath = os.path.join(_BASE, "funnel_log.jsonl")
+        ctk.CTkLabel(funnel_fi, text=_fpath,
+                     font=ctk.CTkFont(family="Courier", size=11),
+                     text_color=C["text"]).pack(side="left")
+        self._funnel_count_lbl = ctk.CTkLabel(funnel_fi, text="",
+                                              font=ctk.CTkFont(size=11),
+                                              text_color=C["muted"])
+        self._funnel_count_lbl.pack(side="right", padx=12)
+        try:
+            with open(_fpath) as _ff:
+                self._funnel_count_lbl.configure(text=f"{sum(1 for _ in _ff)} Scans")
+        except Exception:
+            self._funnel_count_lbl.configure(text="(noch keine Daten)")
+
+        funnel_ctrl = ctk.CTkFrame(sc, fg_color="transparent")
+        funnel_ctrl.pack(fill="x", padx=12, pady=(8, 0))
+        self._funnel_btn = ctk.CTkButton(
+            funnel_ctrl, text="▶  Funnel auswerten", width=170, height=36,
+            fg_color=C["accent"], hover_color="#009e78", text_color="#000000",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._funnel_run)
+        self._funnel_btn.pack(side="left", padx=(0, 12))
+        self._funnel_status_lbl = ctk.CTkLabel(
+            funnel_ctrl, text="Bereit — Klick zum Start.",
+            font=ctk.CTkFont(size=11), text_color=C["muted"])
+        self._funnel_status_lbl.pack(side="left")
+
+        ctk.CTkLabel(sc, text="  Funnel-Ausgabe", anchor="w",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=C["muted"]).pack(fill="x", padx=12, pady=(12, 2))
+        self._funnel_output = ctk.CTkTextbox(
+            sc, height=280,
+            font=ctk.CTkFont(family="Courier", size=10),
+            fg_color=C["bg"], text_color=C["text"],
+            border_color=C["border"], border_width=1)
+        self._funnel_output.pack(fill="both", expand=True, padx=12, pady=(0, 16))
+        self._funnel_output.configure(state="disabled")
+
+    def _funnel_run(self):
+        self._funnel_btn.configure(state="disabled", text="⏳  Läuft...")
+        self._funnel_status_lbl.configure(text="Auswertung läuft...", text_color=C["muted"])
+        threading.Thread(target=self._funnel_run_thread, daemon=True).start()
+
+    def _funnel_run_thread(self):
+        try:
+            import json as _j, collections
+            fpath = os.path.join(_BASE, "funnel_log.jsonl")
+            if not os.path.exists(fpath):
+                self.after(0, lambda: self._funnel_show("Keine Daten — funnel_log.jsonl nicht gefunden.\nBot muss mindestens einen Scan-Zyklus gelaufen sein."))
+                return
+            lines = []
+            with open(fpath, encoding="utf-8") as _ff:
+                for _l in _ff:
+                    _l = _l.strip()
+                    if _l:
+                        try: lines.append(_j.loads(_l))
+                        except Exception: pass
+            if not lines:
+                self.after(0, lambda: self._funnel_show("Keine auswertbaren Einträge."))
+                return
+
+            total_scans   = len(lines)
+            total_qual    = sum(l.get("qualified", 0) for l in lines)
+            gate_totals   = collections.Counter()
+            for l in lines:
+                for g, n in l.get("gates", {}).items():
+                    gate_totals[g] += n
+
+            _LABELS = {
+                "keine_daten":    "Keine Preisdaten",
+                "kein_iv":        "Kein IV",
+                "iv_floor":       "IV ≤ Floor / Rank",
+                "earnings_hard":  "Earnings-HardBlock",
+                "keine_strikes":  "Keine IB Strike-Map",
+                "dte":            "Kein DTE im Fenster",
+                "kein_otm_strike":"Kein OTM-Strike",
+                "nicht_verbunden":"IB nicht verbunden",
+                "kein_short":     "Short-Put nicht qualifizierbar",
+                "kein_bid_ask":   "Kein Bid/Ask von IB",
+                "liquidity":      "Bid/Ask-Spread zu weit",
+                "kein_live_bid":  "Kein Live-Bid",
+                "kein_live_data": "Keine Live-Daten",
+                "prob_otm":       "P(Win) außerhalb Korridor",
+                "prob_max_loss":  "P(MaxVerlust) zu hoch",
+                "ev_ratio":       "EV-Ratio zu niedrig",
+                "bs_schatzung":   "BS-Schätzung (kein echtes Bid)",
+                "credit_hard":    "Credit < Minimum (Hard-Gate)",
+                "score":          "Score < Schwelle (kein TRADE)",
+            }
+            first = lines[0].get("ts", "?")
+            last  = lines[-1].get("ts", "?")
+            avg_q = total_qual / total_scans if total_scans else 0
+
+            out = []
+            out.append("🔻 GATE-FUNNEL AUSWERTUNG")
+            out.append("─" * 64)
+            out.append(f"Zeitraum :  {first}  →  {last}")
+            out.append(f"Scans    :  {total_scans}")
+            out.append(f"Signale  :  {total_qual} qualifiziert  (Ø {avg_q:.2f} / Scan)")
+            out.append("")
+            out.append(f"  {'Gate':<40} {'Gesamt':>7}  {'Ø/Scan':>7}  Balken")
+            out.append("  " + "─" * 60)
+            for gate, total in gate_totals.most_common():
+                label = _LABELS.get(gate, gate)
+                avg   = total / total_scans
+                bar   = "█" * min(20, round(avg * 2))
+                out.append(f"  {label:<40} {total:>7}  {avg:>7.1f}  {bar}")
+            self.after(0, lambda o="\n".join(out): self._funnel_show(o))
+        except Exception:
+            import traceback
+            self.after(0, lambda e=traceback.format_exc(): self._funnel_show(f"❌ Fehler:\n{e}"))
+
+    def _funnel_show(self, text):
+        self._funnel_output.configure(state="normal")
+        self._funnel_output.delete("1.0", "end")
+        self._funnel_output.insert("1.0", text)
+        self._funnel_output.configure(state="disabled")
+        self._funnel_btn.configure(state="normal", text="▶  Funnel auswerten")
+        self._funnel_status_lbl.configure(text="✅ Fertig!", text_color=C["green"])
+
     def _an_start_run(self):
         self._an_run_btn.configure(state="disabled", text="⏳  Läuft...")
         self._an_export_btn.configure(state="disabled")
