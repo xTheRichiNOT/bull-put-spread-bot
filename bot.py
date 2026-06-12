@@ -2309,7 +2309,7 @@ async def monitor_exits(ib=None):
         _pnl_display = None
         if ib is not None:
             try:
-                expiry_ib_pfx = info['expiry_yf'].replace('-', '')
+                expiry_ib_pfx = info.get('expiry_yf', '').replace('-', '')
                 _pf = ib.portfolio()
                 _legs = [p for p in _pf
                          if p.contract.symbol == symbol
@@ -2325,7 +2325,7 @@ async def monitor_exits(ib=None):
             except Exception:
                 pass
 
-        entry = info['entry_per_share']
+        entry = info.get('entry_per_share', 0)
         if not entry or entry <= 0:
             log(f"  ⚠️  [{symbol}] Einstiegspreis nicht bekannt — TP/SL-Monitoring deaktiviert "
                 f"(Bot-Neustart während offener Position?)")
@@ -2404,8 +2404,9 @@ async def monitor_exits(ib=None):
 
                     _save_state()
 
-        # Unrealized P&L in trade-Info speichern (für Launcher-Anzeige)
+        # Unrealized P&L in trade-Info speichern (für Launcher-Anzeige + Neustart-Persistenz)
         info['unrealized_pnl'] = round(pnl_dollar, 2)
+        _save_state()
 
         # P&L Logging
         be_pct  = BREAKEVEN_TRIGGER_PCT * 100
