@@ -488,6 +488,7 @@ _iv_memory: dict = {}
 # 201=riskless/guaranteed-loss, 110=Tick-Size, 203=Security nicht erlaubt,
 # 461/463=ungültige Order-Attribute, 478=Combo-Leg-Fehler
 _order_error_codes: dict = {}
+_ghost_strikes:     dict = {}   # Symbol → aufeinanderfolgende Leer-Treffer im Ghost-Check
 _FATAL_ORDER_ERRORS = {201, 110, 203, 461, 463, 478}
 # Speichert aktive Bot-Trades für Exit-Monitoring
 _bot_trades: dict = {}
@@ -2158,20 +2159,30 @@ async def monitor_exits(ib=None):
     if not _bot_trades:
         return
 
-    # IB-Abgleich: Positionen die manuell in CapTrader geschlossen wurden sofort entfernen
+    # IB-Abgleich: Positionen die manuell in CapTrader geschlossen wurden entfernen.
+    # SCHUTZ gegen transiente Leer-Snapshots (Reconnect/Subscription-Hickup):
+    # frische Server-Abfrage + Löschung erst nach 2 aufeinanderfolgenden Leer-Treffern.
     if ib is not None:
         try:
-            _ib_syms = {p.contract.symbol for p in ib.positions()
+            _fresh_pos = await ib.reqPositionsAsync()
+            _ib_syms = {p.contract.symbol for p in (_fresh_pos or [])
                         if p.contract.secType == 'OPT' and p.position != 0}
             _ib_order_syms = {t.contract.symbol for t in ib.openTrades()
                               if t.contract.secType in ('OPT', 'BAG')}
-            _active_statuses = ('open', 'exit_retry', 'error')  # 'closing' nie entfernen — Exit-Order läuft
+            _active_statuses = ('open', 'exit_retry', 'error')
             _removed = []
             for _sym, _info in list(_bot_trades.items()):
                 if _info.get('status') in _active_statuses:
                     if _sym not in _ib_syms and _sym not in _ib_order_syms:
-                        _bot_trades.pop(_sym, None)
-                        _removed.append(_sym)
+                        _ghost_strikes[_sym] = _ghost_strikes.get(_sym, 0) + 1
+                        if _ghost_strikes[_sym] >= 2:
+                            _bot_trades.pop(_sym, None)
+                            _ghost_strikes.pop(_sym, None)
+                            _removed.append(_sym)
+                        else:
+                            log(f"  👻 [{_sym}] Kein IB-Pendant gefunden — warte auf Bestätigung (1/2)")
+                    else:
+                        _ghost_strikes.pop(_sym, None)
             if _removed:
                 _save_state()
                 log(f"  🧹 IB-Abgleich: {_removed} manuell geschlossen — aus State entfernt")
@@ -2923,19 +2934,27 @@ async def _reconciliation_loop(ib, stop_event=None) -> None:
                         except Exception as _ce:
                             log(f"     ⚠️  #{_oid}: {_ce}")
 
-            # Ghost Positionen: bot denkt 'open'/'closing'/'exit_retry' aber IB hat keine OPT-Pos
-            _ib_opt_syms   = {p.contract.symbol for p in ib.positions()
+            # Ghost Positionen: bot denkt 'open'/'closing'/'exit_retry' aber IB hat keine OPT-Pos.
+            # Frische Server-Abfrage + Zwei-Zyklen-Bestätigung schützt vor transienten Leer-Snapshots.
+            _fresh_recon   = await ib.reqPositionsAsync()
+            _ib_opt_syms   = {p.contract.symbol for p in (_fresh_recon or [])
                               if p.contract.secType == 'OPT' and p.position != 0}
             _ib_order_syms = {t.contract.symbol for t in open_orders
                               if t.contract.secType in ('OPT', 'BAG')}
-            _ghost = [
-                s for s, v in list(_bot_trades.items())
-                if v.get('status') in ('open', 'closing', 'exit_retry', 'error')
-                and s not in _ib_opt_syms
-                and s not in _ib_order_syms
-            ]
+            _ghost = []
+            for s, v in list(_bot_trades.items()):
+                if v.get('status') in ('open', 'closing', 'exit_retry', 'error') \
+                        and s not in _ib_opt_syms and s not in _ib_order_syms:
+                    _ghost_strikes[s] = _ghost_strikes.get(s, 0) + 1
+                    if _ghost_strikes[s] >= 2:
+                        _ghost.append(s)
+                        _ghost_strikes.pop(s, None)
+                    else:
+                        log(f"  👻 [RECON] [{s}] Kein IB-Pendant — warte auf Bestätigung (1/2)")
+                else:
+                    _ghost_strikes.pop(s, None)
             for _gs in _ghost:
-                log(f"  🧹 [RECON] [{_gs}] Ghost-Position — kein IB-Pendant → entfernt")
+                log(f"  🧹 [RECON] [{_gs}] Ghost-Position — kein IB-Pendant (2× bestätigt) → entfernt")
                 del _bot_trades[_gs]
             if _ghost:
                 _save_state()
