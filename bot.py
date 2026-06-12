@@ -2344,7 +2344,9 @@ async def monitor_exits(ib=None):
             if _pnl_display is not None:
                 info['unrealized_pnl'] = round(_pnl_display, 2)
                 _save_state()
-            log(f"  ⚠️  [{symbol}] Kein Marktpreis verfügbar — überspringe")
+                log(f"  📊 [{symbol}] Kein Live-Preis — IB-P&L aus Portfolio: ${_pnl_display:+.0f}")
+            else:
+                log(f"  ⚠️  [{symbol}] Kein Marktpreis verfügbar — überspringe")
             continue
         current = max(0.0, current)
 
