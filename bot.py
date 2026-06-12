@@ -2341,6 +2341,9 @@ async def monitor_exits(ib=None):
             symbol, info['expiry_yf'], info['short_strike'], info['long_strike'], ib
         )
         if current is None:
+            if _pnl_display is not None:
+                info['unrealized_pnl'] = round(_pnl_display, 2)
+                _save_state()
             log(f"  ⚠️  [{symbol}] Kein Marktpreis verfügbar — überspringe")
             continue
         current = max(0.0, current)
