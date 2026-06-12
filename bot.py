@@ -139,10 +139,16 @@ WATCHLIST        = [
     # Industrie (2) — LMT/RTX/BA/GE gestrichen (kein Delayed-Datenstrom)
     'CAT', 'DE',
 ]  # gesamt: 48
-MIN_VOLA         = float(_cfg.get('min_vola', 0.28))   # Hard-Floor IV (PDF: >28%)
+MIN_VOLA         = float(_cfg.get('min_vola', 0.28))   # Hard-Floor IV — Modus 'absolute'
 MIN_VOLA_SOFT    = 0.35    # Score-Penalty Zone: IV 28–35 % → -0.10
 IV_SOFT_PENALTY  = 0.10
 MIN_IV_SPIKE     = 0.05
+# IV-Gate-Modus: 'rank' = IV relativ zur 52-Wochen-Vol-Historie (Backtest: PF 1.37→1.71)
+#                'absolute' = alter fixer Floor MIN_VOLA
+# Bei 'rank' ohne verfügbare Historie greift automatisch der absolute Floor (Fallback).
+IV_GATE_MODE     = str(_cfg.get('iv_gate_mode', 'rank')).lower()
+IV_RANK_MIN      = float(_cfg.get('iv_rank_min', 0.50))       # Mindest-Perzentil (0.50 = Median)
+IV_RANK_ABS_MIN  = float(_cfg.get('iv_rank_abs_min', 0.15))   # absolute Untergrenze
 ABSTAND_Y        = float(_cfg['abstand_y'])
 SPREAD_MAX_PCT   = 0.025
 SPREAD_MIN       = 5
@@ -1531,6 +1537,45 @@ def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
     return min(1.0, oi_score * 0.6 + vol_score * 0.4)
 
 
+# ── IV-Rank: aktuelle IV relativ zur 52-Wochen-Vol-Historie des Symbols ──────
+_iv_rank_cache: dict = {}
+_sem_iv_rank = None
+_IV_RANK_VOL_PREMIUM = 1.20
+
+async def _get_iv_rank(symbol: str, current_iv: float):
+    """Perzentil der aktuellen IV in der 1-Jahres-Vol-Verteilung (0.0–1.0 oder None)."""
+    global _sem_iv_rank
+    if _sem_iv_rank is None:
+        _sem_iv_rank = asyncio.Semaphore(5)
+    today = datetime.now().strftime('%Y-%m-%d')
+    cached = _iv_rank_cache.get(symbol)
+    if cached and cached[0] == today:
+        dist = cached[1]
+    else:
+        def _fetch():
+            import yfinance as _yf
+            h = _yf.Ticker(symbol).history(period='1y', interval='1d', auto_adjust=True)
+            return [float(c) for c in h['Close'].dropna()]
+        try:
+            async with _sem_iv_rank:
+                closes = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25)
+        except Exception:
+            return None
+        if not closes or len(closes) < 80:
+            _iv_rank_cache[symbol] = (today, [])
+            return None
+        dist = []
+        for i in range(21, len(closes)):
+            rets = [math.log(closes[j] / closes[j - 1]) for j in range(i - 20, i + 1)]
+            mean = sum(rets) / len(rets)
+            var  = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+            dist.append(math.sqrt(var * 252) * _IV_RANK_VOL_PREMIUM)
+        _iv_rank_cache[symbol] = (today, dist)
+    if not dist:
+        return None
+    return sum(1 for v in dist if v < current_iv) / len(dist)
+
+
 async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False, _ftrack=None):
     """Berechnet Bull-Put-Spread. Gibt Signal-Dict zurück oder None."""
     _f = (lambda g: _ftrack(g, symbol)) if _ftrack else (lambda g: None)
@@ -2770,6 +2815,9 @@ async def configure_environment(ib) -> None:
         log("  MODUS: LIVE  (Konto: " + ACCOUNT_ID + ")")
         log("  Echtzeit-Marktdaten aktiv (OPRA + US Real-Time)")
         log("  Empfehlungs-Modus — kein Auto-Trade (Sicherheitsnetz)")
+    _iv_mode_str = (f"rank (Perzentil ≥{IV_RANK_MIN:.0%}, Min-IV {IV_RANK_ABS_MIN:.0%})"
+                    if IV_GATE_MODE == 'rank' else f"absolute (Floor {MIN_VOLA:.0%})")
+    log(f"  IV-Gate: {_iv_mode_str} | SL-Mult: {STOP_LOSS_MULT:.1f}×")
     log("=" * 60)
 
 
@@ -3337,10 +3385,26 @@ async def run_bot(stop_event: threading.Event = None):
                 async with _sem_news:
                     news_hit, headline = await check_news_trigger(symbol)
 
-                if iv <= MIN_VOLA:
-                    log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
-                    _ftrack('iv_floor', symbol)
-                    return None
+                # ── IV-Gate: 'rank' (relativ zur Symbol-Historie) oder 'absolute' (Floor) ──
+                if IV_GATE_MODE == 'rank':
+                    _rank = await _get_iv_rank(symbol, iv)
+                    if _rank is None:
+                        if iv <= MIN_VOLA:
+                            log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%}, Rank n/v)")
+                            _ftrack('iv_floor', symbol)
+                            return None
+                    elif iv <= IV_RANK_ABS_MIN or _rank < IV_RANK_MIN:
+                        log(f"   [{symbol}] ✗  IV={iv:.1%} | IV-Rank={_rank:.0%} "
+                            f"(unter {IV_RANK_MIN:.0%}-Perzentil)")
+                        _ftrack('iv_floor', symbol)
+                        return None
+                    else:
+                        log(f"   [{symbol}] ✓  IV={iv:.1%} | IV-Rank={_rank:.0%}")
+                else:
+                    if iv <= MIN_VOLA:
+                        log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
+                        _ftrack('iv_floor', symbol)
+                        return None
 
                 trigger_reasons = []
                 if iv_spike:
