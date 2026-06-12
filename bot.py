@@ -3208,6 +3208,40 @@ async def run_bot(stop_event: threading.Event = None):
         if ghost_syms:
             _save_state()
 
+        # Bracket-Re-Adoption: nach State-Verlust TP/SL-IDs + Preise aus IB-Orderbuch
+        # wiederherstellen. Läuft vor dem Zombie-Sweep → frisch verknüpfte IDs stehen
+        # sofort unter dessen Schutz. Manuelle Close-Orders (BUY LMT DAY ohne Parent)
+        # werden explizit ausgeschlossen.
+        _ACTIVE_ST_ADOPT = {'Submitted', 'PreSubmitted', 'PendingSubmit', 'ApiPending'}
+        _relinked: list = []
+        for _sym_ra, _info_ra in _bot_trades.items():
+            if _info_ra.get('status') not in ('open', 'exit_retry'):
+                continue
+            for _o_ra in open_orders:
+                if _o_ra.contract.secType != 'BAG' or _o_ra.contract.symbol != _sym_ra:
+                    continue
+                if _o_ra.orderStatus.status not in _ACTIVE_ST_ADOPT:
+                    continue
+                _od = _o_ra.order
+                _is_child = bool(_od.parentId) or bool(getattr(_od, 'ocaGroup', '') or '')
+                if _od.action != 'BUY' or not _is_child:
+                    continue
+                if (_od.orderType or '').startswith('STP'):
+                    if _info_ra.get('sl_order_id', 0) != _od.orderId:
+                        _info_ra['sl_order_id'] = _od.orderId
+                        if _od.auxPrice:
+                            _info_ra['sl_price'] = float(_od.auxPrice)
+                        _relinked.append(f"{_sym_ra}:SL#{_od.orderId}@{_od.auxPrice}")
+                elif _od.orderType == 'LMT':
+                    if _info_ra.get('tp_order_id', 0) != _od.orderId:
+                        _info_ra['tp_order_id'] = _od.orderId
+                        if _od.lmtPrice:
+                            _info_ra['tp_price'] = float(_od.lmtPrice)
+                        _relinked.append(f"{_sym_ra}:TP#{_od.orderId}@{_od.lmtPrice}")
+        if _relinked:
+            _save_state()
+            log(f"  🔗 Bracket-Re-Adoption: {len(_relinked)} Order(s) wiederverknüpft — {_relinked}")
+
         # Startup-Diagnose: offene BAG-Orders anzeigen. Bekannte Bracket-Kinder (TP/SL)
         # bleiben aktiv — sie sind die Absicherung offener Positionen und überleben
         # Bot-Neustarts genau deshalb serverseitig bei IBKR.
