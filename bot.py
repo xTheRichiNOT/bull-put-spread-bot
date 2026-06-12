@@ -534,6 +534,7 @@ _HISTORY_FILE        = os.path.join(_BASE, 'trade_history.json')
 _POSITIONS_FILE      = os.path.join(_BASE, 'positions.json')
 _CLOSE_CMD_FILE      = os.path.join(_BASE, 'close_commands.json')
 _SHADOW_FILE         = os.path.join(_BASE, 'shadow_trades.jsonl')
+_FUNNEL_LOG_FILE     = os.path.join(_BASE, 'funnel_log.jsonl')
 _RECOMMENDATIONS_FILE = os.path.join(_BASE, 'recommendations.json')
 
 def _write_positions_file():
@@ -3518,6 +3519,20 @@ async def run_bot(stop_event: threading.Event = None):
             if _qual_n:
                 _ql_str = ', '.join(s['symbol'] for s in qualified[:8])
                 log(f"   ✅ {_qual_n:2d}  Qualifiziert                              {_ql_str}")
+
+            # Funnel-Daten persistieren (für monatliche Auswertung)
+            try:
+                _funnel_entry = {
+                    'ts':        datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                    'scanned':   len(WATCHLIST),
+                    'filtered':  _total_out,
+                    'qualified': _qual_n,
+                    'gates':     {k: len(v) for k, v in _funnel.items()},
+                }
+                with open(_FUNNEL_LOG_FILE, 'a', encoding='utf-8') as _ff:
+                    _ff.write(_json.dumps(_funnel_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
 
             # Alle qualifizierten Signale sind handelbar — sortiert nach R/R,
             # Slot-Limit begrenzt natürlich auf die besten N
