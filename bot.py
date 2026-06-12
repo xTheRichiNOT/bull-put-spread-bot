@@ -1531,12 +1531,14 @@ def _compute_liq_score(symbol: str, oi: float, vol: float) -> float:
     return min(1.0, oi_score * 0.6 + vol_score * 0.4)
 
 
-async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False):
+async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False, _ftrack=None):
     """Berechnet Bull-Put-Spread. Gibt Signal-Dict zurück oder None."""
+    _f = (lambda g: _ftrack(g, symbol)) if _ftrack else (lambda g: None)
     try:
         # ── 1. Expiry-Auswahl aus IB Strike-Map ──────────────────────────────
         if symbol not in _strike_map or not _strike_map[symbol].get('expirations'):
             log(f"   [{symbol}] ✗ Keine IB Strike-Map — überspringe")
+            _f('keine_strikes')
             return None
 
         map_entry = _strike_map[symbol]
@@ -1552,6 +1554,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         if not valid:
             candidates = [(e, d) for e, d in dte_map if d >= 21]
             if not candidates:
+                _f('dte')
                 return None
             expiry_ib_str = min(candidates, key=lambda x: abs(x[1] - MIN_DTE))[0]
         else:
@@ -1565,6 +1568,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         if hard_block:
             log(f"   [{symbol}] 🚫 Earnings-HardBlock: {conflict_reason} — überspringe")
             _shadow_partial(symbol, preis, iv, 'earnings', conflict_reason, expiry=expiry_yf)
+            _f('earnings_hard')
             return None
         if earn_penalty > 0:
             log(f"   [{symbol}] ⚠️  Earnings-Penalty: {conflict_reason} → Score -{earn_penalty:.2f}")
@@ -1575,6 +1579,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         valid_short = [s for s in ib_strikes if s < preis]
         if not valid_short:
             log(f"   [{symbol}] ✗ Keine OTM Strikes in IB Strike-Map — überspringe")
+            _f('kein_otm_strike')
             return None
         short_strike = _round_to_standard_strike(
             min(valid_short, key=lambda s: abs(s - target)), preis
@@ -1582,6 +1587,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
 
         # ── 4. IB Marktdaten für Short-Put (Bid/Ask) ─────────────────────────
         if not (ib and ib.isConnected()):
+            _f('nicht_verbunden')
             return None
         global _sem_ib_mktdata
         if _sem_ib_mktdata is None:
@@ -1610,6 +1616,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
 
         if t_scan is None:
             log(f"   [{symbol}] ✗ Short-Put nicht qualifizierbar — überspringe")
+            _f('kein_short')
             return None
 
         _sb = t_scan.bid if (t_scan.bid and not math.isnan(t_scan.bid) and t_scan.bid > 0) else 0.0
@@ -1626,6 +1633,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         if _sb == 0 and _sa == 0:
             log(f"   [{symbol}] ✗ Kein Bid/Ask von IB — überspringe")
             _shadow_partial(symbol, preis, iv, 'liquidity', "Kein IB-Bid/Ask", short_strike=short_strike)
+            _f('kein_bid_ask')
             return None
         if _sb > 0 and _sa > 0:
             _ba_pct = (_sa - _sb) / ((_sb + _sa) / 2)
@@ -1634,6 +1642,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
                 _shadow_partial(symbol, preis, iv, 'liquidity',
                                 f"BidAskSpread={_ba_pct:.1%} > {MAX_BID_ASK_SPREAD:.1%}",
                                 short_strike=short_strike)
+                _f('liquidity')
                 return None
             _liquidity_score = max(0.1, 1.0 - _ba_pct * 3)
         else:
@@ -1644,6 +1653,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
         if not bid > 0:
             log(f"   [{symbol}] ✗ Kein IB-Bid für Short-Put — überspringe")
             _shadow_partial(symbol, preis, iv, 'no_live_data', "Kein IB-Bid", short_strike=short_strike)
+            _f('kein_live_bid')
             return None
         praemie        = bid
         praemie_quelle = "IB (Bid)"
@@ -1717,6 +1727,7 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
             log(f"   [{symbol}] ✗ Keine Live-/Delayed-Daten verfügbar — Symbol übersprungen")
             _shadow_partial(symbol, preis, iv, 'no_live_data', "Keine verwertbaren Marktdaten",
                             short_strike=short_strike)
+            _f('kein_live_data')
             return None
 
         credit    = praemie * 100
@@ -1738,16 +1749,19 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
             log(f"   [{symbol}] ✗ P(Win)={prob_otm:.1%} > {MAX_PROBABILITY:.0%} — Credit zu klein, überspringe")
             _shadow_partial(symbol, preis, iv, 'prob_otm', f"P(Win)={prob_otm:.1%}>{MAX_PROBABILITY:.0%}",
                             short_strike=short_strike)
+            _f('prob_otm')
             return None
         if prob_max_loss > MAX_LOSS_PROB:
             log(f"   [{symbol}] ✗ P(MaxVerlust)={prob_max_loss:.1%} > {MAX_LOSS_PROB:.0%} — Totalverlustrisiko zu hoch")
             _shadow_partial(symbol, preis, iv, 'prob_max_loss', f"P(MaxL)={prob_max_loss:.1%}>{MAX_LOSS_PROB:.0%}",
                             short_strike=short_strike)
+            _f('prob_max_loss')
             return None
         if ev_ratio < MIN_EV_RATIO:
             log(f"   [{symbol}] ✗ EV-Ratio={ev_ratio:.3f} < {MIN_EV_RATIO} — kein statistischer Vorteil")
             _shadow_partial(symbol, preis, iv, 'ev_ratio', f"EV-Ratio={ev_ratio:.3f}<{MIN_EV_RATIO}",
                             short_strike=short_strike)
+            _f('ev_ratio')
             return None
 
         # ── Deterministischer 4-Komponenten Score ────────────────────────
@@ -3301,14 +3315,19 @@ async def run_bot(stop_event: threading.Event = None):
             _sem_news = asyncio.Semaphore(5)
             _sem_sig  = asyncio.Semaphore(4)
 
+            _funnel: dict = {}
+            def _ftrack(gate: str, sym: str): _funnel.setdefault(gate, []).append(sym)
+
             async def scan_symbol(symbol):
                 entry = ib_price_data.get(symbol)
                 if entry is None:
                     log(f"   [{symbol}] ⏳ Keine Preisdaten")
+                    _ftrack('keine_daten', symbol)
                     return None
                 preis, iv = entry
                 if iv is None:
                     log(f"   [{symbol}] ⏳ Kein IV — überspringe")
+                    _ftrack('kein_iv', symbol)
                     return None
 
                 prev_iv  = _iv_memory.get(symbol)
@@ -3320,6 +3339,7 @@ async def run_bot(stop_event: threading.Event = None):
 
                 if iv <= MIN_VOLA:
                     log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%})")
+                    _ftrack('iv_floor', symbol)
                     return None
 
                 trigger_reasons = []
@@ -3329,7 +3349,7 @@ async def run_bot(stop_event: threading.Event = None):
                     trigger_reasons.append(f"News: \"{headline[:60]}\"")
 
                 async with _sem_sig:
-                    sig = await build_bull_put_spread(symbol, preis, iv, ib, news_hit=news_hit, iv_spike=iv_spike)
+                    sig = await build_bull_put_spread(symbol, preis, iv, ib, news_hit=news_hit, iv_spike=iv_spike, _ftrack=_ftrack)
                 if sig:
                     sig['triggers'] = trigger_reasons
                     return sig
@@ -3356,6 +3376,52 @@ async def run_bot(stop_event: threading.Event = None):
                 and s.get('decision') == 'TRADE'
             ]
             qualified.sort(key=lambda s: s['score'], reverse=True)
+
+            for _s2 in all_signals:
+                if _s2 in qualified:
+                    continue
+                if _s2['praemie_quelle'] == "Black-Scholes (geschätzt)":
+                    _ftrack('bs_schatzung', _s2['symbol'])
+                elif not _s2.get('credit_ok_hard', True):
+                    _ftrack('credit_hard', _s2['symbol'])
+                elif _s2.get('decision') != 'TRADE':
+                    _ftrack('score', _s2['symbol'])
+
+            # ── Funnel-Summary ────────────────────────────────────────────────
+            _GATE_LABELS = [
+                ('keine_daten',    'Keine Preisdaten'),
+                ('kein_iv',        'Kein IV'),
+                ('iv_floor',       f'IV ≤ Hard-Floor ({MIN_VOLA:.0%})'),
+                ('earnings_hard',  'Earnings-HardBlock'),
+                ('keine_strikes',  'Keine IB Strike-Map'),
+                ('dte',            'Kein DTE im Fenster'),
+                ('kein_otm_strike','Kein OTM-Strike'),
+                ('nicht_verbunden','IB nicht verbunden'),
+                ('kein_short',     'Short-Put nicht qualifizierbar'),
+                ('kein_bid_ask',   'Kein Bid/Ask von IB'),
+                ('liquidity',      'Bid/Ask-Spread zu weit'),
+                ('kein_live_bid',  'Kein Live-Bid'),
+                ('kein_live_data', 'Keine Live-Daten'),
+                ('prob_otm',       'P(Win) außerhalb Korridor'),
+                ('prob_max_loss',  'P(MaxVerlust) zu hoch'),
+                ('ev_ratio',       'EV-Ratio zu niedrig'),
+                ('bs_schatzung',   'BS-Schätzung (kein echtes Bid)'),
+                ('credit_hard',    f'Credit < ${MIN_CREDIT_ABS:.0f} (Hard-Gate)'),
+                ('score',          f'Score < {ENTRY_THRESHOLD} (kein TRADE)'),
+            ]
+            _total_out = sum(len(v) for v in _funnel.values())
+            _qual_n    = len(qualified)
+            log(f"\n🔻 GATE-FUNNEL — {len(WATCHLIST)} gescannt | {_total_out} gefiltert | {_qual_n} qualifiziert:")
+            for _gkey, _glabel in _GATE_LABELS:
+                _gsyms = _funnel.get(_gkey, [])
+                if not _gsyms:
+                    continue
+                _sym_str  = ', '.join(_gsyms[:6]) + (f' +{len(_gsyms)-6} weitere' if len(_gsyms) > 6 else '')
+                _dominant = '  💡 Dominantes Gate' if len(_gsyms) > len(WATCHLIST) * 0.25 else ''
+                log(f"   ✗ {len(_gsyms):2d}  {_glabel:<42} {_sym_str}{_dominant}")
+            if _qual_n:
+                _ql_str = ', '.join(s['symbol'] for s in qualified[:8])
+                log(f"   ✅ {_qual_n:2d}  Qualifiziert                              {_ql_str}")
 
             # Alle qualifizierten Signale sind handelbar — sortiert nach R/R,
             # Slot-Limit begrenzt natürlich auf die besten N
