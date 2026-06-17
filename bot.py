@@ -74,6 +74,9 @@ _cfg_defaults = {
     "max_risk_per_trade_pct": 0.02, # max 2 % NetLiq-Risiko pro Trade
     "max_total_risk_pct": 0.15,     # max 15 % NetLiq-Risiko gesamt offen
     "earnings_buffer_days": 14,     # kein Trade wenn Earnings < X Tage entfernt oder vor Expiry
+    "trend_filter": True,           # kein Bull Put unter fallender Aktie nahe 52W-Tief
+    "trend_sma_days": 50,           # SMA-Fenster für die Trendrichtung
+    "trend_low_buffer_pct": 0.05,   # "nahe Tief" = innerhalb dieser Spanne über dem 52W-Tief
 }
 if os.path.exists(_cfg_path):
     try:
@@ -676,16 +679,27 @@ def _append_history(symbol: str, info: dict, exit_per_share: float = 0.0):
         if os.path.exists(_HISTORY_FILE):
             with open(_HISTORY_FILE) as f:
                 history = json.load(f)
-        entry = info.get('entry_per_share', 0.0)
-        pnl   = round((entry - exit_per_share) * 100, 2)
+        entry = info.get('entry_per_share', 0.0) or 0.0
+        # Kein fabrizierter Verlust: ist der Einstiegs-Credit unbekannt (0), würde
+        # (0 - exit) JEDEN Trade fälschlich als Totalverlust zeigen (→ Win 0 %).
+        # Stattdessen P&L offen lassen und markieren — der Broker-Reconcile füllt ihn
+        # später aus den echten Ausführungen nach.
+        if entry > 0.01:
+            pnl = round((entry - exit_per_share) * 100, 2)
+            entry_unknown = False
+        else:
+            pnl = None
+            entry_unknown = True
         history.append({
             'symbol':          symbol,
             'expiry':          info.get('expiry_yf', ''),
             'short_strike':    info.get('short_strike', 0),
             'long_strike':     info.get('long_strike', 0),
-            'entry_per_share': round(entry, 2),
+            'entry_per_share': round(entry, 2) if entry > 0.01 else None,
             'exit_per_share':  round(exit_per_share, 2),
             'pnl':             pnl,
+            'entry_unknown':   entry_unknown,
+            'inverted':        bool(info.get('inverted', False)),
             'status':          info.get('status', 'done'),
             'close_reason':    info.get('close_reason', ''),
             'closed_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -694,6 +708,104 @@ def _append_history(symbol: str, info: dict, exit_per_share: float = 0.0):
             json.dump(history, f, indent=2)
     except Exception:
         pass
+
+async def reconcile_with_broker(ib, lookback_days: int = 7):
+    """Gleicht die Bot-History gegen die ECHTEN Broker-Ausführungen ab.
+
+    Trägt Trades nach, die der Live-Fill-Handler verpasst hat (z. B. weil das Symbol
+    nach einem Neustart nicht mehr in _bot_trades stand), und korrigiert Einträge mit
+    unbekanntem Einstiegspreis. Best-Effort: crasht nie, blockiert den Start nicht.
+
+    Logik bewusst simpel und broker-deckungsgleich: pro (Symbol, Expiry) wird der
+    realisierte Netto-Cashflow aller Put-Legs summiert (verkauft = Geld rein, gekauft =
+    Geld raus). Ist der Kontraktsaldo 0 (Position geschlossen) und fehlt der Trade in
+    der History, wird er mit genau diesem Netto-P&L nachgetragen — dieselbe Zahl, die
+    auch in der CapTrader-Umsatzübersicht steht.
+    """
+    try:
+        _ef = ExecutionFilter()
+        try:
+            _ef.time = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y%m%d-%H:%M:%S')
+        except Exception:
+            pass
+        fills = await ib.reqExecutionsAsync(_ef)
+        if not fills:
+            return
+
+        groups: dict = {}
+        for f in (fills or []):
+            c  = f.contract
+            ex = f.execution
+            if c.secType != 'OPT' or c.right not in ('P', 'PUT'):
+                continue
+            price  = ex.avgPrice or ex.price or 0.0
+            shares = ex.shares or 0
+            if price <= 0 or shares <= 0:
+                continue
+            exp = (c.lastTradeDateOrContractMonth or '')[:8]
+            key = (c.symbol, exp)
+            g = groups.setdefault(key, {'cash': 0.0, 'qty': 0, 'strikes': set(), 'last': ''})
+            # SLD = verkauft → Geld rein (+), Kontraktsaldo runter (-)
+            g['cash'] += (price * shares * 100) * (1 if ex.side == 'SLD' else -1)
+            g['qty']  += shares * (-1 if ex.side == 'SLD' else 1)
+            g['strikes'].add(c.strike)
+            _t = str(ex.time or '')
+            if _t > g['last']:
+                g['last'] = _t
+
+        history = []
+        if os.path.exists(_HISTORY_FILE):
+            try:
+                with open(_HISTORY_FILE) as _hf:
+                    history = json.load(_hf)
+            except Exception:
+                history = []
+
+        def _norm_exp(v):
+            return str(v or '').replace('-', '')[:8]
+        existing = {(h.get('symbol'), _norm_exp(h.get('expiry'))) for h in history}
+
+        added = 0
+        corrected = 0
+        for (sym, exp), g in groups.items():
+            if abs(g['qty']) > 0:
+                continue   # noch offen → nicht abgleichen
+            net_pnl = round(g['cash'], 2)
+            exp_fmt = f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}" if len(exp) == 8 else exp
+            strikes = sorted(g['strikes'])
+            if (sym, exp) in existing:
+                for h in history:
+                    if h.get('symbol') == sym and _norm_exp(h.get('expiry')) == exp \
+                       and (h.get('entry_unknown') or h.get('pnl') is None):
+                        h['pnl']           = net_pnl
+                        h['entry_unknown'] = False
+                        h['reconciled']    = True
+                        corrected += 1
+                continue
+            history.append({
+                'symbol':          sym,
+                'expiry':          exp_fmt,
+                'short_strike':    strikes[-1] if strikes else 0,
+                'long_strike':     strikes[0]  if strikes else 0,
+                'entry_per_share': None,
+                'exit_per_share':  None,
+                'pnl':             net_pnl,
+                'entry_unknown':   False,
+                'status':          'reconciled',
+                'close_reason':    'broker_reconcile',
+                'closed_at':       datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'reconciled':      True,
+            })
+            added += 1
+
+        if added or corrected:
+            with open(_HISTORY_FILE, 'w') as _hf:
+                json.dump(history, _hf, indent=2)
+            log(f"  🔄 Broker-Reconcile: {added} Trade(s) nachgetragen, "
+                f"{corrected} mit echtem P&L korrigiert (aus IB-Ausführungen)")
+    except Exception as _e:
+        log(f"  ⚠️  Broker-Reconcile fehlgeschlagen: {_e}")
+
 
 def _load_state():
     """Lädt aktive Spread-Positionen vom letzten Lauf — verhindert Duplikate nach Neustart.
@@ -765,8 +877,8 @@ async def _place_paper_oca(ib, sym):
         bag = Bag(
             symbol=sym, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=short_conid, ratio=1, action='BUY',  exchange='SMART'),
-                ComboLeg(conId=long_conid,  ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=short_conid, ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=long_conid,  ratio=1, action='BUY',  exchange='SMART'),
             ]
         )
         import random as _rnd, time as _time
@@ -807,6 +919,16 @@ def _on_order_status(trade):
     """IBKR Event-Handler: aktualisiert _bot_trades wenn Order gecancelt oder gefüllt wird."""
     sym = trade.contract.symbol
     if sym not in _bot_trades:
+        # Fill auf einem Symbol, das der Bot nicht (mehr) trackt — NICHT still verwerfen.
+        # Genau dieser stille Drop ließ z. B. den NFLX-Roundtrip aus der History fallen.
+        # Sichtbar machen; der Broker-Reconcile trägt den Trade später korrekt nach.
+        try:
+            if trade.orderStatus.status == 'Filled' and trade.contract.secType in ('OPT', 'BAG'):
+                log(f"  ⚠️  [{sym}] FILL auf UNGETRACKTEM Symbol "
+                    f"(@${abs(trade.orderStatus.avgFillPrice or 0):.2f}) — nicht in _bot_trades. "
+                    f"Wird beim nächsten Broker-Reconcile nachgetragen.")
+        except Exception:
+            pass
         return
     status = trade.orderStatus.status
     order_id = trade.order.orderId
@@ -915,7 +1037,8 @@ def _on_order_status(trade):
                 _bot_trades[sym]['entry_per_share'] = abs(fill)
                 log(f"  💰 [{sym}] TRADE AUSGEFÜHRT @ ${abs(fill):.2f}/Share — Viel Erfolg!")
             else:
-                log(f"  ✅ [{sym}] Entry-Order bestätigt (Fill-Preis folgt)")
+                _saved_ep = _bot_trades[sym].get('entry_per_share', 0) or 0
+                log(f"  ✅ [{sym}] Entry bestätigt (avgFillPrice=0 — Limit ${_saved_ep:.2f}/Share als Entry-Credit)")
             # Self-Healing: Bracket-Kinder fehlen (Reject beim Entry)? → OCA-Paar nachschieben
             if _ib_ref is not None and not _bot_trades[sym].get('tp_order_id') \
                     and not _bot_trades[sym].get('sl_order_id'):
@@ -986,6 +1109,21 @@ def _bs_prob_otm(S, K, T, sigma, r=0.045):
     p = 0.3989423 * math.exp(-d2 * d2 / 2) * t * (
         0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))))
     return (1 - p) if d2 > 0 else p
+
+
+def _bs_put_delta(S, K, T, sigma, r=0.045):
+    """|Delta| eines Short-Puts via Black-Scholes — Fallback wenn IB keine modelGreeks
+    liefert (auf Paper-/Delayed-Daten häufig). Sorgt dafür, dass das Delta-Gate beim
+    Entry nie still umgangen wird. |Put-Delta| = N(-d1)."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 1.0 if S < K else 0.0
+    def ncdf(x):
+        t = 1.0 / (1.0 + 0.2316419 * abs(x))
+        d = 0.3989423 * math.exp(-x * x / 2)
+        p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))))
+        return (1 - p) if x > 0 else p
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return ncdf(-d1)
 
 
 def _check_credit(credit: float, breite: float, prob_otm: float):
@@ -1578,6 +1716,43 @@ async def _get_iv_rank(symbol: str, current_iv: float):
     return sum(1 for v in dist if v < current_iv) / len(dist)
 
 
+_trend_cache: dict = {}
+
+async def _get_trend_context(symbol: str):
+    """Liefert {price, sma, low_52w, high_52w} aus 1J Tagesschluss — Basis für den
+    Trend-/Lokationsfilter. Gibt None zurück wenn keine Historie da ist (dann greift
+    das Gate nicht, d. h. fail-open statt Trade fälschlich zu blockieren)."""
+    global _sem_iv_rank
+    if _sem_iv_rank is None:
+        _sem_iv_rank = asyncio.Semaphore(5)
+    today  = datetime.now().strftime('%Y-%m-%d')
+    cached = _trend_cache.get(symbol)
+    if cached and cached[0] == today:
+        return cached[1]
+    def _fetch():
+        import yfinance as _yf
+        h = _yf.Ticker(symbol).history(period='1y', interval='1d', auto_adjust=True)
+        return [float(c) for c in h['Close'].dropna()]
+    try:
+        async with _sem_iv_rank:
+            closes = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=25)
+    except Exception:
+        return None
+    if not closes or len(closes) < 60:
+        _trend_cache[symbol] = (today, None)
+        return None
+    sma_days = max(1, int(_cfg.get('trend_sma_days', 50)))
+    window   = closes[-sma_days:]
+    ctx = {
+        'price':    closes[-1],
+        'sma':      sum(window) / len(window),
+        'low_52w':  min(closes),
+        'high_52w': max(closes),
+    }
+    _trend_cache[symbol] = (today, ctx)
+    return ctx
+
+
 async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = False, iv_spike: bool = False, _ftrack=None):
     """Berechnet Bull-Put-Spread. Gibt Signal-Dict zurück oder None."""
     _f = (lambda g: _ftrack(g, symbol)) if _ftrack else (lambda g: None)
@@ -1810,6 +1985,25 @@ async def build_bull_put_spread(symbol, preis, iv, ib=None, news_hit: bool = Fal
                             short_strike=short_strike)
             _f('ev_ratio')
             return None
+
+        # ── Trend-/Lokationsfilter ───────────────────────────────────────────
+        # Ein Bull Put ist bullisch/neutral. Unter einer fallenden Aktie nahe ihrem
+        # 52-Wochen-Tief verkauft man genau in die Bewegung hinein (siehe NFLX 75er
+        # Short-Put). Hard-Block nur im klaren Fall: Kurs unter SMA UND nahe Jahres-Tief.
+        if bool(_cfg.get('trend_filter', True)):
+            _tctx = await _get_trend_context(symbol)
+            if _tctx and _tctx.get('sma'):
+                _buf       = float(_cfg.get('trend_low_buffer_pct', 0.05))
+                _below_sma = preis < _tctx['sma']
+                _near_low  = preis <= _tctx['low_52w'] * (1.0 + _buf)
+                if _below_sma and _near_low:
+                    log(f"   [{symbol}] ✗ Trend-Gate: Kurs ${preis:.2f} < SMA{int(_cfg.get('trend_sma_days', 50))} "
+                        f"${_tctx['sma']:.2f} UND <{(1 + _buf):.0%} über 52W-Tief ${_tctx['low_52w']:.2f} "
+                        f"— Bull Put unter fallender Aktie nahe Tief, übersprungen")
+                    _shadow_partial(symbol, preis, iv, 'trend', 'Abwärtstrend nahe 52W-Tief',
+                                    short_strike=short_strike)
+                    _f('trend')
+                    return None
 
         # ── Deterministischer 4-Komponenten Score ────────────────────────
         _iv_penalty  = IV_SOFT_PENALTY if iv < MIN_VOLA_SOFT else 0.0
@@ -2084,8 +2278,8 @@ async def close_spread(ib, symbol, info, reason):
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=_sc, ratio=1, action='BUY',  exchange='SMART'),
-                ComboLeg(conId=_lc, ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=_sc, ratio=1, action='SELL', exchange='SMART'),
+                ComboLeg(conId=_lc, ratio=1, action='BUY',  exchange='SMART'),
             ]
         )
         entry = info.get('entry_per_share', 0)
@@ -2511,16 +2705,16 @@ async def place_order(ib, sig):
                 log(f"  ❌ [{sym}] Qualifizierung fehlgeschlagen — Order abgebrochen")
                 return
 
-            # WICHTIG (IBKR-Konvention): ComboLeg-Actions beschreiben den KAUF der Combo.
-            # Eine SELL-Order INVERTIERT alle Legs. Damit "SELL Combo @ positiver Credit"
-            # den Bull Put Spread eröffnet (SELL short_put + BUY long_put), müssen die
-            # Legs hier als BUY short / SELL long definiert sein. Falsch herum definiert
-            # hat die Combo negativen Wert → IBKR Error 201 "Riskless combination".
+            # IBKR Paper-Trading-Beobachtung: Bei einer SELL-Order werden ComboLeg-Actions
+            # DIREKT ausgeführt (keine Inversion). Um Bull Put (SELL short_put + BUY long_put)
+            # zu eröffnen, müssen die Legs daher als SELL short / BUY long definiert sein.
+            # BUY-Orders (Close/TP/SL) INVERTIEREN alle Legs → BUY-Close mit SELL/BUY-Legs
+            # ergibt BUY short + SELL long = schließt den Bull Put korrekt.
             bag = Bag(
                 symbol=sym, exchange='SMART', currency='USD',
                 comboLegs=[
-                    ComboLeg(conId=short_contract.conId, ratio=1, action='BUY',  exchange='SMART'),
-                    ComboLeg(conId=long_contract.conId,  ratio=1, action='SELL', exchange='SMART'),
+                    ComboLeg(conId=short_contract.conId, ratio=1, action='SELL', exchange='SMART'),
+                    ComboLeg(conId=long_contract.conId,  ratio=1, action='BUY',  exchange='SMART'),
                 ]
             )
 
@@ -2608,15 +2802,25 @@ async def place_order(ib, sig):
             rr_minimum = MIN_RISK_REWARD if has_real_bid else MIN_RISK_REWARD * 1.5
 
             short_delta = None
+            _delta_src  = 'IB'
             if t_short.modelGreeks and t_short.modelGreeks.delta is not None:
                 short_delta = abs(t_short.modelGreeks.delta)
-            delta_str = f"Δ={short_delta:.3f}" if short_delta is not None else "Δ=n/a"
+            # Fallback: IB liefert auf Paper-/Delayed-Daten oft keine modelGreeks.
+            # Ohne Fallback wäre short_delta None und das Gate würde STILL übersprungen
+            # (so rutschte NFLX 75 mit Δ~0.33 durch). Delta per Black-Scholes schätzen.
+            if short_delta is None:
+                _T  = max(sig.get('dte', 0) / 365, 0.001)
+                _S  = sig.get('preis', 0); _K = sig.get('short_strike', 0); _ivd = sig.get('iv', 0)
+                if _S > 0 and _K > 0 and _ivd > 0:
+                    short_delta = _bs_put_delta(_S, _K, _T, _ivd)
+                    _delta_src  = 'BS'
+            delta_str = f"Δ={short_delta:.3f}({_delta_src})" if short_delta is not None else "Δ=n/a"
             log(f"  📡 [{sym}] {quelle} [Conf={confidence:.2f}/{price_src}]: "
                 f"Short ${short_bid:.2f}  Long ${long_ask:.2f}  "
                 f"Netto: ${ibkr_net:.2f} → Limit: ${limit_price:.2f}  {delta_str}")
 
             if short_delta is not None and short_delta > MAX_DELTA:
-                log(f"  ✗ [{sym}] Delta {short_delta:.3f} > {MAX_DELTA} — Short-Put zu nah am Kurs, Trade abgebrochen")
+                log(f"  ✗ [{sym}] Delta {short_delta:.3f} ({_delta_src}) > {MAX_DELTA} — Short-Put zu nah am Kurs, Trade abgebrochen")
                 _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
                 return
 
@@ -3140,6 +3344,15 @@ async def run_bot(stop_event: threading.Event = None):
                 if entry['entry_per_share'] > 0:
                     entry['entry_per_share'] = max(0, entry['entry_per_share'] - paid)
 
+            # Anomalie: Short-Strike unter Long-Strike → invertierter (Bear-Put-)Spread.
+            # Tritt nur bei Altlasten vor dem Entry-Guard auf. Markieren statt still als
+            # Bull Put zu führen, damit History/UI das nicht falsch als Gewinn-Setup zeigen.
+            _ss = entry.get('short_strike', 0); _ls = entry.get('long_strike', 0)
+            if _ss and _ls and _ss <= _ls:
+                entry['inverted'] = True
+                log(f"  ⚠️  [{sym}] INVERTIERTER Spread erkannt: Short {_ss} ≤ Long {_ls} "
+                    f"(kein Bull Put) — als 'inverted' markiert, bitte manuell prüfen")
+
             # avgCost=0 (Demo-Konto): Einstiegspreis über reqExecutions rekonstruieren
             if entry['entry_per_share'] <= 0:
                 try:
@@ -3207,6 +3420,10 @@ async def run_bot(stop_event: threading.Event = None):
             log(f"  🧹 [{sym}] Ghost-Position aus State entfernt — kein echtes IB-Pendant gefunden")
         if ghost_syms:
             _save_state()
+
+        # Broker-Reconcile: abgeschlossene Trades, die der Live-Handler verpasst hat,
+        # aus den echten IB-Ausführungen nachtragen + entry_unknown-P&L korrigieren.
+        await reconcile_with_broker(ib)
 
         # Bracket-Re-Adoption: nach State-Verlust TP/SL-IDs + Preise aus IB-Orderbuch
         # wiederherstellen. Läuft vor dem Zombie-Sweep → frisch verknüpfte IDs stehen
