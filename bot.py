@@ -79,7 +79,7 @@ _cfg_defaults = {
     "trend_low_buffer_pct": 0.05,   # "nahe Tief" = innerhalb dieser Spanne über dem 52W-Tief
     # ── IV-Bezug (US-Optionsdaten-Abo aktiv) ──────────────────────────────────
     "iv_source": "auto",            # 'ib' = nur IB | 'auto' = IB zuerst, yfinance-Fallback | 'yfinance' = nur yfinance
-    "stock_md_type": 1,             # Markt-Daten-Typ Aktien-Stream: 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
+    "stock_md_type": 4,             # Markt-Daten-Typ Aktien-Stream: 4=Delayed-Frozen (liefert bei dir 48/48 Kurse + IV via Tick 106)
     "ib_mktdata_min_gap_ms": 120,   # Pacing: Mindestabstand zwischen IB-Marktdaten-Anfragen (ms) gegen "zu viele Anfragen"
     "iv_max_concurrent": 3,         # gleichzeitige Options-IV-Abfragen pro Scan-Zyklus
 }

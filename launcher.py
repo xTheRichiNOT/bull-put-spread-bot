@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.2": [
+        "⚡  stock_md_type Default auf 4 (Delayed-Frozen) — kein Typ-1-Probelauf mehr, kein 300er-Schwall beim Start",
+        "✅  Sofort 48/48 Kurse + IB-IV (Tick 106) ohne 10s Wartezeit",
+    ],
     "4.1.1": [
         "⚡  IB-IV: Implied Volatility jetzt direkt via Tick 106 aus IB-Streams — kein separater API-Call mehr",
         "⚡  Pacing-Limiter: verhindert 'Max rate of messages exceeded' bei vielen Symbolen",
