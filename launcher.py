@@ -92,6 +92,12 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.3": [
+        "✨  IB Flex Web Service: volle Trade-Historie direkt von IB abrufen",
+        "✅  Fehlende Trades (z.B. NFLX) werden automatisch in trade_history.json nachgetragen",
+        "✅  entry_unknown-Einträge werden mit echtem P&L aus Flex korrigiert",
+        "⚙️  Aktivierung: flex_enabled + flex_token in config.json (Query-ID 1546424 vorbelegt)",
+    ],
     "4.1.2": [
         "⚡  stock_md_type Default auf 4 (Delayed-Frozen) — kein Typ-1-Probelauf mehr, kein 300er-Schwall beim Start",
         "✅  Sofort 48/48 Kurse + IB-IV (Tick 106) ohne 10s Wartezeit",

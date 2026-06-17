@@ -82,6 +82,11 @@ _cfg_defaults = {
     "stock_md_type": 4,             # Markt-Daten-Typ Aktien-Stream: 4=Delayed-Frozen (liefert bei dir 48/48 Kurse + IV via Tick 106)
     "ib_mktdata_min_gap_ms": 120,   # Pacing: Mindestabstand zwischen IB-Marktdaten-Anfragen (ms) gegen "zu viele Anfragen"
     "iv_max_concurrent": 3,         # gleichzeitige Options-IV-Abfragen pro Scan-Zyklus
+    # ── IB Flex Web Service ────────────────────────────────────────────────────
+    "flex_enabled":     False,      # True = Flex-Reconcile aktiv
+    "flex_token":       "",         # Flex Web Service Token (aus clientam.com)
+    "flex_query_id":    "1546424",  # Flex Query ID
+    "flex_refresh_sec": 600,        # Wie oft im Hauptloop nachfragen (Sekunden)
 }
 if os.path.exists(_cfg_path):
     try:
@@ -848,6 +853,156 @@ async def reconcile_with_broker(ib, lookback_days: int = 7):
                 f"{corrected} mit echtem P&L korrigiert (aus IB-Ausführungen)")
     except Exception as _e:
         log(f"  ⚠️  Broker-Reconcile fehlgeschlagen: {_e}")
+
+
+# ── IB Flex Web Service: volle Trade-Historie direkt von IB ──────────────────
+FLEX_ENABLED     = bool(_cfg.get('flex_enabled', False))
+FLEX_TOKEN       = str(_cfg.get('flex_token', '')).strip()
+FLEX_QUERY_ID    = str(_cfg.get('flex_query_id', '')).strip()
+FLEX_REFRESH_SEC = int(_cfg.get('flex_refresh_sec', 600))
+_FLEX_BASE       = 'https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService'
+_flex_state      = {'last': 0.0}
+
+def _flex_http_get(url: str) -> str:
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': 'bot-flex/1.0'})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode('utf-8', 'replace')
+
+async def fetch_flex_closed_spreads():
+    import asyncio as _aio
+    import xml.etree.ElementTree as _ET
+    if not (FLEX_ENABLED and FLEX_TOKEN and FLEX_QUERY_ID):
+        return []
+    try:
+        send_url = f"{_FLEX_BASE}.SendRequest?t={FLEX_TOKEN}&q={FLEX_QUERY_ID}&v=3"
+        txt = await _aio.to_thread(_flex_http_get, send_url)
+        root = _ET.fromstring(txt)
+        if (root.findtext('Status') or '').strip() != 'Success':
+            log(f"  ⚠️  Flex SendRequest: {root.findtext('Status')} "
+                f"{root.findtext('ErrorCode') or ''} {root.findtext('ErrorMessage') or ''}")
+            return []
+        ref  = (root.findtext('ReferenceCode') or '').strip()
+        base = (root.findtext('Url') or f"{_FLEX_BASE}.GetStatement").strip()
+        stmt = None
+        for _ in range(12):
+            await _aio.sleep(3)
+            s = await _aio.to_thread(_flex_http_get, f"{base}?t={FLEX_TOKEN}&q={ref}&v=3")
+            if '<FlexQueryResponse' in s:
+                stmt = s
+                break
+        if not stmt:
+            log("  ⚠️  Flex: Report nicht rechtzeitig fertig (Polling-Timeout)")
+            return []
+        try:
+            with open(os.path.join(_BASE, 'flex_last.xml'), 'w') as _fx:
+                _fx.write(stmt)
+        except Exception:
+            pass
+        sroot = _ET.fromstring(stmt)
+        groups: dict = {}
+        n = 0
+        for tr in sroot.iter('Trade'):
+            if tr.get('assetCategory') != 'OPT' or (tr.get('putCall') or '').upper() not in ('P', 'PUT'):
+                continue
+            try:
+                strike = float(tr.get('strike') or 0)
+                qty    = float(tr.get('quantity') or 0)
+                cash   = float(tr.get('proceeds') or 0) + float(tr.get('ibCommission') or 0)
+            except (TypeError, ValueError):
+                continue
+            und = tr.get('underlyingSymbol') or tr.get('symbol') or ''
+            exp = (tr.get('expiry') or '')[:8]
+            if not und or not exp:
+                continue
+            when = (tr.get('dateTime') or tr.get('tradeDate') or '').replace('T', ' ')
+            g = groups.setdefault((und, exp), {'cash': 0.0, 'legs': {}, 'last': '', 'n': 0})
+            g['cash'] += cash
+            g['legs'][strike] = g['legs'].get(strike, 0.0) + qty
+            g['n'] += 1
+            n += 1
+            if str(when) > g['last']:
+                g['last'] = str(when)
+        closed = []
+        for (und, exp), g in groups.items():
+            if g['n'] == 0 or any(abs(q) > 1e-6 for q in g['legs'].values()):
+                continue
+            closed.append({'symbol': und, 'exp': exp, 'pnl': round(g['cash'], 2),
+                           'strikes': sorted(g['legs'].keys()), 'last': g['last']})
+        log(f"  📊 Flex: {n} Options-Ausführungen, {len(closed)} geschlossene Spread(s) erkannt")
+        return closed
+    except Exception as _e:
+        log(f"  ⚠️  Flex-Abruf fehlgeschlagen: {_e}")
+        return []
+
+async def reconcile_history_from_flex():
+    closed = await fetch_flex_closed_spreads()
+    if not closed:
+        return
+    history: list = []
+    if os.path.exists(_HISTORY_FILE):
+        try:
+            with open(_HISTORY_FILE) as _hf:
+                history = json.load(_hf)
+        except Exception:
+            history = []
+    def _norm(v):
+        return str(v or '').replace('-', '')[:8]
+    existing = {(h.get('symbol'), _norm(h.get('expiry'))) for h in history}
+    added = corrected = 0
+    for t in closed:
+        sym, exp, strikes = t['symbol'], t['exp'], t['strikes']
+        exp_fmt = f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}" if len(exp) == 8 else exp
+        if (sym, exp) in existing:
+            for h in history:
+                if h.get('symbol') == sym and _norm(h.get('expiry')) == exp \
+                   and (h.get('entry_unknown') or h.get('pnl') is None):
+                    h['pnl'] = t['pnl']
+                    h['entry_unknown'] = False
+                    h['reconciled'] = True
+                    corrected += 1
+            continue
+        when = t['last']
+        try:
+            d = str(when).replace(';', ' ')
+            if len(d) >= 8 and d[:8].isdigit():
+                when = f"{d[:4]}-{d[4:6]}-{d[6:8]}" + (f" {d[9:11]}:{d[11:13]}" if len(d) >= 13 else "")
+        except Exception:
+            pass
+        history.append({
+            'symbol':          sym,
+            'expiry':          exp_fmt,
+            'short_strike':    strikes[-1] if strikes else 0,
+            'long_strike':     strikes[0]  if strikes else 0,
+            'entry_per_share': None,
+            'exit_per_share':  None,
+            'pnl':             t['pnl'],
+            'entry_unknown':   False,
+            'status':          'reconciled',
+            'close_reason':    'flex_reconcile',
+            'closed_at':       when or datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'reconciled':      True,
+            'source':          'flex',
+        })
+        added += 1
+    if added or corrected:
+        try:
+            _tmp = _HISTORY_FILE + '.tmp'
+            with open(_tmp, 'w') as _hf:
+                json.dump(history, _hf, indent=2)
+            os.replace(_tmp, _HISTORY_FILE)
+            log(f"  ✅ Flex-Reconcile: {added} Trade(s) nachgetragen, {corrected} P&L korrigiert")
+        except Exception as _e:
+            log(f"  ⚠️  Flex-Reconcile Schreibfehler: {_e}")
+
+async def _maybe_flex_reconcile(force: bool = False):
+    if not FLEX_ENABLED:
+        return
+    import time as _t
+    if not force and (_t.time() - _flex_state['last'] < FLEX_REFRESH_SEC):
+        return
+    _flex_state['last'] = _t.time()
+    await reconcile_history_from_flex()
 
 
 def _load_state():
@@ -3524,6 +3679,7 @@ async def run_bot(stop_event: threading.Event = None):
         # Broker-Reconcile: abgeschlossene Trades, die der Live-Handler verpasst hat,
         # aus den echten IB-Ausführungen nachtragen + entry_unknown-P&L korrigieren.
         await reconcile_with_broker(ib)
+        await _maybe_flex_reconcile(force=True)
 
         # Bracket-Re-Adoption: nach State-Verlust TP/SL-IDs + Preise aus IB-Orderbuch
         # wiederherstellen. Läuft vor dem Zombie-Sweep → frisch verknüpfte IDs stehen
@@ -4096,6 +4252,7 @@ async def run_bot(stop_event: threading.Event = None):
 
             # Positionen für Launcher-Anzeige schreiben
             _write_positions_file()
+            await _maybe_flex_reconcile()
 
             for _cd in range(SCAN_INTERVALL, 0, -1):
                 if stop_event and stop_event.is_set():
