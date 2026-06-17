@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.4": [
+        "✨  Flex Token + Query-ID jetzt direkt in den Einstellungen eingebbar — kein config.json-Editieren mehr",
+        "✨  Flex Reconcile an/aus per Toggle in der UI",
+    ],
     "4.1.3": [
         "✨  IB Flex Web Service: volle Trade-Historie direkt von IB abrufen",
         "✅  Fehlende Trades (z.B. NFLX) werden automatisch in trade_history.json nachgetragen",
@@ -2138,6 +2142,13 @@ class BotLauncher(ctk.CTk):
         section("Automation")
         toggle_field("Auto-Trade — Orders automatisch platzieren", "auto_trade")
 
+        section("IB Flex Web Service  (Trade-Historie)")
+        toggle_field("Flex Reconcile aktivieren", "flex_enabled")
+        field("Flex Token",    "flex_token",    width=320,
+              tip="clientam.com → Einstellungen → Flex Web Service → Token generieren")
+        field("Flex Query-ID", "flex_query_id", width=160,
+              tip="Aus clientam.com — Query muss Trades (OPT, Puts) enthalten")
+
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_row.grid(row=self._row, column=0, columnspan=3,
@@ -2332,7 +2343,7 @@ class BotLauncher(ctk.CTk):
                     self.cfg[key] = int(widget.get().split()[0])
                 else:
                     raw = widget.get().strip()
-                    if key in ("ib_host", "ib_account"):
+                    if key in ("ib_host", "ib_account", "flex_token", "flex_query_id"):
                         self.cfg[key] = raw
                     elif key in ("max_positions", "max_per_sector",
                                  "min_available_funds", "scan_intervall",
