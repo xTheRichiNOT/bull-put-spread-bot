@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.5": [
+        "🐛  IV-Gate: iv_rank und iv_absmin sind jetzt getrennte Funnel-Töpfe — bessere Analyse warum Trades blockiert wurden",
+        "✨  Funnel-Tab zeigt IV-Rank-Gate und IV-Abs-Minimum separat",
+    ],
     "4.1.4": [
         "✨  Flex Token + Query-ID jetzt direkt in den Einstellungen eingebbar — kein config.json-Editieren mehr",
         "✨  Flex Reconcile an/aus per Toggle in der UI",

@@ -3930,14 +3930,22 @@ async def run_bot(stop_event: threading.Event = None):
                 if IV_GATE_MODE == 'rank':
                     _rank = await _get_iv_rank(symbol, iv)
                     if _rank is None:
+                        # Kein Rank berechenbar (z.B. yfinance-Historie fehlt) → grober Floor
                         if iv <= MIN_VOLA:
                             log(f"   [{symbol}] ✗  IV={iv:.1%} (unter {MIN_VOLA:.1%}, Rank n/v)")
                             _ftrack('iv_floor', symbol)
                             return None
-                    elif iv <= IV_RANK_ABS_MIN or _rank < IV_RANK_MIN:
+                    elif iv <= IV_RANK_ABS_MIN:
+                        # Rank da, aber IV absolut zu dünn → Prämie lohnt nicht
+                        log(f"   [{symbol}] ✗  IV={iv:.1%} | IV-Rank={_rank:.0%} "
+                            f"(unter abs. Minimum {IV_RANK_ABS_MIN:.0%})")
+                        _ftrack('iv_absmin', symbol)
+                        return None
+                    elif _rank < IV_RANK_MIN:
+                        # Das eigentliche Rank-Gate: IV im unteren Bereich der eigenen Historie
                         log(f"   [{symbol}] ✗  IV={iv:.1%} | IV-Rank={_rank:.0%} "
                             f"(unter {IV_RANK_MIN:.0%}-Perzentil)")
-                        _ftrack('iv_floor', symbol)
+                        _ftrack('iv_rank', symbol)
                         return None
                     else:
                         log(f"   [{symbol}] ✓  IV={iv:.1%} | IV-Rank={_rank:.0%}")
@@ -3996,7 +4004,10 @@ async def run_bot(stop_event: threading.Event = None):
             _GATE_LABELS = [
                 ('keine_daten',    'Keine Preisdaten'),
                 ('kein_iv',        'Kein IV'),
-                ('iv_floor',       f'IV ≤ Hard-Floor ({MIN_VOLA:.0%})'),
+                ('iv_rank',        f'IV-Rank < {IV_RANK_MIN:.0%}'),
+                ('iv_absmin',      f'IV < abs. Minimum ({IV_RANK_ABS_MIN:.0%})'),
+                ('iv_floor',       (f'IV < Floor {MIN_VOLA:.0%} (Rank n/v)'
+                                    if IV_GATE_MODE == 'rank' else f'IV ≤ Hard-Floor ({MIN_VOLA:.0%})')),
                 ('earnings_hard',  'Earnings-HardBlock'),
                 ('keine_strikes',  'Keine IB Strike-Map'),
                 ('dte',            'Kein DTE im Fenster'),
