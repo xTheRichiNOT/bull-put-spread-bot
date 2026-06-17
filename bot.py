@@ -77,6 +77,11 @@ _cfg_defaults = {
     "trend_filter": True,           # kein Bull Put unter fallender Aktie nahe 52W-Tief
     "trend_sma_days": 50,           # SMA-Fenster für die Trendrichtung
     "trend_low_buffer_pct": 0.05,   # "nahe Tief" = innerhalb dieser Spanne über dem 52W-Tief
+    # ── IV-Bezug (US-Optionsdaten-Abo aktiv) ──────────────────────────────────
+    "iv_source": "auto",            # 'ib' = nur IB | 'auto' = IB zuerst, yfinance-Fallback | 'yfinance' = nur yfinance
+    "stock_md_type": 1,             # Markt-Daten-Typ Aktien-Stream: 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
+    "ib_mktdata_min_gap_ms": 120,   # Pacing: Mindestabstand zwischen IB-Marktdaten-Anfragen (ms) gegen "zu viele Anfragen"
+    "iv_max_concurrent": 3,         # gleichzeitige Options-IV-Abfragen pro Scan-Zyklus
 }
 if os.path.exists(_cfg_path):
     try:
@@ -503,6 +508,44 @@ _IV_CACHE_TTL = 300  # Sekunden (5 Minuten)
 _iv_use_delayed: bool = False  # True wenn Type 1 kein IV liefert → automatisch Type 3
 _iv_yf_only:     bool = False  # True wenn IB Type1+3 dauerhaft kein IV → yfinance direkt
 _iv_yf_hits:     int  = 0     # Wie oft yfinance als IV-Quelle genutzt wurde (kumulativ)
+
+# IV-Quelle: 'ib' (nur IB) | 'auto' (IB zuerst, yfinance-Fallback) | 'yfinance' (nur yfinance).
+# Mit aktivem US-Optionsdaten-Abo ist 'auto' (Default) bzw. 'ib' korrekt — yfinance wird
+# NICHT mehr dauerhaft eingerastet (das alte _iv_yf_only-Latching ist deaktiviert).
+_IV_SOURCE = str(_cfg.get('iv_source', 'auto')).lower()
+if _IV_SOURCE not in ('ib', 'auto', 'yfinance'):
+    _IV_SOURCE = 'auto'
+_iv_yf_only = (_IV_SOURCE == 'yfinance')   # nur noch durch Config gesetzt, nicht durch Laufzeit-Latch
+
+# ── Globaler Pacing-Limiter für IB-Marktdaten-Anfragen ───────────────────────
+# IBKR begrenzt die Nachrichten-/Ticker-Rate. Wird sie überschritten, kommt
+# "Max rate of messages exceeded" bzw. der vom Nutzer beobachtete "zu viele Anfragen"-Fehler,
+# woraufhin IB kein IV liefert. Dieser Limiter erzwingt einen Mindestabstand zwischen JEDER
+# reqMktData/qualify/cancel im IV-Pfad und macht den IB-IV-Bezug damit pacing-sicher.
+_IB_MD_MIN_GAP   = max(0.0, float(_cfg.get('ib_mktdata_min_gap_ms', 120)) / 1000.0)
+_ib_md_lock: "asyncio.Lock | None" = None
+_ib_md_last_ts: float = 0.0
+
+async def _ib_md_pace():
+    """Blockiert kooperativ, bis seit der letzten IB-Marktdaten-Anfrage >= _IB_MD_MIN_GAP s vergingen."""
+    global _ib_md_lock, _ib_md_last_ts
+    if _IB_MD_MIN_GAP <= 0:
+        return
+    if _ib_md_lock is None:
+        _ib_md_lock = asyncio.Lock()
+    import time as _t
+    async with _ib_md_lock:
+        wait = _IB_MD_MIN_GAP - (_t.monotonic() - _ib_md_last_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _ib_md_last_ts = _t.monotonic()
+
+def _iv_valid(v) -> bool:
+    """True wenn v eine plausible IV ist (>0, keine NaN)."""
+    try:
+        return v is not None and v > 0 and not math.isnan(float(v))
+    except Exception:
+        return False
 
 # yfinance Rate-Limit Cooldown — wenn gesperrt, 10 Min direkt zu IB springen
 _yf_blocked_until: float = 0.0
@@ -1244,8 +1287,21 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
 
         iv = None
 
-        # ── IB-Pfad (übersprungen wenn bekannt nutzlos) ──────────────────────────
-        if not _iv_yf_only:
+        # ── Billigster Pfad: IB-berechnete ATM-IV (Generic Tick 106) ─────────────
+        # IBKR liefert pro optionierbarem Underlying eine 30-Tage-ATM-IV direkt am
+        # Aktien-Stream (Tick 106). Sie wird beim Hintergrund-Streaming mit angefordert
+        # und kostet hier KEINE zusätzliche Anfrage → kein Rate-Limit möglich.
+        if _IV_SOURCE != 'yfinance':
+            for t in ib.tickers():
+                if (t.contract and t.contract.symbol == symbol
+                        and t.contract.secType == 'STK'):
+                    iv_c = getattr(t, 'impliedVolatility', None)
+                    if _iv_valid(iv_c):
+                        iv = float(iv_c)
+                    break
+
+        # ── IB-Pfad: ATM-Put-Optionsleitung (nur wenn Tick 106 nichts lieferte) ──
+        if not iv and _IV_SOURCE != 'yfinance':
             # Echter ATM-Strike: nächster Strike zum aktuellen Kurs
             strike = min(strikes, key=lambda s: abs(s - price))
 
@@ -1254,6 +1310,7 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
             exp = min(expiries, key=lambda e: abs((datetime.strptime(e, '%Y%m%d') - today).days - 38))
             if (datetime.strptime(exp, '%Y%m%d') - today).days >= 7:
                 opt_con = Option(symbol, exp, strike, 'P', 'SMART')
+                await _ib_md_pace()
                 await ib.qualifyContractsAsync(opt_con)
 
                 # Wenn ATM-Strike für diese Expiry nicht existiert → bis zu 4 nächste Strikes versuchen
@@ -1263,6 +1320,7 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                         if alt_s == strike:
                             continue
                         opt_alt = Option(symbol, exp, alt_s, 'P', 'SMART')
+                        await _ib_md_pace()
                         await ib.qualifyContractsAsync(opt_alt)
                         if opt_alt.conId:
                             opt_con = opt_alt
@@ -1274,6 +1332,7 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                         ib.reqMarketDataType(3)
                     else:
                         ib.reqMarketDataType(1)
+                    await _ib_md_pace()
                     t_opt = ib.reqMktData(opt_con, '', False, False)
 
                     def _valid_iv(v) -> bool:
@@ -1318,6 +1377,7 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                     # Kein IV via Type 1 → Fallback auf Type 3
                     if not iv and not _iv_use_delayed:
                         ib.reqMarketDataType(3)
+                        await _ib_md_pace()
                         t_opt3 = ib.reqMktData(opt_con, '', False, False)
                         for _ in range(10):
                             await asyncio.sleep(0.5)
@@ -1349,8 +1409,8 @@ async def _get_market_data_yf(symbol, ib=None, price_hint: float = 0.0):
                                 log(f"   ℹ️  OPRA Type 1 ohne Daten — wechsle dauerhaft auf Type 3 (Delayed) für IV")
                             log(f"   [IV {symbol}] Type-3: IV={iv:.1%} (strike={strike})")
 
-        # ── Fallback: yfinance Options-Chain (Demo / kein IB-Optionsdaten-Abo) ──
-        if not iv:
+        # ── Fallback: yfinance Options-Chain (nur wenn IV-Quelle nicht 'ib' erzwingt) ──
+        if not iv and _IV_SOURCE != 'ib':
             try:
                 import yfinance as _yf
                 from datetime import timedelta as _td
@@ -1409,7 +1469,10 @@ async def _yf_stock_scan(symbols: list, ib=None) -> tuple:
                         price = float(val)
                         break
                 if price:
-                    results[sym] = (price, None)
+                    # IB-berechnete ATM-IV (Tick 106) gleich mitnehmen, falls am Stream vorhanden
+                    iv_c = getattr(t, 'impliedVolatility', None)
+                    iv_stream = float(iv_c) if (_IV_SOURCE != 'yfinance' and _iv_valid(iv_c)) else None
+                    results[sym] = (price, iv_stream)
                     ib_count += 1
         except Exception:
             pass
@@ -1533,25 +1596,62 @@ async def start_background_streaming(symbols: list, ib) -> None:
     except Exception as e:
         log(f"   ⚠️  VIX-Stream fehlgeschlagen: {e}")
 
-    # Aktien: Type 4 (Delayed-Frozen) — robuster als Type 3, vermeidet Error 322 'bM'
-    # Type 4 gibt immer den letzten bekannten Kurs zurück (Delayed während Handelszeiten,
-    # Frozen nach Börsenschluss) — kein separates US-Aktien-Abo nötig
-    ib.reqMarketDataType(4)
-    count = 0
-    for sym in symbols:
-        try:
-            con = Stock(sym, 'SMART', 'USD')
-            await ib.qualifyContractsAsync(con)
-            if con.conId:
-                ib.reqMktData(con, '', False, False)
-                count += 1
-                await asyncio.sleep(0.1)  # 100ms — gibt dem Server Luft zwischen Anfragen
-        except Exception:
-            pass
+    import math as _math
+    # Generic Ticks: 104 = Option Historical Vol, 106 = Option Implied Vol (ATM, 30T)
+    _GEN_TICKS = '104,106' if _IV_SOURCE != 'yfinance' else ''
+
+    def _has_price(t) -> bool:
+        for val in [t.last, t.close,
+                    getattr(t, 'delayedLast', None), getattr(t, 'delayedClose', None)]:
+            if val is not None and val > 0 and not _math.isnan(val):
+                return True
+        return False
+
+    async def _open_stock_streams(md_type: int) -> tuple:
+        """Öffnet alle Aktien-Streams im gewünschten Markt-Daten-Typ. Gibt (tickers, count) zurück."""
+        ib.reqMarketDataType(md_type)
+        _tickers, _count = [], 0
+        for sym in symbols:
+            try:
+                con = Stock(sym, 'SMART', 'USD')
+                await ib.qualifyContractsAsync(con)
+                if con.conId:
+                    await _ib_md_pace()
+                    _tickers.append(ib.reqMktData(con, _GEN_TICKS, False, False))
+                    _count += 1
+            except Exception:
+                pass
+        return _tickers, _count
+
+    # Primärer Versuch: konfigurierter Typ (Default 1 = Live, nötig für berechnete IV)
+    stock_md_type = int(_cfg.get('stock_md_type', 1))
+    _type_name = {1: 'Live', 2: 'Frozen', 3: 'Delayed', 4: 'Delayed-Frozen'}.get(stock_md_type, str(stock_md_type))
+    log(f"   ⚙️  Aktien-Streams: Markt-Daten-Typ {stock_md_type} ({_type_name}), Generic Ticks '{_GEN_TICKS or '—'}'")
+    tickers, count = await _open_stock_streams(stock_md_type)
 
     log(f"   ✅ {count}/{len(symbols)} Aktien-Streams geöffnet — warte 10s auf erste Daten ...")
     await asyncio.sleep(10)  # Warm-up: letzte Symbole in der Liste brauchen mehr Zeit
-    log(f"   ✅ Daten-Pool bereit")
+
+    # ── Selbstheilung: liefert der Live-Typ zu wenige Kurse (kein US-Aktien-Realtime-Abo?),
+    #    auf Type 4 (Delayed-Frozen) zurückfallen — schützt den Preis-Feed. ──────────────
+    priced = sum(1 for t in tickers if _has_price(t))
+    if stock_md_type == 1 and count and priced < count * 0.5:
+        log(f"   ⚠️  Nur {priced}/{count} Live-Kurse — kein US-Aktien-Realtime? Fallback auf Type 4 (Delayed-Frozen)")
+        for t in list(tickers):
+            try:
+                ib.cancelMktData(t.contract)
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+        tickers, count = await _open_stock_streams(4)
+        await asyncio.sleep(10)
+        priced = sum(1 for t in tickers if _has_price(t))
+
+    iv_ready = sum(1 for t in tickers if _iv_valid(getattr(t, 'impliedVolatility', None)))
+    log(f"   ✅ Daten-Pool bereit — {priced}/{count} Kurse, {iv_ready}/{count} mit IB-IV (Tick 106)")
+    if _IV_SOURCE != 'yfinance' and iv_ready == 0:
+        log("   ℹ️  Noch keine IB-IV am Aktien-Stream — IV kommt pro Symbol via ATM-Put (gepaced)"
+            + (", sonst yfinance" if _IV_SOURCE == 'auto' else ""))
     ib.reqMarketDataType(1)  # Für Options-Scan (OPRA) zurück auf Live
 
 
@@ -3602,17 +3702,20 @@ async def run_bot(stop_event: threading.Event = None):
                 ib_price_data, _ib_price_count = await _yf_stock_scan(WATCHLIST, ib)
                 log(f"   🔄 Nach Stream-Neustart: {len(ib_price_data)}/{len(WATCHLIST)} Preise")
 
-            # IB liefert keine Preise → IV-Abruf via IB spart auch nichts → direkt yfinance
-            global _iv_yf_only, _iv_yf_hits
-            if _ib_price_count == 0 and len(ib_price_data) > 0 and not _iv_yf_only:
-                _iv_yf_only = True
-                log("   ℹ️  IB liefert keine Preise → IV-Scan direkt via yfinance (kein IB-Wait)")
+            # Hinweis: das alte dauerhafte Umschalten auf yfinance (_iv_yf_only-Latch) ist
+            # entfernt. Die IV-Quelle wird allein durch die Config 'iv_source' bestimmt, damit
+            # der Bot mit aktivem US-Optionsdaten-Abo durchgehend IB-IV nutzt.
+            global _iv_yf_hits
 
-            # ── Phase 1c: IV via Cache + yfinance-Fallback (TTL 5min) ──────────
-            # IV ändert sich langsam → Cache verhindert yfinance-Spam jeden Scan-Zyklus
+            # ── Phase 1c: IV via Cache + IB (Tick 106 / ATM-Put) + ggf. yfinance ──
+            # IV ändert sich langsam → Cache (TTL 5min) hält die Anfragelast niedrig.
             import time as _time
             now_ts = _time.time()
             no_iv = [s for s, (_, v) in ib_price_data.items() if v is None]
+            # Frische IB-IV (Tick 106) aus dem Preis-Scan direkt in den Cache spiegeln
+            for sym, (_p, _v) in ib_price_data.items():
+                if _v is not None:
+                    _iv_cache[sym] = (_v, now_ts)
             # Cache-Treffer sofort eintragen
             for sym in list(no_iv):
                 cached = _iv_cache.get(sym)
@@ -3620,28 +3723,26 @@ async def run_bot(stop_event: threading.Event = None):
                     p, _ = ib_price_data[sym]
                     ib_price_data[sym] = (p, cached[0])
                     no_iv.remove(sym)
-            # Nur abgelaufene / unbekannte IV via OPRA holen
+            # Nur fehlende / abgelaufene IV nachholen
             if no_iv:
-                _iv_src = "yf-Chain direkt" if _iv_yf_only else "OPRA ATM-Put, Type 1"
+                if _IV_SOURCE == 'ib':
+                    _iv_src = "IB ATM-Put (gepaced)"
+                elif _IV_SOURCE == 'yfinance':
+                    _iv_src = "yfinance Options-Chain"
+                else:
+                    _iv_src = "IB ATM-Put → yfinance-Fallback"
                 log(f"   IV für {len(no_iv)} Symbole ({_iv_src}) ...")
-                _sem_iv = asyncio.Semaphore(5)
-                _iv_yf_hits_before = _iv_yf_hits
+                _sem_iv = asyncio.Semaphore(max(1, int(_cfg.get('iv_max_concurrent', 3))))
                 async def _iv_fill(sym):
                     async with _sem_iv:
                         _known_price = ib_price_data.get(sym, (0.0, None))[0] or 0.0
-                        _, yf_iv = await _get_market_data_yf(sym, ib, price_hint=_known_price)
-                    if yf_iv is not None:
+                        _, iv_val = await _get_market_data_yf(sym, ib, price_hint=_known_price)
+                    if iv_val is not None:
                         p, _ = ib_price_data[sym]
-                        ib_price_data[sym] = (p, yf_iv)
-                        _iv_cache[sym] = (yf_iv, _time.time())
+                        ib_price_data[sym] = (p, iv_val)
+                        _iv_cache[sym] = (iv_val, _time.time())
                 await asyncio.gather(*[_iv_fill(s) for s in no_iv],
                                      return_exceptions=True)
-                # Wenn in diesem Scan die meisten IV via yfinance kamen (IB taugt nichts) → direkt yfinance
-                _iv_yf_this_scan = _iv_yf_hits - _iv_yf_hits_before
-                if not _iv_yf_only and _iv_yf_this_scan >= max(1, len(no_iv) // 2):
-                    _iv_yf_only = True
-                    log(f"   ℹ️  IB liefert kein IV ({_iv_yf_this_scan}/{len(no_iv)} via yfinance)"
-                        f" — wechsle dauerhaft auf yfinance Options-Chain")
 
             # ── Phase 1d: News-Check und Signal-Berechnung für Trigger ───────
             _sem_news = asyncio.Semaphore(5)
