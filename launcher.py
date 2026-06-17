@@ -92,6 +92,21 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.1": [
+        "⚡  IB-IV: Implied Volatility jetzt direkt via Tick 106 aus IB-Streams — kein separater API-Call mehr",
+        "⚡  Pacing-Limiter: verhindert 'Max rate of messages exceeded' bei vielen Symbolen",
+        "✨  iv_source Config: 'ib' | 'auto' | 'yfinance' — ersetzt alten _iv_yf_only Latch",
+    ],
+    "4.1.0": [
+        "🐛  ComboLeg-Fix: Bot platziert jetzt korrekte Bull Put Spreads (SELL Short / BUY Long) statt Bear Put",
+        "🐛  P&L-Fix: Trades ohne bekannten Einstiegspreis zeigen 'unbekannt' statt falsch $0",
+        "🐛  Broker-Reconcile: fehlende Fills werden beim nächsten Start automatisch nachgetragen",
+        "✨  Trend-Filter: Bull Put wird geblockt wenn Preis unter SMA50 und nahe 52W-Tief",
+        "✨  Delta-Fallback (Black-Scholes) wenn IB keine modelGreeks liefert",
+    ],
+    "4.0.3": [
+        "✨  Bracket-Re-Adoption: bestehende TP/SL-Orders werden beim Start wiederhergestellt",
+    ],
     "3.2.33": [
         "✨  Entry-Retry: abgelehnte Entry-Orders werden bis zu 3× automatisch neu versucht (60/120/180s Delay)",
         "✨  Status 'Entry Retry X/3' in Offene Positionen — Exit-Button bleibt erreichbar",
