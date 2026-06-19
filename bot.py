@@ -3033,6 +3033,27 @@ async def place_order(ib, sig):
             has_real_ask = bool(t_long.ask  and t_long.ask  > 0)
 
             ibkr_net = round(short_bid - long_ask, 2) if (short_bid and long_ask) else 0.0
+
+            # ── Order-Sanity-Gate (Paper UND Live) ───────────────────────────
+            # Niemals einen Spread mit nicht-positivem oder zu kleinem Netto-Credit
+            # verkaufen. Stale/invertierte Einzelbein-Quotes (Short-Bid < Long-Ask)
+            # erzeugen sonst ein 0.01-Limit, das IB als "guaranteed-to-lose" ablehnt
+            # (Error 201) und damit Folge-Orders blockiert. Lieber abbrechen und im
+            # nächsten Zyklus mit frischen Quotes neu versuchen.
+            _min_credit_ps = max(MIN_CREDIT_ABS / 100.0, 0.05)
+            _sig_credit_ps = sig.get('credit', 0) / 100.0
+            if ibkr_net < _min_credit_ps:
+                log(f"  ✗ [{sym}] Order-Abbruch: Netto-Credit ${ibkr_net:.2f}/Aktie "
+                    f"(Short ${short_bid:.2f} / Long ${long_ask:.2f}) unter Minimum "
+                    f"${_min_credit_ps:.2f} — vermutlich stale/invertierte Quotes, kein Trade")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
+            if _sig_credit_ps > 0 and ibkr_net < 0.5 * _sig_credit_ps:
+                log(f"  ✗ [{sym}] Order-Abbruch: Platzierungs-Credit ${ibkr_net:.2f} weicht stark "
+                    f"vom Signal-Credit ${_sig_credit_ps:.2f} ab (<50%) — unzuverlässige Quotes, kein Trade")
+                _bot_trades[sym] = {'status': 'failed', 'entry_per_share': 0, 'at_breakeven': False}
+                return
+
             has_model = not has_real_bid and bool(
                 t_short.modelGreeks and t_short.modelGreeks.optPrice
                 and t_short.modelGreeks.optPrice > 0)

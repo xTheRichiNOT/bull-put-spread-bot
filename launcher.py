@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.7": [
+        "🐛  Order-Sanity-Gate: stale/invertierte Quotes erzeugen keine 0.01-Order mehr",
+        "🐛  Error 201 (guaranteed-to-lose) kann nicht mehr durch kaputte Quotes entstehen",
+        "✅  Gate greift auf Paper UND Live — kein Sonderweg mehr für Paper-Konto",
+    ],
     "4.1.6": [
         "✨  Trades-Tab: 'IB ↓' Button lädt Trade-Historie direkt von IB Flex — kein Bot-Neustart nötig",
         "✅  Flex-Daten haben Vorrang vor trade_history.json — IB ist die einzige Wahrheit",
