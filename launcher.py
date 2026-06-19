@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.6": [
+        "✨  Trades-Tab: 'IB ↓' Button lädt Trade-Historie direkt von IB Flex — kein Bot-Neustart nötig",
+        "✅  Flex-Daten haben Vorrang vor trade_history.json — IB ist die einzige Wahrheit",
+        "✅  Lokale Intraday-Trades (noch nicht in Flex) werden automatisch ergänzt",
+    ],
     "4.1.5": [
         "🐛  IV-Gate: iv_rank und iv_absmin sind jetzt getrennte Funnel-Töpfe — bessere Analyse warum Trades blockiert wurden",
         "✨  Funnel-Tab zeigt IV-Rank-Gate und IV-Abs-Minimum separat",
@@ -1502,6 +1507,11 @@ class BotLauncher(ctk.CTk):
                           fg_color=C["surface"], hover_color=C["border"],
                           text_color=C["muted"],
                           command=self._refresh_history).pack(side="right", padx=4)
+            ctk.CTkButton(pr, text="IB ↓", width=52, height=26,
+                          fg_color=C["surface"], hover_color=C["border"],
+                          text_color=C["accent"],
+                          font=ctk.CTkFont(size=11, weight="bold"),
+                          command=self._flex_fetch_manual).pack(side="right", padx=2)
             sr = ctk.CTkFrame(bar, fg_color="transparent")
             sr.pack(fill="x", padx=10, pady=(0, 8))
             lbl_refs["total"]   = ctk.CTkLabel(sr, text="Gesamt: —",
@@ -1885,15 +1895,7 @@ class BotLauncher(ctk.CTk):
         for w in self._history_scroll.winfo_children():
             w.destroy()
 
-        history_file = os.path.join(_BASE, "trade_history.json")
-        all_trades = []
-        if os.path.exists(history_file):
-            try:
-                with open(history_file) as f:
-                    all_trades = json.load(f)
-            except Exception:
-                pass
-
+        all_trades = self._load_trades()
         trades = self._filter_trades_by_period(all_trades)
 
         # Stats aktualisieren
@@ -1999,6 +2001,161 @@ class BotLauncher(ctk.CTk):
             else:
                 status_txt, status_col = f"{pnl_pct_h:.0f}%", "#ef4444"
             lbl(row, status_txt, 80, status_col)
+
+    # ── IB Flex: direkt aus IB laden ─────────────────────────────────────────
+
+    def _flex_fetch_manual(self):
+        """Button 'IB ↓': Flex im Hintergrund abrufen, dann Trades-Tab refreshen."""
+        cfg = self.cfg
+        if not (cfg.get("flex_enabled") and cfg.get("flex_token") and cfg.get("flex_query_id")):
+            self._save_lbl.configure(
+                text="⚠  Flex nicht konfiguriert — Einstellungen → IB Flex Web Service",
+                text_color=C["amber"])
+            self.after(4000, lambda: self._save_lbl.configure(text=""))
+            return
+        threading.Thread(target=self._flex_fetch_bg, daemon=True).start()
+
+    def _flex_fetch_bg(self):
+        """Hintergrund-Thread: Flex-API abrufen, flex_cache.json schreiben, UI aktualisieren."""
+        import time as _t, xml.etree.ElementTree as _ET
+        self.after(0, lambda: self._save_lbl.configure(
+            text="  🔄  Lade Trade-Historie von IB Flex...", text_color=C["accent2"]))
+
+        FLEX_BASE = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService"
+        token = str(self.cfg.get("flex_token", "")).strip()
+        qid   = str(self.cfg.get("flex_query_id", "")).strip()
+
+        def _get(url):
+            req = urllib.request.Request(url, headers={"User-Agent": "bot-flex/1.0"})
+            with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as r:
+                return r.read().decode("utf-8", "replace")
+
+        try:
+            r1 = _get(f"{FLEX_BASE}.SendRequest?t={token}&q={qid}&v=3")
+            root = _ET.fromstring(r1)
+            if (root.findtext("Status") or "").strip() != "Success":
+                err = f"{root.findtext('ErrorCode') or ''} {root.findtext('ErrorMessage') or ''}".strip()
+                self.after(0, lambda e=err: self._save_lbl.configure(
+                    text=f"  ❌  Flex Fehler: {e}", text_color=C["red"]))
+                return
+            ref  = (root.findtext("ReferenceCode") or "").strip()
+            base = (root.findtext("Url") or f"{FLEX_BASE}.GetStatement").strip()
+
+            stmt = None
+            for _ in range(12):
+                _t.sleep(3)
+                s = _get(f"{base}?t={token}&q={ref}&v=3")
+                if "<FlexQueryResponse" in s:
+                    stmt = s
+                    break
+            if not stmt:
+                self.after(0, lambda: self._save_lbl.configure(
+                    text="  ❌  Flex: Timeout beim Abrufen", text_color=C["red"]))
+                return
+
+            sroot  = _ET.fromstring(stmt)
+            groups: dict = {}
+            for tr in sroot.iter("Trade"):
+                if tr.get("assetCategory") != "OPT" or \
+                   (tr.get("putCall") or "").upper() not in ("P", "PUT"):
+                    continue
+                try:
+                    strike = float(tr.get("strike") or 0)
+                    qty    = float(tr.get("quantity") or 0)
+                    cash   = float(tr.get("proceeds") or 0) + float(tr.get("ibCommission") or 0)
+                except (TypeError, ValueError):
+                    continue
+                und = tr.get("underlyingSymbol") or tr.get("symbol") or ""
+                exp = (tr.get("expiry") or "")[:8]
+                if not und or not exp:
+                    continue
+                when = (tr.get("dateTime") or tr.get("tradeDate") or "").replace("T", " ")
+                g = groups.setdefault((und, exp), {"cash": 0.0, "legs": {}, "last": "", "n": 0,
+                                                    "buysell": []})
+                g["cash"] += cash
+                g["legs"][strike] = g["legs"].get(strike, 0.0) + qty
+                g["n"] += 1
+                if str(when) > g["last"]:
+                    g["last"] = str(when)
+
+            flex_trades = []
+            for (und, exp), g in groups.items():
+                if g["n"] == 0 or any(abs(q) > 1e-6 for q in g["legs"].values()):
+                    continue
+                strikes = sorted(g["legs"].keys())
+                exp_fmt = f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}" if len(exp) == 8 else exp
+                when = g["last"]
+                try:
+                    d = str(when).replace(";", " ")
+                    if len(d) >= 8 and d[:8].isdigit():
+                        when = (f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+                                + (f" {d[9:11]}:{d[11:13]}" if len(d) >= 13 else ""))
+                except Exception:
+                    pass
+                flex_trades.append({
+                    "symbol":          und,
+                    "expiry":          exp_fmt,
+                    "short_strike":    strikes[-1] if strikes else 0,
+                    "long_strike":     strikes[0]  if strikes else 0,
+                    "entry_per_share": None,
+                    "exit_per_share":  None,
+                    "pnl":             round(g["cash"], 2),
+                    "entry_unknown":   False,
+                    "status":          "reconciled",
+                    "close_reason":    "flex",
+                    "closed_at":       when,
+                    "source":          "flex",
+                })
+
+            cache_path = os.path.join(_BASE, "flex_cache.json")
+            with open(cache_path, "w") as _f:
+                json.dump(flex_trades, _f, indent=2)
+
+            n = len(flex_trades)
+            self.after(0, lambda: self._save_lbl.configure(
+                text=f"  ✅  {n} geschlossene Spread(s) von IB geladen", text_color=C["green"]))
+            self.after(0, self._refresh_history)
+            self.after(5000, lambda: self._save_lbl.configure(text=""))
+
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._save_lbl.configure(
+                text=f"  ❌  Flex: {err}", text_color=C["red"]))
+
+    def _load_trades(self) -> list:
+        """Ladet Trade-Historie: Flex-Cache (IB) hat Vorrang, trade_history.json als Ergänzung."""
+        flex_cache = os.path.join(_BASE, "flex_cache.json")
+        local_file = os.path.join(_BASE, "trade_history.json")
+
+        flex_trades: list = []
+        if os.path.exists(flex_cache):
+            try:
+                with open(flex_cache) as f:
+                    flex_trades = json.load(f)
+            except Exception:
+                pass
+
+        local_trades: list = []
+        if os.path.exists(local_file):
+            try:
+                with open(local_file) as f:
+                    local_trades = json.load(f)
+            except Exception:
+                pass
+
+        if not flex_trades:
+            return local_trades
+
+        # Flex ist primär — lokale Trades ergänzen nur wenn nicht in Flex vorhanden
+        def _key(t):
+            exp = str(t.get("expiry", "")).replace("-", "")[:8]
+            return (t.get("symbol", ""), exp)
+
+        flex_keys = {_key(t) for t in flex_trades}
+        merged = list(flex_trades)
+        for t in local_trades:
+            if _key(t) not in flex_keys:
+                merged.append(t)
+        return merged
 
     # ── Auto-Refresh alle 15s ─────────────────────────────────────────────────
 
