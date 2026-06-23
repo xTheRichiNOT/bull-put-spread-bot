@@ -2993,12 +2993,32 @@ async def place_order(ib, sig):
             global _sem_ib_mktdata
             if _sem_ib_mktdata is None:
                 _sem_ib_mktdata = asyncio.Semaphore(2)
+            # ── Option 1: Quote-Retry ────────────────────────────────────────
+            # Eine leere Optionsquote ist oft nur ein einzelner unglücklicher Tick.
+            # Bevor wir auf Modellpreis (Confidence 0.70 → Abbruch) zurückfallen, den
+            # echten zweiseitigen Markt bis zu N-mal mit kurzem Abstand neu anfragen.
+            short_bid = long_ask = None
+            _QUOTE_TRIES = max(1, int(_cfg.get('quote_retry_attempts', 3)))
+            _QUOTE_GAP   = max(0.0, float(_cfg.get('quote_retry_gap_sec', 2.0)))
             async with _sem_ib_mktdata:
-                t_short = ib.reqMktData(short_contract, '', False, False)
-                t_long  = ib.reqMktData(long_contract,  '', False, False)
-                await _wait_tickers([t_short, t_long], timeout=5.0)
-                short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
-                long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
+                for _qa in range(_QUOTE_TRIES):
+                    t_short = ib.reqMktData(short_contract, '', False, False)
+                    t_long  = ib.reqMktData(long_contract,  '', False, False)
+                    await _wait_tickers([t_short, t_long], timeout=5.0)
+                    short_bid = t_short.bid if t_short.bid and t_short.bid > 0 else None
+                    long_ask  = t_long.ask  if t_long.ask  and t_long.ask  > 0 else None
+                    if short_bid is not None and long_ask is not None:
+                        if _qa > 0:
+                            log(f"  ✓ [{sym}] Echter Bid/Ask im Versuch {_qa+1}/{_QUOTE_TRIES} erhalten")
+                        break
+                    if _qa < _QUOTE_TRIES - 1:
+                        try: ib.cancelMktData(t_short)
+                        except Exception: pass
+                        try: ib.cancelMktData(t_long)
+                        except Exception: pass
+                        log(f"  ⏳ [{sym}] Noch kein echter Bid/Ask (Versuch {_qa+1}/{_QUOTE_TRIES}) — "
+                            f"neuer Versuch in {_QUOTE_GAP:.0f}s")
+                        await asyncio.sleep(_QUOTE_GAP)
             try:
                 ib.cancelMktData(t_short)
             except Exception:

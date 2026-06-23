@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.9": [
+        "⚡  Quote-Retry beim Platzieren: bis zu 3× echten Bid/Ask anfragen bevor Modell-Fallback greift",
+        "✅  Leere Optionsquote durch schlechten Tick führt nicht mehr sofort zum Abbruch",
+        "⚙️  quote_retry_attempts (3) und quote_retry_gap_sec (2.0) in config.json einstellbar",
+    ],
     "4.1.8": [
         "🐛  Error 201 final behoben: Entry steht allein (transmit=True), kein simultanes Bracket mehr",
         "🐛  TP/SL werden NACH dem Fill als OCA-Paar nachgeschoben — kein guaranteed-to-lose mehr",
