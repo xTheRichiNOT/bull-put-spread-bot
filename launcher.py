@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.1.8": [
+        "🐛  Error 201 final behoben: Entry steht allein (transmit=True), kein simultanes Bracket mehr",
+        "🐛  TP/SL werden NACH dem Fill als OCA-Paar nachgeschoben — kein guaranteed-to-lose mehr",
+        "🐛  _fatal_err_of: Race-Condition zwischen Cancelled-Event und Error-Event behoben",
+    ],
     "4.1.7": [
         "🐛  Order-Sanity-Gate: stale/invertierte Quotes erzeugen keine 0.01-Order mehr",
         "🐛  Error 201 (guaranteed-to-lose) kann nicht mehr durch kaputte Quotes entstehen",

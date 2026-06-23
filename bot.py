@@ -503,6 +503,22 @@ _iv_memory: dict = {}
 _order_error_codes: dict = {}
 _ghost_strikes:     dict = {}   # Symbol → aufeinanderfolgende Leer-Treffer im Ghost-Check
 _FATAL_ORDER_ERRORS = {201, 110, 203, 461, 463, 478}
+
+def _fatal_err_of(trade, order_id):
+    """Ermittelt einen strukturellen Fehlercode (z.B. 201) robust: erst aus dem
+    _order_error_codes-Dict, sonst direkt aus trade.log. Das verhindert fälschliche
+    Retries, wenn der Cancelled-Status-Event VOR dem Error-Event eintrifft (Race)."""
+    _e = _order_error_codes.pop(order_id, None)
+    if _e in _FATAL_ORDER_ERRORS:
+        return _e
+    try:
+        for _entry in getattr(trade, 'log', []):
+            _ec = getattr(_entry, 'errorCode', None)
+            if _ec in _FATAL_ORDER_ERRORS:
+                return _ec
+    except Exception:
+        pass
+    return _e
 # Speichert aktive Bot-Trades für Exit-Monitoring
 _bot_trades: dict = {}
 # IB-validierte Strikes und Expiries pro Symbol (einmalig beim Start geladen)
@@ -1151,7 +1167,7 @@ def _on_order_status(trade):
             entry_oid = _bot_trades[sym].get('entry_order_id', -1)
             if not _bot_trades[sym].get('fill_confirmed', True) and order_id == entry_oid:
                 # Entry-Order abgelehnt bevor sie gefüllt wurde — Retry oder aufgeben
-                _err = _order_error_codes.pop(order_id, None)
+                _err = _fatal_err_of(trade, order_id)
                 if _err in _FATAL_ORDER_ERRORS:
                     _bot_trades[sym]['status'] = 'failed'
                     log(f"  🚫 [{sym}] Entry #{order_id} abgelehnt — IBKR Error {_err} ist "
@@ -1179,7 +1195,7 @@ def _on_order_status(trade):
                     f"(Versuch #{_bot_trades[sym].get('retry_count', 1)})")
         else:
             # Kein offener Trade (OCA TP/SL abgelehnt) — Entry-Retry falls noch nicht erschöpft
-            _err = _order_error_codes.pop(order_id, None)
+            _err = _fatal_err_of(trade, order_id)
             if _err in _FATAL_ORDER_ERRORS:
                 _bot_trades[sym]['status'] = 'cancelled'
                 log(f"  🚫 [{sym}] Order #{order_id} abgelehnt — IBKR Error {_err} ist "
@@ -3216,7 +3232,9 @@ async def place_order(ib, sig):
             # kein Übernacht-Fill zu Konditionen, die der Scanner nie geprüft hat.
             # TP/SL bleiben GTC (sichern die Position über die gesamte Laufzeit).
             entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='DAY')
-            entry_order.transmit = False   # erst SL-Kind (transmit=True) aktiviert das Paket atomar
+            # Variante B: Entry steht ALLEIN (transmit=True). Keine simultanen TP/SL-Kinder,
+            # die als gegensätzliche Kombi-Order auf denselben Legs Error 201 auslösen würden.
+            entry_order.transmit = True
             # NonGuaranteed=1 entfernt: bei Non-Guaranteed-Routing ignoriert IBKR lmtPrice
             # auf Combo-Ebene (erfordert orderComboLegs pro Leg) → Limit kommt als 0.00 an.
             # Ohne dieses Tag nutzt IBKR guaranteed combo routing → lmtPrice wird korrekt übertragen.
@@ -3232,36 +3250,15 @@ async def place_order(ib, sig):
 
             _bot_trades[sym]['entry_order_id'] = parent_id
 
-            # ── Dreierpack: TP + SL als Bracket-Kinder (Paper UND Live identisch) ──
-            # parentId → IBKR hält die Kinder serverseitig zurück bis der Entry füllt,
-            # aktiviert sie danach automatisch als OCA-Paar (eins füllt → anderes weg).
-            # Überlebt Bot-Neustarts, da alle drei Orders im IB-Orderbuch liegen.
-            # TP: Limit-BUY unter Markt (ruht bis Gewinnziel).
-            tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
-            tp_order.parentId = parent_id
-            tp_order.transmit = False
-            tp_order.account = _acct
-            if _ibq is not None:
-                tp_trade = await _ibq.place(ib, bag, tp_order)
-            else:
-                tp_trade = ib.placeOrder(bag, tp_order)
-
-            # SL: MUSS eine Stop-Order sein (STP, auxPrice=Trigger). Eine Limit-BUY-Order
-            # über dem Marktpreis (z.B. 1.26 bei Markt 0.84) wäre sofort marketable und
-            # würde die Position direkt nach dem Fill wieder schließen!
-            sl_order = StopOrder('BUY', n_contracts, sl_close, tif='GTC')
-            sl_order.parentId = parent_id
-            sl_order.transmit = True   # letztes Glied → transmittiert das gesamte Bracket
-            sl_order.account = _acct
-            if _ibq is not None:
-                sl_trade = await _ibq.place(ib, bag, sl_order)
-            else:
-                sl_trade = ib.placeOrder(bag, sl_order)
-
-            _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
-            _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
-            _bot_trades[sym]['tp_price']    = tp_close
-            _bot_trades[sym]['sl_price']    = sl_close
+            # ── Variante B: KEIN simultanes TP/SL-Bracket mehr ──────────────────
+            # Gleichzeitige gegensätzliche Kombi-Orders (SELL-Entry + BUY-TP/SL auf
+            # denselben Legs) lösen IBKR Error 201 aus ("riskless/guaranteed-loss") und
+            # verstopfen das Orderbuch. Stattdessen wird nur der Entry gesendet; TP+SL
+            # platziert der Fill-Handler via _place_paper_oca als OCA-Paar NACH dem Fill,
+            # wenn die Position offen ist und kein arbeitender SELL mehr gegenübersteht.
+            # tp_order_id/sl_order_id bleiben 0 → der Fill-Handler triggert das Nachschieben.
+            _bot_trades[sym]['tp_price'] = tp_close
+            _bot_trades[sym]['sl_price'] = sl_close
 
             _save_state()
 
@@ -3274,10 +3271,10 @@ async def place_order(ib, sig):
                     f"Retry-Logik übernimmt")
                 return False
             _mode = 'Paper' if _is_paper else 'Live'
-            log(f"  ✅ [{sym}] BRACKET PLATZIERT ({_mode} — Entry DAY, TP/SL GTC) × {n_contracts} Kontrakt(e)")
-            log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x  [{_st}]")
-            log(f"     TP     #{tp_trade.order.orderId}:  LMT +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})  → aktiv nach Fill")
-            log(f"     SL     #{sl_trade.order.orderId}:  STP +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -{sl_close*100*n_contracts:.0f})  → aktiv nach Fill, BE bei +{BREAKEVEN_TRIGGER_PCT:.0%}")
+            log(f"  ✅ [{sym}] ENTRY PLATZIERT ({_mode} — Entry DAY, TP/SL folgen nach Fill) × {n_contracts} Kontrakt(e)")
+            log(f"     Entry #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x  [{_st}]")
+            log(f"     Nach Fill via OCA:  TP LMT +${tp_close:.2f} (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})  /  "
+                f"SL STP +${sl_close:.2f} (-{STOP_LOSS_MULT:.0%} = -${sl_close*100*n_contracts:.0f}), BE bei +{BREAKEVEN_TRIGGER_PCT:.0%}")
             return True
     except Exception as e:
         import traceback
