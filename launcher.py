@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.2.0": [
+        "🐛  Combo-Limit-Fix: NonGuaranteed='0' erzwingt garantiertes Routing — lmtPrice kommt nicht mehr als 0.00 an",
+        "🐛  Error 201 (guaranteed-loss durch 0.00-Limit) damit endgültig behoben",
+    ],
     "4.1.9": [
         "⚡  Quote-Retry beim Platzieren: bis zu 3× echten Bid/Ask anfragen bevor Modell-Fallback greift",
         "✅  Leere Optionsquote durch schlechten Tick führt nicht mehr sofort zum Abbruch",

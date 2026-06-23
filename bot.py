@@ -3255,9 +3255,14 @@ async def place_order(ib, sig):
             # Variante B: Entry steht ALLEIN (transmit=True). Keine simultanen TP/SL-Kinder,
             # die als gegensätzliche Kombi-Order auf denselben Legs Error 201 auslösen würden.
             entry_order.transmit = True
-            # NonGuaranteed=1 entfernt: bei Non-Guaranteed-Routing ignoriert IBKR lmtPrice
-            # auf Combo-Ebene (erfordert orderComboLegs pro Leg) → Limit kommt als 0.00 an.
-            # Ohne dieses Tag nutzt IBKR guaranteed combo routing → lmtPrice wird korrekt übertragen.
+            # ── Combo-Limit-Fix: GARANTIERTES Routing erzwingen ──────────────
+            # SMART-Options-Combos routen bei IBKR per Default non-guaranteed. Dabei
+            # ignoriert IBKR den Netto-lmtPrice (er erfordert dann orderComboLegs pro
+            # Leg) → das Limit kommt als 0.00 an, und IBKR lehnt als guaranteed-loss ab.
+            # Das bloße Weglassen des Tags reicht NICHT, IBKR defaultet trotzdem auf
+            # non-guaranteed. Mit NonGuaranteed='0' wird der Combo als EIN Netto-Limit
+            # (All-or-None) geroutet und der lmtPrice korrekt übertragen.
+            entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '0')]
             entry_order.account = _acct
             log(f"  🔍 [{sym}] Order-Debug: action={entry_order.action} qty={entry_order.totalQuantity} "
                 f"type={entry_order.orderType} lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} "
