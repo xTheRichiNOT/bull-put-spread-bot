@@ -1091,8 +1091,8 @@ async def _place_paper_oca(ib, sym):
         bag = Bag(
             symbol=sym, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=short_conid, ratio=1, action='SELL', exchange='SMART'),
-                ComboLeg(conId=long_conid,  ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=short_conid, ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=long_conid,  ratio=1, action='SELL', exchange='SMART'),
             ]
         )
         import random as _rnd, time as _time
@@ -2549,8 +2549,8 @@ async def close_spread(ib, symbol, info, reason):
         bag = Bag(
             symbol=symbol, exchange='SMART', currency='USD',
             comboLegs=[
-                ComboLeg(conId=_sc, ratio=1, action='SELL', exchange='SMART'),
-                ComboLeg(conId=_lc, ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=_sc, ratio=1, action='BUY',  exchange='SMART'),
+                ComboLeg(conId=_lc, ratio=1, action='SELL', exchange='SMART'),
             ]
         )
         entry = info.get('entry_per_share', 0)
@@ -2976,16 +2976,17 @@ async def place_order(ib, sig):
                 log(f"  ❌ [{sym}] Qualifizierung fehlgeschlagen — Order abgebrochen")
                 return
 
-            # IBKR Paper-Trading-Beobachtung: Bei einer SELL-Order werden ComboLeg-Actions
-            # DIREKT ausgeführt (keine Inversion). Um Bull Put (SELL short_put + BUY long_put)
-            # zu eröffnen, müssen die Legs daher als SELL short / BUY long definiert sein.
-            # BUY-Orders (Close/TP/SL) INVERTIEREN alle Legs → BUY-Close mit SELL/BUY-Legs
-            # ergibt BUY short + SELL long = schließt den Bull Put korrekt.
+            # Kauf-Konvention (BEWÄHRT — Fable-5-Fix): Legs als BUY short / SELL long.
+            # IBKR definiert die Combo aus Käufersicht; eine SELL-Order INVERTIERT die Legs
+            # → SELL short_put + BUY long_put = Bull Put eröffnen (Credit positiv). Eine
+            # BUY-Order (TP/SL-Close) führt die Legs DIREKT aus → BUY short + SELL long =
+            # schließt den Bull Put korrekt. Nur so ist der Combo-Wert positiv, der Netto-
+            # Limit kommt durch (kein 0.00) und es gibt kein Error 201 (kein guaranteed-loss).
             bag = Bag(
                 symbol=sym, exchange='SMART', currency='USD',
                 comboLegs=[
-                    ComboLeg(conId=short_contract.conId, ratio=1, action='SELL', exchange='SMART'),
-                    ComboLeg(conId=long_contract.conId,  ratio=1, action='BUY',  exchange='SMART'),
+                    ComboLeg(conId=short_contract.conId, ratio=1, action='BUY',  exchange='SMART'),
+                    ComboLeg(conId=long_contract.conId,  ratio=1, action='SELL', exchange='SMART'),
                 ]
             )
 

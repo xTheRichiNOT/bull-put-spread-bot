@@ -92,6 +92,11 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.2.2": [
+        "🐛  ComboLeg-Regression behoben: alle 4 Bags zurück auf BUY short / SELL long (Fable-5-Fix)",
+        "🐛  Haupt-Entry, Post-Fill-OCA und Close-Pfad standen auf falscher SELL/BUY-Orientierung",
+        "✅  Combo-Wert positiv → Netto-Limit kommt durch → kein Error 201 mehr",
+    ],
     "4.2.1": [
         "🐛  Bracket zurück: Entry transmit=False, SL-Kind schaltet das Paket scharf → lmtPrice korrekt übertragen",
         "🐛  TP/SL wieder als parentId-Kinder — bis zum Fill nicht aktiv im Buch, kein Error 201",
