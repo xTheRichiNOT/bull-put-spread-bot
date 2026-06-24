@@ -3254,15 +3254,11 @@ async def place_order(ib, sig):
             entry_order = LimitOrder('SELL', n_contracts, limit_price, tif='DAY')
             # Variante B: Entry steht ALLEIN (transmit=True). Keine simultanen TP/SL-Kinder,
             # die als gegensätzliche Kombi-Order auf denselben Legs Error 201 auslösen würden.
-            entry_order.transmit = True
-            # ── Combo-Limit-Fix: GARANTIERTES Routing erzwingen ──────────────
-            # SMART-Options-Combos routen bei IBKR per Default non-guaranteed. Dabei
-            # ignoriert IBKR den Netto-lmtPrice (er erfordert dann orderComboLegs pro
-            # Leg) → das Limit kommt als 0.00 an, und IBKR lehnt als guaranteed-loss ab.
-            # Das bloße Weglassen des Tags reicht NICHT, IBKR defaultet trotzdem auf
-            # non-guaranteed. Mit NonGuaranteed='0' wird der Combo als EIN Netto-Limit
-            # (All-or-None) geroutet und der lmtPrice korrekt übertragen.
-            entry_order.smartComboRoutingParams = [TagValue('NonGuaranteed', '0')]
+            entry_order.transmit = False
+            # Bracket-Lösung: Entry transmit=False — IBKR hält die Order zurück, bis das
+            # letzte Bracket-Kind (SL, transmit=True) das gesamte Paket scharfschaltet.
+            # NUR so überträgt IBKR den Netto-lmtPrice der Combo korrekt; ein Solo-Entry
+            # (transmit=True ohne Kinder) verliert ihn und sendet 0.00 an IBKR.
             entry_order.account = _acct
             log(f"  🔍 [{sym}] Order-Debug: action={entry_order.action} qty={entry_order.totalQuantity} "
                 f"type={entry_order.orderType} lmtPrice={entry_order.lmtPrice} tif={entry_order.tif} "
@@ -3275,15 +3271,36 @@ async def place_order(ib, sig):
 
             _bot_trades[sym]['entry_order_id'] = parent_id
 
-            # ── Variante B: KEIN simultanes TP/SL-Bracket mehr ──────────────────
-            # Gleichzeitige gegensätzliche Kombi-Orders (SELL-Entry + BUY-TP/SL auf
-            # denselben Legs) lösen IBKR Error 201 aus ("riskless/guaranteed-loss") und
-            # verstopfen das Orderbuch. Stattdessen wird nur der Entry gesendet; TP+SL
-            # platziert der Fill-Handler via _place_paper_oca als OCA-Paar NACH dem Fill,
-            # wenn die Position offen ist und kein arbeitender SELL mehr gegenübersteht.
-            # tp_order_id/sl_order_id bleiben 0 → der Fill-Handler triggert das Nachschieben.
-            _bot_trades[sym]['tp_price'] = tp_close
-            _bot_trades[sym]['sl_price'] = sl_close
+            # ── Bracket: TP + SL als Kinder mit parentId ────────────────────────
+            # parentId → IBKR hält die Kinder serverseitig zurück, bis der Entry füllt,
+            # und aktiviert sie erst danach als OCA-Paar. Bis zum Fill stehen sie NICHT
+            # als aktive gegensätzliche Order im Buch → kein Error 201. Gleichzeitig
+            # schaltet das letzte Kind (SL, transmit=True) das Paket scharf, wodurch der
+            # Netto-lmtPrice des Entry korrekt an IBKR übertragen wird (kein 0.00 mehr).
+            tp_order = LimitOrder('BUY', n_contracts, tp_close, tif='GTC')
+            tp_order.parentId = parent_id
+            tp_order.transmit = False
+            tp_order.account = _acct
+            if _ibq is not None:
+                tp_trade = await _ibq.place(ib, bag, tp_order)
+            else:
+                tp_trade = ib.placeOrder(bag, tp_order)
+
+            # SL MUSS eine Stop-Order sein (STP). Eine Limit-BUY über Markt wäre sofort
+            # marketable und würde die Position direkt nach dem Fill wieder schließen.
+            sl_order = StopOrder('BUY', n_contracts, sl_close, tif='GTC')
+            sl_order.parentId = parent_id
+            sl_order.transmit = True   # letztes Glied → transmittiert das gesamte Bracket
+            sl_order.account = _acct
+            if _ibq is not None:
+                sl_trade = await _ibq.place(ib, bag, sl_order)
+            else:
+                sl_trade = ib.placeOrder(bag, sl_order)
+
+            _bot_trades[sym]['tp_order_id'] = tp_trade.order.orderId
+            _bot_trades[sym]['sl_order_id'] = sl_trade.order.orderId
+            _bot_trades[sym]['tp_price']    = tp_close
+            _bot_trades[sym]['sl_price']    = sl_close
 
             _save_state()
 
@@ -3296,10 +3313,10 @@ async def place_order(ib, sig):
                     f"Retry-Logik übernimmt")
                 return False
             _mode = 'Paper' if _is_paper else 'Live'
-            log(f"  ✅ [{sym}] ENTRY PLATZIERT ({_mode} — Entry DAY, TP/SL folgen nach Fill) × {n_contracts} Kontrakt(e)")
-            log(f"     Entry #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x  [{_st}]")
-            log(f"     Nach Fill via OCA:  TP LMT +${tp_close:.2f} (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})  /  "
-                f"SL STP +${sl_close:.2f} (-{STOP_LOSS_MULT:.0%} = -${sl_close*100*n_contracts:.0f}), BE bei +{BREAKEVEN_TRIGGER_PCT:.0%}")
+            log(f"  ✅ [{sym}] BRACKET PLATZIERT ({_mode} — Entry DAY, TP/SL GTC mit parentId) × {n_contracts} Kontrakt(e)")
+            log(f"     Entry  #{parent_id}:  +${limit_price:.2f}  (Credit ${market_credit*n_contracts:.0f})  R/R: {market_rr:.2f}x  [{_st}]")
+            log(f"     TP     #{tp_trade.order.orderId}:  LMT +${tp_close:.2f}  (+{TAKE_PROFIT_PCT:.0%} = +${tp_close*100*n_contracts:.0f})  → aktiv nach Fill")
+            log(f"     SL     #{sl_trade.order.orderId}:  STP +${sl_close:.2f}  (-{STOP_LOSS_MULT:.0%} = -${sl_close*100*n_contracts:.0f})  → aktiv nach Fill, BE bei +{BREAKEVEN_TRIGGER_PCT:.0%}")
             return True
     except Exception as e:
         import traceback

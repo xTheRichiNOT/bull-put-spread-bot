@@ -92,6 +92,10 @@ UPDATE_FILES = ["bot.py", "launcher.py", "backtest.py", "shadow_analyze.py",
 
 # Changelog — pro Version eine Liste mit Änderungen (wird im Update-Dialog angezeigt)
 CHANGELOG: dict[str, list[str]] = {
+    "4.2.1": [
+        "🐛  Bracket zurück: Entry transmit=False, SL-Kind schaltet das Paket scharf → lmtPrice korrekt übertragen",
+        "🐛  TP/SL wieder als parentId-Kinder — bis zum Fill nicht aktiv im Buch, kein Error 201",
+    ],
     "4.2.0": [
         "🐛  Combo-Limit-Fix: NonGuaranteed='0' erzwingt garantiertes Routing — lmtPrice kommt nicht mehr als 0.00 an",
         "🐛  Error 201 (guaranteed-loss durch 0.00-Limit) damit endgültig behoben",
